@@ -1,0 +1,18 @@
+packages:
+  "framer-motion": "For smooth transitions and animated agent movement on the canvas"
+  "recharts": "For the knowledge base stats charts"
+  "date-fns": "For formatting timestamps in event logs and knowledge entries"
+  "clsx": "Utility for constructing className strings conditionally"
+  "tailwind-merge": "Utility for merging tailwind classes without style conflicts"
+
+images:
+  - path: "artifacts/software-city/public/images/hero-city.png"
+    description: "A dark, atmospheric pixel-art city skyline at night with glowing neon cyan and purple lights, retro cyberpunk hacker aesthetic, no text"
+    aspect_ratio: "16:9"
+  - path: "artifacts/software-city/public/images/logo.png"
+    description: "Minimal pixel-art style icon of a single glowing computer server tower or building in bright neon cyan against a pitch black background"
+    aspect_ratio: "1:1"
+
+notes:
+  - The app heavily uses polling for real-time updates from /api/city/metrics and /api/events/stream
+  - SVG is used for the interactive city map rendering to support crisp pixel-art aesthetics and easy interactivity

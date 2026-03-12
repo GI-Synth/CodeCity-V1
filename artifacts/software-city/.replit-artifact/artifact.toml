@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Software City"
+version = "1.0.0"
+id = "artifacts/software-city"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+localPort = 25205
+name = "web"
+paths = ["/"]
+
+[services.development]
+run = "pnpm --filter @workspace/software-city run dev"
+
+[services.env]
+PORT = "25205"
+BASE_PATH = "/"
+
+[services.production]
+build = ["pnpm", "--filter", "@workspace/software-city", "run", "build"]
+publicDir = "artifacts/software-city/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"

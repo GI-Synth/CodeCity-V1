@@ -1,22 +1,28 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Software City API - transforms code repos into living pixel-art cities
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: repo
+    description: Repository analysis operations
+  - name: city
+    description: City layout and state
+  - name: agents
+    description: NPC agent operations
+  - name: knowledge
+    description: AI knowledge base operations
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +30,205 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /repo/load:
+    post:
+      operationId: loadRepo
+      tags: [repo]
+      summary: Load and analyze a repository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoadRepoRequest"
+      responses:
+        "200":
+          description: Repository loaded and analyzed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoadRepoResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /repo/demo:
+    post:
+      operationId: loadDemoRepo
+      tags: [repo]
+      summary: Load a demo repository for showcase
+      responses:
+        "200":
+          description: Demo repository loaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoadRepoResponse"
+
+  /city/layout:
+    get:
+      operationId: getCityLayout
+      tags: [city]
+      summary: Get current city layout
+      responses:
+        "200":
+          description: City layout data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CityLayout"
+
+  /city/health:
+    get:
+      operationId: getCityHealth
+      tags: [city]
+      summary: Get city health score and season
+      responses:
+        "200":
+          description: City health data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CityHealth"
+
+  /city/metrics:
+    get:
+      operationId: getLiveMetrics
+      tags: [city]
+      summary: Get live city metrics
+      responses:
+        "200":
+          description: Live metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveMetrics"
+
+  /agents/list:
+    get:
+      operationId: listAgents
+      tags: [agents]
+      summary: List all active NPC agents
+      responses:
+        "200":
+          description: List of active agents
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentList"
+
+  /agents/spawn:
+    post:
+      operationId: spawnAgent
+      tags: [agents]
+      summary: Spawn a new NPC agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpawnAgentRequest"
+      responses:
+        "200":
+          description: Agent spawned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Agent"
+
+  /agents/{agentId}/task:
+    post:
+      operationId: assignAgentTask
+      tags: [agents]
+      summary: Assign a task to an NPC agent
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentTaskRequest"
+      responses:
+        "200":
+          description: Task assigned and result returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTaskResult"
+
+  /agents/{agentId}/chat:
+    post:
+      operationId: chatWithAgent
+      tags: [agents]
+      summary: Chat with an NPC agent
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Agent response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+
+  /knowledge/stats:
+    get:
+      operationId: getKnowledgeStats
+      tags: [knowledge]
+      summary: Get knowledge base statistics
+      responses:
+        "200":
+          description: Knowledge base stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeStats"
+
+  /knowledge/entries:
+    get:
+      operationId: getKnowledgeEntries
+      tags: [knowledge]
+      summary: Get recent knowledge base entries
+      responses:
+        "200":
+          description: Knowledge entries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KnowledgeEntryList"
+
+  /events/stream:
+    get:
+      operationId: getEventStream
+      tags: [city]
+      summary: Get recent city events (fires, bugs, alerts)
+      responses:
+        "200":
+          description: Recent city events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CityEventList"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +239,562 @@ components:
       required:
         - status
 
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+        - message
+
+    LoadRepoRequest:
+      type: object
+      properties:
+        repoUrl:
+          type: string
+          description: GitHub repository URL or local path
+        branch:
+          type: string
+          description: Branch to analyze (default main)
+      required:
+        - repoUrl
+
+    LoadRepoResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        repoName:
+          type: string
+        fileCount:
+          type: integer
+        districtCount:
+          type: integer
+        analysisTime:
+          type: number
+        message:
+          type: string
+      required:
+        - success
+        - repoName
+        - fileCount
+        - districtCount
+        - analysisTime
+        - message
+
+    District:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        type:
+          type: string
+          enum: [source, test, config, api, database, docs, assets, root]
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+        color:
+          type: string
+        buildings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Building"
+        healthScore:
+          type: number
+      required:
+        - id
+        - name
+        - path
+        - type
+        - x
+        - y
+        - width
+        - height
+        - color
+        - buildings
+        - healthScore
+
+    Building:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        filePath:
+          type: string
+        fileType:
+          type: string
+          enum: [class, function, api, database, config, test, entry, unknown]
+        floors:
+          type: integer
+          description: Height based on lines of code
+        complexity:
+          type: integer
+          description: Cyclomatic complexity score
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+        status:
+          type: string
+          enum: [healthy, warning, error, fire, dark, glowing]
+        hasTests:
+          type: boolean
+        testCoverage:
+          type: number
+        commitCount:
+          type: integer
+        age:
+          type: string
+          enum: [new, modern, aged, ancient]
+        language:
+          type: string
+        linesOfCode:
+          type: integer
+        dependencies:
+          type: array
+          items:
+            type: string
+        activeEvent:
+          type: string
+          nullable: true
+          enum: [fire, flood, smoke, alarm, sparkle, collapse, null]
+      required:
+        - id
+        - name
+        - filePath
+        - fileType
+        - floors
+        - complexity
+        - x
+        - y
+        - width
+        - height
+        - status
+        - hasTests
+        - testCoverage
+        - commitCount
+        - age
+        - language
+        - linesOfCode
+        - dependencies
+
+    Road:
+      type: object
+      properties:
+        id:
+          type: string
+        fromBuilding:
+          type: string
+        toBuilding:
+          type: string
+        type:
+          type: string
+          enum: [import, api, database, config]
+      required:
+        - id
+        - fromBuilding
+        - toBuilding
+        - type
+
+    CityLayout:
+      type: object
+      properties:
+        districts:
+          type: array
+          items:
+            $ref: "#/components/schemas/District"
+        roads:
+          type: array
+          items:
+            $ref: "#/components/schemas/Road"
+        repoName:
+          type: string
+        totalFiles:
+          type: integer
+        season:
+          type: string
+          enum: [summer, spring, autumn, winter]
+        healthScore:
+          type: number
+        generatedAt:
+          type: string
+      required:
+        - districts
+        - roads
+        - repoName
+        - totalFiles
+        - season
+        - healthScore
+        - generatedAt
+
+    CityHealth:
+      type: object
+      properties:
+        score:
+          type: number
+          description: 0-100 health score
+        season:
+          type: string
+          enum: [summer, spring, autumn, winter]
+        testCoverageRatio:
+          type: number
+        cleanBuildingRatio:
+          type: number
+        avgComplexity:
+          type: number
+        commitFrequency:
+          type: number
+        breakdown:
+          type: object
+          properties:
+            testCoverage:
+              type: number
+            codeQuality:
+              type: number
+            complexity:
+              type: number
+            activity:
+              type: number
+          required:
+            - testCoverage
+            - codeQuality
+            - complexity
+            - activity
+      required:
+        - score
+        - season
+        - testCoverageRatio
+        - cleanBuildingRatio
+        - avgComplexity
+        - commitFrequency
+        - breakdown
+
+    LiveMetrics:
+      type: object
+      properties:
+        timestamp:
+          type: string
+        cpuUsage:
+          type: number
+        memoryUsage:
+          type: number
+        activeAgents:
+          type: integer
+        bugsFound:
+          type: integer
+        testsRun:
+          type: integer
+        escalations:
+          type: integer
+        knowledgeBaseHits:
+          type: integer
+      required:
+        - timestamp
+        - cpuUsage
+        - memoryUsage
+        - activeAgents
+        - bugsFound
+        - testsRun
+        - escalations
+        - knowledgeBaseHits
+
+    Agent:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [qa_inspector, api_fuzzer, load_tester, edge_explorer, ui_navigator]
+        status:
+          type: string
+          enum: [idle, working, escalating, reporting, waiting]
+        currentBuilding:
+          type: string
+          nullable: true
+        currentTask:
+          type: string
+          nullable: true
+        bugsFound:
+          type: integer
+        testsGenerated:
+          type: integer
+        escalations:
+          type: integer
+        accuracy:
+          type: number
+        level:
+          type: integer
+          description: NPC level 1-5 based on accuracy
+        dialogue:
+          type: string
+          description: Current NPC status dialogue
+        x:
+          type: number
+        y:
+          type: number
+        color:
+          type: string
+      required:
+        - id
+        - name
+        - role
+        - status
+        - bugsFound
+        - testsGenerated
+        - escalations
+        - accuracy
+        - level
+        - dialogue
+        - x
+        - y
+        - color
+
+    AgentList:
+      type: object
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: "#/components/schemas/Agent"
+        total:
+          type: integer
+      required:
+        - agents
+        - total
+
+    SpawnAgentRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [qa_inspector, api_fuzzer, load_tester, edge_explorer, ui_navigator]
+        targetBuilding:
+          type: string
+          nullable: true
+      required:
+        - role
+
+    AgentTaskRequest:
+      type: object
+      properties:
+        taskType:
+          type: string
+          enum: [generate_tests, analyze_bug, fuzz_api, load_test, explore_edge_cases]
+        buildingId:
+          type: string
+        context:
+          type: string
+      required:
+        - taskType
+        - buildingId
+        - context
+
+    AgentTaskResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        taskType:
+          type: string
+        result:
+          type: string
+        actionItems:
+          type: array
+          items:
+            type: string
+        bugsFound:
+          type: integer
+        escalated:
+          type: boolean
+        fromKnowledgeBase:
+          type: boolean
+        provider:
+          type: string
+          nullable: true
+      required:
+        - success
+        - taskType
+        - result
+        - actionItems
+        - bugsFound
+        - escalated
+        - fromKnowledgeBase
+
+    ChatRequest:
+      type: object
+      properties:
+        message:
+          type: string
+        buildingContext:
+          type: string
+          nullable: true
+      required:
+        - message
+
+    ChatResponse:
+      type: object
+      properties:
+        agentId:
+          type: string
+        agentName:
+          type: string
+        message:
+          type: string
+        escalated:
+          type: boolean
+        fromKnowledgeBase:
+          type: boolean
+        actionItems:
+          type: array
+          items:
+            type: string
+      required:
+        - agentId
+        - agentName
+        - message
+        - escalated
+        - fromKnowledgeBase
+        - actionItems
+
+    KnowledgeStats:
+      type: object
+      properties:
+        totalEntries:
+          type: integer
+        totalCacheHits:
+          type: integer
+        avgBugsPerEntry:
+          type: number
+        escalationRate:
+          type: number
+        topProblems:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              count:
+                type: integer
+            required:
+              - type
+              - count
+      required:
+        - totalEntries
+        - totalCacheHits
+        - avgBugsPerEntry
+        - escalationRate
+        - topProblems
+
+    KnowledgeEntry:
+      type: object
+      properties:
+        id:
+          type: integer
+        problemType:
+          type: string
+        language:
+          type: string
+        question:
+          type: string
+        answer:
+          type: string
+        confidence:
+          type: string
+        provider:
+          type: string
+        useCount:
+          type: integer
+        createdAt:
+          type: string
+      required:
+        - id
+        - problemType
+        - language
+        - question
+        - answer
+        - confidence
+        - provider
+        - useCount
+        - createdAt
+
+    KnowledgeEntryList:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/KnowledgeEntry"
+        total:
+          type: integer
+      required:
+        - entries
+        - total
+
+    CityEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [fire, bug_found, test_passed, escalation, knowledge_hit, building_collapse, season_change, agent_promoted]
+        buildingId:
+          type: string
+          nullable: true
+        buildingName:
+          type: string
+          nullable: true
+        agentId:
+          type: string
+          nullable: true
+        agentName:
+          type: string
+          nullable: true
+        message:
+          type: string
+        severity:
+          type: string
+          enum: [info, warning, error, critical]
+        timestamp:
+          type: string
+      required:
+        - id
+        - type
+        - message
+        - severity
+        - timestamp
+
+    CityEventList:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/CityEvent"
+        total:
+          type: integer
+      required:
+        - events
+        - total

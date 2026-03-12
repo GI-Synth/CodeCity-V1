@@ -1,0 +1,28 @@
+import { pgTable, text, serial, integer, real, timestamp } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod/v4";
+
+export const knowledgeTable = pgTable("knowledge", {
+  id: serial("id").primaryKey(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  lastUsed: timestamp("last_used"),
+  useCount: integer("use_count").default(1).notNull(),
+  problemType: text("problem_type").notNull(),
+  language: text("language").notNull(),
+  framework: text("framework"),
+  patternTags: text("pattern_tags"),
+  fileType: text("file_type"),
+  question: text("question").notNull(),
+  contextHash: text("context_hash"),
+  codeSnippet: text("code_snippet"),
+  answer: text("answer").notNull(),
+  actionItems: text("action_items"),
+  confidence: text("confidence").notNull(),
+  provider: text("provider").notNull(),
+  wasUseful: integer("was_useful").default(1).notNull(),
+  producedBugs: integer("produced_bugs").default(0).notNull(),
+});
+
+export const insertKnowledgeSchema = createInsertSchema(knowledgeTable).omit({ id: true, createdAt: true });
+export type InsertKnowledge = z.infer<typeof insertKnowledgeSchema>;
+export type Knowledge = typeof knowledgeTable.$inferSelect;
