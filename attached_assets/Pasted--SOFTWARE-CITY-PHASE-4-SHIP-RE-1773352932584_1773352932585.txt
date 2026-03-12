@@ -1,0 +1,309 @@
+═══════════════════════════════════════════════════════════════════
+SOFTWARE CITY — PHASE 4: SHIP-READY Polish. Performance. Real onboarding. Self-contained. After this phase someone can clone
+and run it in 5 minutes.
+═══════════════════════════════════════════════════════════════════
+Read PROGRESS.md and PHASE3_HANDOFF.md before doing anything else.
+CURRENT STATE — what Phase 3 completed: ✓ Real test execution (tsx + c8 coverage, pytest –json-report) ✓ Coverage bars on
+buildings (green/yellow/red based on real %) ✓ NPC thought bubbles in SVG city map ✓ Knowledge base deduplication + quality
+scoring ✓ Multi-repo support with slug-based routing ✓ Shareable city URL (/shared/:token) ✓ Git diff view with diff2html + building
+highlight ✓ Agent reputation persists across restarts ✓ City time-lapse (▶ PLAY through git history) ✓ Rate limiting (express-ratelimit) ✓ Request logging (morgan) ✓ Graceful shutdown (SIGTERM/SIGINT) ✓ Environment validation table at startup ✓ Leaderboard
+page (/leaderboard) ✓ Read-only shared snapshot page (/shared/:token) ✓ KB: sort, pagination, quality stars, delete, export ✓ Zero
+TypeScript errors on both services
+WHAT STILL NEEDS DOING — your mission this phase: ✗ No self-hosted DB option — requires external PostgreSQL ✗ Landing page
+doesn’t explain what the app is ✗ No onboarding tour for new users ✗ City renders slowly for repos > 200 files (SVG has too many
+nodes) ✗ No keyboard shortcuts documentation ✗ Agent loop can spawn duplicate tasks on same building ✗ No dark/light theme
+toggle ✗ No error recovery — one failed API call can break UI state ✗ Mobile layout broken ✗ No Docker setup for one-command local
+deploy ✗ Building tooltips disappear when mouse moves to inspector ✗ No way to manually mark a bug as “false positive” ✗ F3 debug
+panel shows FPS but no WebSocket message rate ✗ No agent “pause” — can only spawn or stop all ✗ Knowledge base has no import
+(only export)
+Priority: Steps 1–5 are essential. Steps 6–10 are important polish. Do them in order. After each step: pnpm run typecheck, fix errors.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — SELF-CONTAINED: REPLACE POSTGRESQL WITH SQLITE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PostgreSQL requires an external server. Replace it with SQLite so the app runs with zero external dependencies.
+Install in lib/db: better-sqlite3 ← sync SQLite driver, fastest option @types/better-sqlite3 drizzle-orm ← already installed, supports
+SQLite Remove: pg, @types/pg
+Update lib/db/drizzle.config.ts: Change dialect from “postgresql” to “sqlite” Set dbCredentials: { url: process.env.DB_PATH ||
+“./data/city.db” }
+Update lib/db/src/index.ts: Import from ‘drizzle-orm/better-sqlite3’ instead of ‘drizzle-orm/pg-core’ Use Database from ‘better-sqlite3’
+const sqlite = new Database(process.env.DB_PATH || ‘./data/city.db’) export const db = drizzle(sqlite)
+Update all schema files — SQLite differences: serial() → integer().primaryKey({ autoIncrement: true }) text(‘x’).default(sql now() ) →
+text(‘x’).default(sql (datetime('now')) ) json() columns → text() with $type<YourType>() annotation boolean() → integer({ mode:
+‘boolean’ }) Remove all .notNull() where SQLite doesn’t enforce it well
+Update .env.template: Remove: DATABASE_URL Add: DB_PATH=./data/city.db (optional, has default)
+Create data/ directory at repo root with .gitkeep inside. Add data/*.db to .gitignore (keep schema, not data).
+Update db:push script to work with SQLite: “db:push”: “drizzle-kit push –dialect=sqlite”
+Update README.md — remove PostgreSQL requirement: Before: “Fill in DATABASE_URL (PostgreSQL connection string)” After: “No
+database setup needed — SQLite runs automatically”
+Run db:push after migration. Verify all tables create correctly. Run pnpm run typecheck. Fix all errors introduced by migration.
+This is the most impactful change in Phase 4. A user can now clone the repo and run it with nothing but Node + pnpm.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — ONBOARDING: LANDING PAGE REDESIGN + GUIDED TOUR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The current landing page has an input form but doesn’t explain what the app does. New users have no idea where to start.
+── 2A. REDESIGN Landing.tsx ────────────────────────────────────────
+Restructure the landing page into three sections:
+SECTION 1 — HERO (above the fold): Animated SVG city skyline (reuse the /api/assets/hero image) Headline: “YOUR CODE. AS A
+CITY.” Subheadline: “Walk through your repository. Watch AI agents find bugs in real time. Every file is a building. Every bug is a fire.”
+Two CTA buttons: [▶ Run Demo — 5 seconds] ← runs demo immediately, no input [Load a Repository →] ← scrolls down to the form
+SECTION 2 — HOW IT WORKS (three columns): Column 1: “Load Any Repo” GitHub URL or local folder → instant city Column 2:
+“AI Agents Explore” Local AI (Ollama) tests your code automatically Falls back to Groq/Claude when stuck Column 3: “Watch It
+Live” Bugs appear as fires. Coverage glows green. Fix code → city updates in 2 seconds.
+SECTION 3 — THE FORM (existing, keep functionality): GitHub URL input + PAT field (existing) Local folder input (existing) “Recent
+Cities” list (existing) Add small note: “No account needed. All analysis runs locally.”
+── 2B. GUIDED TOUR (first-time users only) ─────────────────────────
+Create src/components/ui/GuidedTour.tsx
+Use a simple spotlight-based tour. No external library needed. Store tour completion in localStorage key “sc_tour_complete”.
+TOUR STEPS (shown sequentially, each highlights one element): Step 1: HUD bar Highlight: the top HUD bar Text: “This is your city’s
+health. Green = well tested. Season changes as your codebase improves.” Step 2: First district Highlight: largest district in city Text:
+“Each zone is a folder. Click any building to inspect it.” Step 3: An NPC agent Highlight: first visible NPC dot Text: “This is a QA agent.
+It’s reading your code and generating tests right now.” Step 4: Sidebar events Highlight: sidebar event stream Text: “Every bug found
+and test run appears here in real time.” Step 5: Inspector (if a building was clicked) Highlight: BuildingInspector panel Text: “Ask the
+agent anything about this file. It answers locally, or escalates to Claude if it’s unsure.” Step 6: Done Text: “You’re ready. Spawn more
+agents or watch the city run.” Button: “Start Exploring”
+Tour implementation: Semi-transparent dark overlay covers everything Highlighted element: cut-out in overlay (box-shadow trick)
+Tooltip box with step text, prev/next/skip buttons Prev/Next animate the highlight moving between elements Runs automatically on first
+visit to /city Accessible via “?” keyboard shortcut anytime
+── 2C. KEYBOARD SHORTCUTS HELP PANEL ───────────────────────────────
+Press ? → opens a keyboard shortcuts overlay (currently F3 shows debug but ? does nothing)
+Create src/components/ui/ShortcutsPanel.tsx
+NAVIGATION: WASD / Arrow keys Pan city view Scroll wheel Zoom in/out F Fly to Developer Tower (center) Escape Close any open
+panel ? Show/hide this panel
+CITY: T Toggle git timeline M Toggle minimap P Pause/resume all agents F3 Toggle debug HUD
+AGENTS: Click NPC Open agent chat E (when near NPC) Interact with nearest agent
+Show this panel on ? keydown. Dismiss on Escape or ? again.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — PERFORMANCE: SVG VIRTUALIZATION FOR LARGE REPOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For repos with 200+ files, the SVG has hundreds of <rect> and <text> elements. Rendering slows, interactions lag.
+── 3A. VIEWPORT CULLING ────────────────────────────────────────────
+In CityMap.tsx, compute the visible viewport rectangle from the current pan/zoom state. Only render buildings that intersect it.
+const viewportBounds = useMemo(() => ({ minX: -pan.x / zoom, minY: -pan.y / zoom, maxX: (-pan.x + containerWidth) / zoom, maxY: (-
+pan.y + containerHeight) / zoom, }), [pan, zoom, containerWidth, containerHeight])
+const visibleBuildings = useMemo(() => allBuildings.filter(b => b.x + b.width > viewportBounds.minX && b.x < viewportBounds.maxX
+&& b.y + b.height > viewportBounds.minY && b.y < viewportBounds.maxY ), [allBuildings, viewportBounds])
+Render only visibleBuildings instead of all buildings. Always render roads (they’re cheap <line> elements). Always render all NPC
+agents (max 8, always cheap). Always render district borders (just <rect> outlines).
+── 3B. LEVEL OF DETAIL ─────────────────────────────────────────────
+At zoom < 0.5: render buildings as simple colored rects only No text labels, no coverage bars, no status icons Districts show name
+labels in large text only
+At zoom 0.5–1.0: standard rendering Building labels visible, coverage bars visible Status icons visible ( ✓)
+At zoom > 2.0: detailed rendering Show LOC number inside building rect Show complexity number in corner Coverage percentage as
+text
+Track zoom level in state. Switch rendering tier in useMemo.
+── 3C. ROAD SIMPLIFICATION ─────────────────────────────────────────
+At zoom < 0.5: hide individual file-to-file dependency roads Only show district-to-district connections (much fewer) At zoom 0.5–1.0:
+show roads within same district + cross-district At zoom > 1.0: show all roads including within-building connections
+This alone reduces SVG element count by ~60% at full city view.
+── 3D. BUILDING COUNT BADGE ────────────────────────────────────────
+When viewport culling is active, show a badge in the corner: “Rendering 47/312 buildings” in the F3 debug panel This lets users know
+culling is working
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — AGENT CONTROLS: PAUSE, TARGET, FALSE POSITIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 4A. PAUSE INDIVIDUAL AGENTS ─────────────────────────────────────
+Add PATCH /api/agents/:id/pause route: Toggles agent.status between “working” and “paused” When paused: agent’s setInterval still
+fires but chooseTarget() returns null → agent stops moving, shows “ ” thought bubble Response: { id, status: “paused” | “working” }
+Update Agents.tsx agent cards: Add pause/resume toggle button ( /▶) on each agent card Paused agents: card has reduced opacity,
+“PAUSED” badge “Pause All” / “Resume All” buttons in the page header
+── 4B. MANUAL TARGET ASSIGNMENT ────────────────────────────────────
+In BuildingInspector.tsx, add “Assign Agent” button: Opens a small dropdown: list of idle/working agents Selecting one: POST
+/api/agents/:id/task { buildingId } Immediately sets agent target to this building Agent interrupts current task and moves to new building
+Update agentEngine.ts: Add manualTarget?: string to agent state In chooseTarget(): if manualTarget is set, return it and clear it
+── 4C. FALSE POSITIVE MARKING ──────────────────────────────────────
+In BuildingInspector.tsx bug list: Each bug has a “✓ Real bug” and “✗ False positive” button On click: PATCH /api/bugs/:bugId/verdict {
+verdict: “real”|“false” }
+Add POST /api/bugs route and bugs table: lib/db/src/schema/bugs.ts: { id, buildingId, agentId, message, stack, line, verdict: text default
+‘unverified’, ← unverified|real|false foundAt, verifiedAt }
+Update reputation scoring: When verdict=“real”: increment agent.truePositives When verdict=“false”: increment agent.falsePositives
+accuracy = truePositives / (truePositives + falsePositives) Recompute rank after each verdict
+Update Leaderboard.tsx: Show accuracy only for agents with >= 5 verified bugs Agents with < 5 verified: show “Not enough data”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — KNOWLEDGE BASE IMPORT + SEARCH IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 5A. IMPORT ──────────────────────────────────────────────────────
+Add POST /api/knowledge/import route: Accepts: multipart/form-data with a JSON file The JSON must match the export format from
+Phase 3 For each entry in the JSON: Check for near-duplicate before inserting (reuse existing logic) If duplicate: skip, increment
+skipCount If new: insert, increment importCount Returns: { imported: N, skipped: N, errors: string[] }
+Update KnowledgeBase.tsx: Add “Import KB” button next to “Export KB” Opens a file picker (accept=”.json”) On file select: POST to
+/api/knowledge/import Show result toast: “Imported 42 entries, skipped 8 duplicates”
+This lets users share knowledge bases between repos or teammates.
+── 5B. FULL-TEXT SEARCH IMPROVEMENT ────────────────────────────────
+Current search filters client-side after loading all entries. For large KBs (1000+ entries) this is slow.
+Add query param to GET /api/knowledge/entries: ?search=term → server-side LIKE search on question + answer + language ?
+language=python → exact language filter (already exists, move server-side) ?confidence=high → exact confidence filter (move serverside) ?page=1&limit=20 → pagination (already exists)
+SQLite supports LIKE and FTS5 (full-text search). Add FTS5 virtual table for knowledge_entries: CREATE VIRTUAL TABLE
+knowledge_fts USING fts5( question, answer, language, content=knowledge_entries, content_rowid=id ) Keep FTS table in sync: after
+INSERT/UPDATE/DELETE on knowledge_entries, update knowledge_fts using triggers or explicit sync in the route.
+Update KnowledgeBase.tsx search input: Debounce 300ms then re-fetch from server with ?search=term Remove client-side filtering
+(it’s now server-side) Show loading spinner during debounced fetch
+── 5C. KNOWLEDGE BASE STATS DASHBOARD ──────────────────────────────
+Add GET /api/knowledge/analytics route: Returns: topLanguages: [{ language, count }] top 5 topPatterns: [{ pattern, useCount }] top 5
+most-used entries escalationSavings: number ← KB hits * avg_escalation_cost ($0.005) entriesByConfidence: { high: N, medium: N,
+low: N } entriesAddedLast7Days: number hitRateOverTime: [{ date, hits, misses }] last 14 days
+Update KnowledgeBase.tsx stats cards to show: “ $X.XX saved” (escalation savings from KB hits) “ +N entries this week” Top
+language bar chart (simple SVG, no library needed)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — MOBILE LAYOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The app is desktop-only. Add responsive breakpoints.
+MOBILE BREAKPOINT: < 768px
+Landing.tsx mobile: Single column layout How It Works: stack vertically Form: full width inputs
+AppLayout.tsx mobile: Sidebar: hidden by default, toggle via hamburger menu (☰) Hamburger in top-left of header Sidebar slides in
+from left as overlay on toggle
+CityView.tsx mobile: BuildingInspector: slides up from bottom (not right panel) Takes 70% of screen height Has a drag handle at top to
+dismiss HUD: compressed to 2 rows, smaller text F3 debug: hidden on mobile (too cramped) Timeline: horizontal scroll instead of fixed
+width slider
+CityMap.tsx mobile: Touch pan: handle touchmove events for panning Pinch zoom: handle touch with 2 fingers for zoom Track distance
+between two touch points Scale zoom by distance ratio Tap building: same as click (already works via touch)
+Agents.tsx mobile: Single column card layout (already mostly works) Spawn dialog: full-screen on mobile
+KnowledgeBase.tsx mobile: Table → card layout on mobile Each entry: card with truncated question, language badge, quality
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — DARK / LIGHT THEME TOGGLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Current: dark theme only (hardcoded dark backgrounds). Add a light theme and toggle.
+In src/index.css: Define CSS variables for both themes:
+:root { –bg-primary: #0a0a12; –bg-secondary: #111120; –bg-glass: rgba(255,255,255,0.03); –border: rgba(255,255,255,0.08); –textprimary: #e0e0f0; –text-secondary:#8888aa; –accent: #00ff88; –accent-blue: #63b3ff; –city-bg: #0d1117; }
+[data-theme=“light”] { –bg-primary: #f4f4f8; –bg-secondary: #eaeaf0; –bg-glass: rgba(0,0,0,0.03); –border: rgba(0,0,0,0.10); –textprimary: #1a1a2e; –text-secondary:#555566; –accent: #00aa55; –accent-blue: #2266cc; –city-bg: #dde0e8; }
+Replace all hardcoded color values in components with CSS variables. (Focus on AppLayout, HUD, BuildingInspector, Agents,
+KnowledgeBase)
+Add theme toggle to AppLayout.tsx: / icon button in top-right of sidebar Toggle:
+document.documentElement.setAttribute(‘data-theme’, theme) Persist in localStorage: ‘sc_theme’ Load on startup: read localStorage
+before first render
+CityMap.tsx light theme: District borders: var(–accent-blue) at 40% opacity Building fills: slightly desaturated in light mode Roads:
+darker grey instead of cyan Background: –city-bg variable
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — ERROR RECOVERY + RESILIENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 8A. GLOBAL ERROR BOUNDARY TREE ──────────────────────────────────
+Currently only CityMap has an error boundary (from Phase 2). Wrap every page in its own error boundary.
+Create src/components/ui/PageErrorBoundary.tsx: class PageErrorBoundary extends React.Component State: { hasError: boolean,
+error: Error | null } getDerivedStateFromError: set hasError=true render error state: Dark panel centered on screen: “Something went
+wrong in this section” Error message (in <code> block, truncated to 200 chars) Two buttons: “Try Again” (resets state) and “Go Home”
+(navigate /) Small text: “This error has been logged”
+Wrap each page in App.tsx: <PageErrorBoundary key={location}> ← key forces remount on nav <Landing /> | <CityView /> | <Agents />
+| etc. </PageErrorBoundary>
+── 8B. TANSTACK QUERY ERROR HANDLING ────────────────────────────────
+Add global query error handling in main.tsx: const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 2, retryDelay:
+(attempt) => Math.min(1000 * 2 ** attempt, 10000), staleTime: 5000, onError: (error) => { // Only toast for non-404 errors (404 =
+expected for new users) if (!error.message?.includes(‘404’)) { toast({ title: “Connection issue”, description: error.message, variant:
+“destructive” }) } } } } })
+── 8C. WEBSOCKET AUTO-RECONNECT ─────────────────────────────────────
+Update useWebSocket.ts: On connection close: wait 2s, attempt reconnect Max 5 reconnection attempts with exponential backoff (2s,
+4s, 8s…) After 5 failures: show toast “Live updates paused — reconnecting…” On successful reconnect: show toast “Live updates
+restored” Add to HUD: small WS status dot (green=connected, yellow=reconnecting, grey=polling fallback)
+── 8D. GRACEFUL API DEGRADATION ─────────────────────────────────────
+Wrap every fetch call in the API client with a timeout: Update src/generated/api.ts: wrap all fetch() with: const controller = new
+AbortController() const timeout = setTimeout(() => controller.abort(), 10000) fetch(url, { …opts, signal: controller.signal }) finally:
+clearTimeout(timeout)
+On AbortError: return a typed error response instead of throwing This prevents the UI from hanging on slow backend
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — DOCKER: ONE-COMMAND LOCAL DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create Dockerfile at repo root:
+FROM node:20-slim AS base RUN npm install -g pnpm WORKDIR /app COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY artifacts/api-server/package.json ./artifacts/api-server/ COPY artifacts/software-city/package.json ./artifacts/software-city/
+COPY lib/db/package.json ./lib/db/ COPY lib/api-client-react/package.json ./lib/api-client-react/ COPY lib/api-spec/package.json
+./lib/api-spec/ RUN pnpm install –frozen-lockfile
+FROM base AS builder COPY . . RUN pnpm –filter @workspace/db run db:generate RUN pnpm –filter @workspace/api-server run build
+RUN pnpm –filter @workspace/software-city run build
+FROM node:20-slim AS runner RUN npm install -g pnpm WORKDIR /app COPY –from=builder /app/artifacts/api-server/dist ./apiserver/ COPY –from=builder /app/artifacts/software-city/dist ./frontend/ COPY –from=builder /app/lib/db/drizzle ./drizzle/ COPY
+package.json ./ RUN mkdir -p data ENV PORT=8080 ENV DB_PATH=./data/city.db EXPOSE 8080 CMD [“node”, “api-server/index.js”]
+The Express server should also serve the built frontend: Update src/app.ts: in production (NODE_ENV=production):
+app.use(express.static(path.join(__dirname, ‘../../frontend’))) app.get(’*’, (_, res) => res.sendFile(‘index.html’, …)) This makes the single
+Docker container serve both API and UI.
+Create docker-compose.yml: version: ‘3.8’ services: software-city: build: . ports: - “8080:8080” volumes: - ./data:/app/data ← persist
+SQLite DB between restarts environment: - NODE_ENV=production - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} -
+GROQ_API_KEY=${GROQ_API_KEY} - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434} extra_hosts: -
+“host.docker.internal:host-gateway” ← reach host Ollama
+Update README.md — add Docker section:
+One-Command Deploy (Docker)
+docker compose up Open http://localhost:8080 That’s it. SQLite database persists in ./data/city.db
+Optional — point to your local Ollama: Ollama must be running on your host machine. The container reaches it via host.docker.internal
+automatically.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — FINAL POLISH + PHASE 4 HANDOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 10A. BUILDING TOOLTIP FIX ────────────────────────────────────────
+Current bug: tooltip disappears when moving mouse from building toward the inspector panel (because SVG mouseLeave fires).
+Fix in CityMap.tsx: Add 200ms delay before hiding tooltip: let tooltipTimeout: ReturnType<typeof setTimeout> onMouseEnter:
+clearTimeout(tooltipTimeout), show tooltip onMouseLeave: tooltipTimeout = setTimeout(() => hide, 200) This lets the cursor travel to
+the inspector without flash.
+── 10B. F3 DEBUG PANEL IMPROVEMENTS ─────────────────────────────────
+Add to the F3 debug overlay: WS messages/sec (count messages received per second) Buildings rendered / total (from viewport
+culling) Active agent count / max (8) KB entries / hit rate Last city reload timestamp SQLite DB file size (GET /api/health should return
+this)
+Update GET /api/health to return: { status, version, uptime, dbSizeBytes, wsClients, activeAgents, kbEntries, ollamaAvailable }
+── 10C. CITY MAP MINI-IMPROVEMENTS ──────────────────────────────────
+Add to CityMap.tsx: “Recenter” button (⊕) in bottom-left — resets pan and zoom to fit all districts in view (compute bounding box of
+all buildings) District click: click on district label → zoom and pan to center that district in view (smooth animation) Building right-click
+context menu: “Inspect” | “Assign agent” | “View in GitHub” (if GitHub repo) “View in GitHub” opens
+github.com/owner/repo/blob/HEAD/path
+── 10D. WSMESSAGE RATE TRACKING ─────────────────────────────────────
+In useWebSocket.ts: Count messages received. Expose messageRate (msgs/sec). Compute as rolling average over last 5 seconds.
+Pass to the F3 debug panel via context or prop.
+── 10E. FINAL DOCUMENTATION ─────────────────────────────────────────
+Update PROGRESS.md — append Phase 4 session summary.
+Create CONTRIBUTING.md at repo root:
+Contributing to Software City
+Architecture Overview
+Three-layer stack: Frontend: React + Vite + TailwindCSS + shadcn/ui (artifacts/software-city) Backend: Express + TypeScript + bettersqlite3 (artifacts/api-server) DB: Drizzle ORM + SQLite (lib/db)
+Adding a New Agent Role
+1. Add role to AgentRole type in lib/db/src/schema/agents.ts
+2. Add role bonus in agentEngine.ts _chooseTarget()
+3. Add role card in Agents.tsx spawn dialog
+4. Add thought templates in ollamaPrompts.ts
+Adding a New Analysis Metric
+1. Add to FileMetrics interface in codeAnalyzer.ts
+2. Compute in analyzeFile()
+3. Store in building metadata (cityAnalyzer.ts)
+4. Display in BuildingInspector.tsx
+5. Use in healthScorer.ts if relevant
+Running Tests
+pnpm run typecheck ← TypeScript validation pnpm run build ← Full production build test
+── 10F. PHASE 4 HANDOFF ─────────────────────────────────────────────
+After completing all steps and pnpm run typecheck passes (zero errors), generate PHASE4_HANDOFF.md in the same format as
+previous handoffs.
+Sections:
+1. New files created
+2. Modified files + what changed
+3. Verification results for all checks below
+4. Full file tree
+5. Final package.json deps (both packages)
+6. TypeScript result: zero errors or list remaining
+7. Docker build result: does docker build . succeed?
+8. What the app does NOW that it didn’t do after Phase 3
+9. What is still missing or could be improved
+10. Honest assessment: is this ready for a real user to clone and use?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERIFICATION CHECKLIST — ALL MUST PASS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHECK 1 — SQLite works: Start the app with no DATABASE_URL set App starts without error Load demo repo → city renders GET
+/api/health → returns { dbSizeBytes: N } (not error) Restart server → data still there (SQLite file persisted)
+CHECK 2 — Landing page explains what the app is: Fresh user (no prior knowledge) can understand the purpose within 5 seconds of
+landing page load Demo button works in under 5 seconds
+CHECK 3 — Guided tour: Clear localStorage key “sc_tour_complete” Navigate to /city with agents running Tour overlay appears
+automatically All 6 steps advance correctly with next/prev After step 6: “sc_tour_complete” in localStorage Second visit: tour does
+NOT appear
+CHECK 4 — Performance (large repo): Load a repo with 200+ files FPS in F3 debug: must stay above 30fps “Rendering X/Y buildings”
+badge shows culling is active Zooming in/out must feel smooth (no jank)
+CHECK 5 — Pause agent: PATCH /api/agents/:id/pause → agent stops moving Thought bubble shows “ ” PATCH again → agent
+resumes “Pause All” pauses all active agents simultaneously
+CHECK 6 — False positive marking: Find a bug in BuildingInspector Click “✗ False positive” GET /api/agents/:id → agent.falsePositives
+incremented Agent accuracy updates accordingly
+CHECK 7 — Mobile layout: Resize browser to 375px wide Landing page: single column, no overflow City view: inspector slides up from
+bottom AppLayout: sidebar hidden, hamburger visible
+CHECK 8 — Docker build: docker build . must complete without error docker compose up must start successfully http://localhost:8080
+must serve both API and frontend Demo mode must work inside container
+CHECK 9 — KB import: Export KB from one session (download JSON) Clear the KB (delete all entries) Import the JSON file Entries
+restored with correct useCount, confidence, etc. Duplicate protection: importing same file twice = no duplicates
+CHECK 10 — TypeScript clean: pnpm run typecheck → zero errors on both packages pnpm run build → builds without error docker
+build . → succeeds
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRIORITY ORDER IF RUNNING SHORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MUST DO: Steps 1, 8, 10F (SQLite, error recovery, handoff) SHOULD DO: Steps 2, 3, 9 (onboarding, performance, Docker) NICE TO
+HAVE: Steps 4, 5, 6, 7
+Step 1 (SQLite) is the most important. It removes the only external dependency. After Phase 4, someone should be able to: git clone →
+pnpm install → pnpm dev → open browser And have a fully working app with zero other setup.
+That is the finish line. Build toward it.

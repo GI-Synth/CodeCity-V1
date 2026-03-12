@@ -1,7 +1,8 @@
 import { ollamaClient } from "./ollamaClient";
+import path from "path";
 
 export async function validateEnv(): Promise<void> {
-  const dbUrl = process.env["DATABASE_URL"];
+  const dbPath = process.env["DB_PATH"] ?? "./data/city.db";
   const groqKey = process.env["GROQ_API_KEY"];
   const anthropicKey = process.env["ANTHROPIC_API_KEY"];
 
@@ -15,7 +16,7 @@ export async function validateEnv(): Promise<void> {
   }
 
   const rows = [
-    ["DATABASE_URL", dbUrl ? "✓ Connected" : "✗ MISSING (required)"],
+    ["SQLite DB", `✓ ${path.resolve(dbPath)}`],
     ["Ollama", ollamaAvailable ? `✓ Available (${ollamaModels} model${ollamaModels !== 1 ? "s" : ""})` : "✗ Unavailable (agents will escalate)"],
     ["GROQ_API_KEY", groqKey ? "✓ Set" : "○ Not set (optional)"],
     ["ANTHROPIC_API_KEY", anthropicKey ? "✓ Set" : "○ Not set (optional)"],
@@ -33,9 +34,4 @@ export async function validateEnv(): Promise<void> {
     console.log(`│ ${label.padEnd(maxLabel)} │ ${value.padEnd(maxVal)} │`);
   }
   console.log("└" + "─".repeat(maxLabel + 2) + "┴" + "─".repeat(maxVal + 2) + "┘");
-
-  if (!dbUrl) {
-    console.error("[EnvValidator] FATAL: DATABASE_URL is required. Cannot start without a database connection.");
-    process.exit(1);
-  }
 }

@@ -11,7 +11,7 @@
 - **Package manager**: pnpm
 - **TypeScript version**: 5.9
 - **API framework**: Express 5
-- **Database**: PostgreSQL + Drizzle ORM
+- **Database**: SQLite (via @libsql/client) + Drizzle ORM
 - **Validation**: Zod (`zod/v4`), `drizzle-zod`
 - **API codegen**: Orval (from OpenAPI spec)
 - **Frontend**: React + Vite + Tailwind CSS
@@ -103,7 +103,14 @@ artifacts-monorepo/
 4. Next time same pattern appears → knowledge base hit (no API call needed)
 5. Escalation rate drops over time as knowledge base fills up
 
-## Database Schema
+## Database
+
+**SQLite** via `@libsql/client` + Drizzle ORM. Database file at `artifacts/api-server/data/city.db` (auto-created on first run). No PostgreSQL or external DB required.
+
+- `DB_PATH` env var overrides the default location
+- Run `pnpm --filter @workspace/db run push` to apply schema changes
+
+### Tables
 
 ### `knowledge` table
 Persistent AI knowledge base — every escalation answer is stored and reused.

@@ -32,7 +32,7 @@ router.get("/list", async (_req, res) => {
         healthScore: r.healthScore,
         season: r.season,
         isActive: r.isActive,
-        loadedAt: r.createdAt?.toISOString(),
+        loadedAt: r.createdAt,
         analysisTime: r.analysisTime,
       })),
     });
@@ -64,7 +64,7 @@ router.post("/load", async (req, res): Promise<void> => {
       await db.update(reposTable).set({
         repoName, branch, fileCount: files.length, districtCount: layout.districts.length,
         healthScore: layout.healthScore, season: layout.season, layoutData: JSON.stringify(layout),
-        analysisTime, slug, updatedAt: new Date(),
+        analysisTime, slug, updatedAt: new Date().toISOString(),
       }).where(eq(reposTable.id, existing[0].id));
       repoId = existing[0].id;
     } else {

@@ -1,11 +1,12 @@
-import { pgTable, text, serial, integer, real, timestamp } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const knowledgeTable = pgTable("knowledge", {
-  id: serial("id").primaryKey(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  lastUsed: timestamp("last_used"),
+export const knowledgeTable = sqliteTable("knowledge", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  createdAt: text("created_at").default(sql`(datetime('now'))`).notNull(),
+  lastUsed: text("last_used"),
   useCount: integer("use_count").default(1).notNull(),
   problemType: text("problem_type").notNull(),
   language: text("language").notNull(),

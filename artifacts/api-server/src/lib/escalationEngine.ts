@@ -189,7 +189,7 @@ async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationRes
       const newUseCount = (bestMatch.useCount ?? 1) + 1;
       const qs = computeQualityScore(newUseCount, newConfidence, bestMatch.producedBugs ?? 0);
       await db.update(knowledgeTable)
-        .set({ useCount: newUseCount, answer: result.answer.slice(0, 2000), confidence: newConfidence, lastUsed: new Date(), qualityScore: qs })
+        .set({ useCount: newUseCount, answer: result.answer.slice(0, 2000), confidence: newConfidence, lastUsed: new Date().toISOString(), qualityScore: qs })
         .where(eq(knowledgeTable.id, bestMatch.id));
       return;
     }

@@ -71,7 +71,7 @@ router.get("/stream", async (_req, res) => {
         agentName: e.agentName ?? null,
         message: e.message,
         severity: e.severity,
-        timestamp: e.timestamp?.toISOString() ?? new Date().toISOString(),
+        timestamp: e.timestamp ?? new Date().toISOString(),
       })),
       total: events.length,
     });

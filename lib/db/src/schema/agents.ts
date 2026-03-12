@@ -1,8 +1,9 @@
-import { pgTable, text, serial, integer, real, timestamp } from "drizzle-orm/pg-core";
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
-export const agentsTable = pgTable("agents", {
+export const agentsTable = sqliteTable("agents", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   role: text("role").notNull(),
@@ -24,7 +25,7 @@ export const agentsTable = pgTable("agents", {
   kbHits: integer("kb_hits").default(0).notNull(),
   rank: text("rank").default("junior").notNull(),
   totalTasksCompleted: integer("total_tasks_completed").default(0).notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
+  createdAt: text("created_at").default(sql`(datetime('now'))`).notNull(),
 });
 
 export const insertAgentSchema = createInsertSchema(agentsTable).omit({ createdAt: true });
