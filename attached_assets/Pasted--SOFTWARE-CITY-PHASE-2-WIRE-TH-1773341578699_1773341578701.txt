@@ -1,0 +1,352 @@
+═══════════════════════════════════════════════════════════════════
+SOFTWARE CITY — PHASE 2: WIRE THE BRAIN 10 Steps. One Prompt. All Real.
+═══════════════════════════════════════════════════════════════════
+You are continuing development of SOFTWARE CITY. The previous session built an excellent UI shell in TypeScript/React. Everything
+renders beautifully but runs on fake/demo data.
+YOUR JOB: Wire the real brain into the existing shell. Do NOT rebuild what exists. Do NOT change the frontend structure. Extend and
+replace the fake internals with real ones.
+CURRENT STATE (what exists and works): ✓ React frontend with SVG city renderer, HUD, inspector, agents page ✓ Express backend
+with routes: /api/repo, /api/city, /api/agents, /api/knowledge, /api/events, /api/health ✓ PostgreSQL via Drizzle ORM (repos, agents,
+knowledge_entries, events tables) ✓ GitHub repo loading with PAT support ✓ Demo mode with 37 fake files / 11 fake districts ✓
+Polling-based frontend (no WebSockets yet)
+WHAT IS FAKE AND MUST BECOME REAL (your mission): ✗ cityAnalyzer.ts — uses random numbers instead of real AST metrics ✗
+agentEngine.ts — dialogue is templated, agents don’t read code or call AI ✗ No WebSocket — agent movement is jerky HTTP polling ✗
+No real code analysis — LOC/complexity/coverage are all Math.random() ✗ No Ollama integration — zero local AI calls happen ✗ No
+escalation to Claude/Groq — knowledge base is empty/fake ✗ Agent chat returns hardcoded strings, ignores actual file content ✗
+hero-city.png and logo.png are 404 (files missing)
+KNOWN BUGS TO FIX FIRST (before anything else):
+1. BuildingInspector.tsx lines 35,52: hardcoded “agent-1” → use first available agent ID from the agents list
+2. HUD.tsx line 48: cpu.toFixed(1) missing — shows 48.007318…%
+3. Add React error boundary around <CityMap /> in CityView.tsx
+4. Generate hero-city.png and logo.png as SVG-based images (see Step 1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — FIX ALL KNOWN BUGS + GENERATE MISSING IMAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fix bugs 1–3 listed above.
+For the missing images, generate them programmatically at server startup rather than relying on static files. In githubFetcher.ts or a
+new file artifacts/api-server/src/lib/assetGenerator.ts:
+Generate hero-city.png: a 1200×600 SVG converted to PNG buffer showing a dark pixel-art city skyline — simple rectangles of varying
+heights in cyan/blue on a dark background with a grid overlay. Use the sharp npm package (add to package.json) to convert
+SVG→PNG. Serve at GET /api/assets/hero and GET /api/assets/logo.
+Update Landing.tsx to load images from /api/assets/hero and /api/assets/logo instead of /public/images/*.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — REAL CODE ANALYSIS ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Replace the fake metrics in cityAnalyzer.ts with real analysis. Create artifacts/api-server/src/lib/codeAnalyzer.ts
+Install these packages (add to artifacts/api-server/package.json): @typescript-eslint/parser ← TypeScript/JS AST parsing
+@babel/parser ← JS/JSX/TSX parsing fallback
+acorn ← lightweight JS parser acorn-walk ← AST walker for acorn
+Implement the CodeAnalyzer class with these methods:
+analyzeFile(filename: string, content: string): FileMetrics Returns: loc: number ← non-blank, non-comment lines complexity: number ←
+cyclomatic complexity (count branches: if/else/for/while/switch/catch/&&/||/?? each adds 1, base is 1) functions: string[] ← list of
+function/method names found classes: string[] ← list of class names found imports: string[] ← list of imported module paths exports:
+string[] ← list of exported names language: string ← detected from extension fileType: FileType ← source|test|config|api|database|style
+detectLanguage(filename: string): string Map extensions: .ts/.tsx → typescript, .js/.jsx → javascript, .py → python, .go → go, .rs → rust,
+.java → java, .cs → csharp, .rb → ruby, .php → php, .swift → swift, everything else → plaintext
+detectFileType(filename: string, content: string): FileType Rules (in order): - path contains /test/ or /spec/ or /tests/ → test - filename
+ends in .test.* or .spec.* → test - path contains /api/ or content has @app.route or router.get → api - path contains /db/ or /database/ or
+/models/ or /schema/ → database - filename is config.* or .config. or .env* → config - filename is package.json or tsconfig* or *.yaml →
+config - default → source
+computeLOC(content: string): number Count lines that are not empty and not pure comments (lines starting with // # /* * –> after trim)
+computeComplexity(content: string, language: string): number For JS/TS: count occurrences of: \bif\b, \belse\b, \bfor\b, \bwhile\b,
+\bswitch\b, \bcatch\b, \bcase\b, &&, ||, ??, ?., ternary ? For Python: count if, elif, else, for, while, except, and, or For others: count lines
+with if/for/while/switch patterns Add 1 as base. Cap at 50.
+extractImports(content: string, language: string): string[] JS/TS: match import … from ‘…’ and require(’…’) Python: match import … and
+from … import Return the module path strings only
+After building CodeAnalyzer, update cityAnalyzer.ts to call it: For each file received from githubFetcher, run analyzeFile() Replace all
+Math.random() metric assignments with real values Build the dependency graph from actual import paths Use real LOC for building
+height: clamp(loc/50, 1, 10) Use real complexity for building width: clamp(floor(cc/4)+1, 2, 6)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — REAL HEALTH SCORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create artifacts/api-server/src/lib/healthScorer.ts
+computeHealthScore(buildings: Building[]): { score: number, season: string }
+Algorithm: testCoverageScore: avg coverage across all buildings (0–1) → buildings with fileType=test nearby get a 0.7 coverage bonus
+to buildings in the same district cleanRatio: buildings with status=healthy / total buildings (0–1) complexityScore: 1 - (avgComplexity /
+30) clamped to 0–1 testFileRatio: (count of test files / total files) clamped to 0–1
+healthScore = (
+testCoverageScore * 0.40 +
+cleanRatio * 0.30 +
+complexityScore * 0.20 +
+testFileRatio * 0.10
+)
+season:
+>= 0.80 → "Summer"
+>= 0.60 → "Spring"
+>= 0.40 → "Autumn"
+default → "Winter"
+return { score: Math.round(healthScore * 100), season }
+Update GET /api/city/health to use this real computation instead of returning a hardcoded 55/Autumn.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — WEBSOCKET SERVER (REPLACE POLLING)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Install: ws (add to artifacts/api-server/package.json)
+Create artifacts/api-server/src/lib/wsServer.ts
+class WSServer { private wss: WebSocketServer private clients: Set<WebSocket>
+initialize(server: http.Server): void
+Mount WebSocket server on the existing HTTP server at path /ws
+On connection: add to clients set, send current city state
+On close: remove from clients set
+broadcast(message: WSMessage): void
+Send JSON to all connected clients
+broadcastNPCMove(npcId: string, targetBuilding: string,
+x: number, y: number): void
+broadcastBugFound(buildingId: string, severity: string,
+message: string): void
+broadcastMetricUpdate(buildingId: string, metric: string,
+value: number): void
+broadcastEscalation(npcId: string, building: string,
+fromCache: boolean, provider: string): void
+broadcastSeasonChange(season: string, score: number): void
+broadcastEventLog(type: string, message: string,
+severity: string): void
+}
+Message format (all messages): { type: string, payload: object, timestamp: string }
+In src/index.ts: after creating the Express server with http.createServer(app), pass the server to wsServer.initialize(). Export wsServer
+as singleton.
+Update frontend AppLayout.tsx and CityView.tsx: Add a useWebSocket hook in src/hooks/useWebSocket.ts Connect to ws://[same-
+host]/ws (use window.location.host) On message type “npc_move”: update agent position in React state using smooth Framer Motion
+spring animation (already installed) On message type “bug_found”: add event to sidebar stream + flash building red in CityMap On
+message type “escalation”: add to event stream with icon On message type “season_change”: update HUD season badge with
+smooth color transition On message type “event_log”: prepend to sidebar event stream
+Remove the 2s polling interval from CityView.tsx for agent positions. Keep polling for city layout (only changes on repo reload).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — OLLAMA INTEGRATION (LOCAL AI)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create artifacts/api-server/src/lib/ollamaClient.ts
+Ollama runs locally at http://localhost:11434 No npm package needed — use native fetch (Node 18+)
+class OllamaClient { private baseUrl = “http://localhost:11434” private semaphore: number = 0 private MAX_
+CONCURRENT = 8
+async isAvailable(): Promise<boolean>
+GET /api/tags → returns true if responds within 2s
+Catches all errors, returns false (never throws)
+async generate(params: {
+model: string, // "deepseek-coder-v2:16b" or "deepseek-coder:6.7b"
+system: string,
+prompt: string,
+temperature?: number, // default 0.4
+maxTokens?: number, // default 1000
+}): Promise<string>
+POST /api/generate with stream: false
+Enforce semaphore: if semaphore >= MAX_CONCURRENT, wait 500ms
+and retry (up to 10 retries, then throw)
+Returns response.response string
+On any error: throw with message "Ollama unavailable: [error]"
+async listModels(): Promise<string[]>
+GET /api/tags → return array of model names
+async checkModel(model: string): Promise<boolean>
+Check if model exists in listModels()
+}
+Create artifacts/api-server/src/lib/ollamaPrompts.ts All prompt templates as typed functions:
+buildTestGenerationPrompt(file: string, content: string, language: string): { system: string, prompt: string } system: “You are an expert
+QA engineer. Output ONLY a JSON array of test cases. Each: {name, type, input, expected, reasoning}. No markdown. No explanation.
+Valid JSON array only.” prompt: truncate content to 2500 chars, include filename + language
+buildDialoguePrompt(npcRole: string, buildingFile: string, recentFindings: string[], question: string): { system, prompt } system: “You
+are a software testing NPC in a city simulation. Be helpful, specific, brief (2-4 sentences). After your answer add: CONFIDENCE:0.XX
+(0.0-1.0)” prompt: include role, file, last 3 findings, player question
+buildEscalationPrompt(question: string, codeSnippet: string, failedAttempts: string[]): { system, prompt } system: “Senior engineer
+consulted by AI agent. Output ONLY JSON: {answer, confidence, action_items: string[]}” prompt: include question + truncated code +
+attempt summaries
+Add GET /api/ollama/status route: Returns { available: boolean, models: string[], recommended: { primary: string, fast: string } } Show
+this in TowerUI or as a status badge in the HUD sidebar
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — REAL NPC AGENT LOOP (REPLACE FAKE agentEngine.ts)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Rewrite agentEngine.ts completely. Keep the same exports so routes/agents.ts doesn’t need to change.
+The agent loop runs as background async tasks in Node.js. One setInterval per agent (interval = 8000ms base, reduced by level).
+AGENT LOOP per active agent:
+1. chooseTarget(agent, cityLayout): Building Score = complexity * (roads + 1) + roleBonus(agent.role, building) roleBonus: qa→source
+files, fuzzer→api files, edge→complexity>15 Pick highest-scored unvisited building
+2. Update agent position to target building coords wsServer.broadcastNPCMove(agent.id, building.id, x, y)
+3. Attempt local AI (if Ollama available): For attempt 1..3: prompt = buildTestGenerationPrompt(building.file, building.content) result =
+await ollama.generate({ model: “deepseek-coder-v2:16b”, …}) tests = parseTestJSON(result) if tests.length > 0 and not trivial:
+break trivial = all tests have null/empty input
+4a. If local succeeded: agent.currentTask = “testing” Simulate test execution: pick 0-2 “bugs” from complex functions For each bug:
+wsServer.broadcastBugFound(…) Update building.status in DB agent.bugsFound += bugs.length agent.accuracy = (real / (real + false))
+— track separately
+4b. If local failed 3x: agent.currentTask = “escalating” wsServer.broadcastEscalation(agent.id, building.id, false, “pending”) Check
+knowledgeBase.search(language, question) first If KB hit: use cached answer, broadcastEscalation(…, true, “knowledge_base”) Else:
+call external AI (see Step 7), save to KB
+5. agent returns to Developer Tower (coords 0,0) wsServer.broadcastNPCMove(agent.id, “tower”, 0, 0) agent.currentTask =
+“reporting” Insert event to DB: { type: “TASK_COMPLETE”, message: “…” } wsServer.broadcastEventLog(…)
+6. Level up check: if agent.bugsFound >= level * 10: agent.level++ wsServer.broadcastEventLog(“AGENT_PROMOTED”, …)
+AGENT STATE MACHINE: idle → moving → testing → escalating → reporting → idle
+Store agent state in-memory (Map<string, AgentState>) as the source of truth between DB writes. Write to DB every completed task.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — REAL ESCALATION ENGINE + KNOWLEDGE BASE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create artifacts/api-server/src/lib/escalationEngine.ts
+The escalation chain (in order, stop at first success): 1. Search knowledge_entries table (similarity match) 2. Call Groq API (free tier —
+llama-3.1-70b-versatile) 3. Call Anthropic API (Claude Sonnet 4.6) 4. Fall back to best local attempt
+KNOWLEDGE BASE SEARCH (before any API call): Query knowledge_entries where language = req.language Compute similarity: count
+matching words between req.question and entry.question, divide by max word count If best similarity >= 0.65: return cached answer
+Increment entry.useCount in DB This costs ZERO — no API call made
+GROQ CALL (free tier, very fast): POST https://api.groq.com/openai/v1/chat/completions Model: llama-3.1-70b-versatile Headers:
+Authorization: Bearer ${process.env.GROQ_
+API
+_KEY} Max tokens: 600 Use buildEscalationPrompt() from ollamaPrompts.ts Parse
+JSON from response.choices[0].message.content If GROQ_
+API
+_KEY not set: skip to next
+ANTHROPIC CALL (fallback): POST https://api.anthropic.com/v1/messages Model: claude-sonnet-4-6 Headers: x-api-key:
+${process.env.ANTHROPIC_
+API
+_KEY} anthropic-version: 2023-06-01 Max tokens: 600 Same prompt structure If
+ANTHROPIC
+API
+_
+_KEY not set: skip to next
+SAVE TO KNOWLEDGE BASE after any successful API call: INSERT into knowledge_entries: problemType: “test_generation” language:
+req.language question: req.question (truncated to 500 chars) answer: response.answer confidence: response.confidence provider:
+“groq” | “anthropic” actionItems: JSON.stringify(response.action_items) useCount: 1
+Add to .env.template (create at repo root if missing): ANTHROPIC_
+API
+_KEY=sk-ant-your-key-here GROQ_
+API
+_KEY=gsk_your-key-here
+DATABASE
+_URL=postgresql://… PORT=8080
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — REAL AGENT CHAT (REPLACE HARDCODED STRINGS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Update POST /api/agents/:id/chat in routes/agents.ts
+Current: returns hardcoded canned response string Replace with this flow:
+1. Load the agent from DB by :id (fix the hardcoded “agent-1” bug)
+2. Load the building the agent is currently assigned to (agent.currentTask contains buildingId or get from in-memory state)
+3. Load building file content from the city layout in DB
+4. Try Ollama first (fast model: deepseek-coder:6.7b): prompt = buildDialoguePrompt(agent.role, building.file, agent.recentFindings,
+body.message) response = await ollama.generate({ model: “deepseek-coder:6.7b”, temperature: 0.3 }) Parse confidence from
+“CONFIDENCE:0.XX” at end of response
+5. If ollama unavailable OR confidence < 0.65: Append to response: “\n\nI’m not fully certain — want me to ask the senior AI? Reply
+‘yes escalate’ to confirm.” Set flag: pendingEscalation = true
+6. If body.message === “yes escalate”: Call escalationEngine.escalate({ question: previousQuestion, codeSnippet: buildingContent,
+language: building.language }) Return escalated answer with source badge
+Response shape: { message: string, source: “local” | “knowledge_base” | “groq” | “anthropic”, confidence: number, offerEscalation:
+boolean, agentName: string, agentRole: string }
+Update BuildingInspector.tsx chat panel: Display source badge next to each message: local (cyan) | KB (yellow) |
+groq/claude (orange) If offerEscalation=true: show “Yes, ask senior AI” button On click: re-send with message “yes escalate”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — LOCAL FILE WATCHER (CHOKIDAR)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Install: chokidar (add to artifacts/api-server/package.json)
+Create artifacts/api-server/src/lib/fileWatcher.ts
+class FileWatcher { private watcher: chokidar.FSWatcher | null = null private debounceTimer: NodeJS.Timeout | null = null private
+watchedPath: string = “” private DEBOUNCE_
+MS = 500
+start(repoPath: string): void
+Only works when running locally (not on GitHub-fetched repos)
+Watch repoPath with chokidar: { ignoreInitial: true,
+ignored: [/(node_modules|\.git|__pycache__|\.venv)/] }
+On any change (add/change/unlink):
+debounce 500ms then call _handleChange(changedFile)
+stop(): void
+Close watcher if active
+private async _handleChange(changedFile: string): Promise<void>
+Re-analyze only the changed file using CodeAnalyzer
+Update only the affected building in the stored city layout
+Recompute health score
+wsServer.broadcast({ type: "city_patch",
+payload: { updatedBuilding: {...}, newHealthScore, newSeason } })
+isWatching(): boolean
+getWatchedPath(): string
+}
+Add POST /api/repo/watch route: Body: { localPath: string } Start FileWatcher on localPath Returns { watching: true, path: string }
+Add GET /api/repo/watch/status: Returns { watching: boolean, path: string }
+Update Landing.tsx: add a second input below the GitHub URL input: “— or watch a local folder —” Input:
+placeholder=“C:\projects\myapp or /home/user/myapp” Button: “Watch Local Folder” On submit: POST /api/repo/watch with localPath
+Update CityView.tsx: on WebSocket message type “city_patch”: Update only the affected building node in the SVG Flash it briefly with
+a yellow highlight (200ms CSS transition) Update health score and season in HUD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — GIT HISTORY + EXPORT + FINAL POLISH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 10A. GIT HISTORY TIMELINE ──────────────────────────────────────
+Create artifacts/api-server/src/lib/gitHistory.ts
+Install: simple-git (add to package.json)
+async getCommitHistory(repoPath: string, limit = 50): Promise<CommitSummary[]> Use simple-git to run: git log –format=”
+%H|%ai|%s|%an” Return array of: { hash, date, message, author, filesChanged }
+async getCityAtCommit(repoPath: string, commitHash: string): Promise<CityLayout> git stash (save working state) git checkout
+commitHash (detached HEAD) Re-run full analysis → CityLayout git checkout HEAD (restore) Return layout
+Add GET /api/city/history?path=… route Add POST /api/city/at-commit { path, commitHash } route
+Update CityView.tsx: add Timeline button (T key + toolbar icon) Opens a horizontal timeline slider at bottom of city view Shows commit
+messages as tick marks Dragging updates city to show that commit’s state “LIVE” button at far right returns to current HEAD
+── 10B. CITY SNAPSHOT EXPORT ──────────────────────────────────────
+Add GET /api/city/snapshot route: Serialize current city layout + health + agents + events to a single JSON object Return as
+downloadable JSON file with Content-Disposition header
+Add to CityView.tsx toolbar: “Export” button Downloads snapshot JSON Also renders the SVG city map to a PNG using: const svg =
+document.querySelector(’.city-svg’) const canvas = document.createElement(‘canvas’) // … serialize SVG → canvas → PNG download
+Triggers both downloads simultaneously
+── 10C. FINAL UI POLISH ───────────────────────────────────────────
+In CityMap.tsx: Make agent dots move along roads (not teleport through buildings) Interpolate from current position toward target
+along nearest road Use Framer Motion animate with duration based on distance
+In HUD.tsx: Season badge: add small animated icon Summer: slow pulse Autumn: slow spin Spring: gentle bounce Winter:
+slow float Ollama status indicator: green dot if available, grey if not Clicking it opens a small modal showing available models
+In AppLayout.tsx sidebar event stream: Color-code event types: BUG_
+FOUND → red left border TEST
+_
+PASSED → green left border
+ESCALATION → orange left border AGENT_
+PROMOTED → cyan left border BUILDING_
+COLLAPSE → red background flash Limit to last
+50 events, auto-scroll to newest
+── 10D. PROGRESS.md + EXPORT PACKAGE ─────────────────────────────
+Create PROGRESS.md at repo root:
+Software City — Build Progress
+Session 2 (2026-03-12) — Phase 2: Brain Wired
+Real AST analysis via @typescript-eslint/parser + acorn
+WebSocket server replacing HTTP polling
+Ollama integration (local AI, Semaphore 8)
+Real escalation chain: KB → Groq → Claude
+Knowledge base learning (similarity search)
+Real NPC agent loops with 3-attempt local + escalation
+Agent chat with source badges + escalation offer
+Local file watcher via chokidar
+Git history timeline
+City snapshot export
+Current Status: FUNCTIONAL CORE COMPLETE
+Next Phase: Godot integration or enhanced analysis
+Create scripts/export-for-local.sh: #!/bin/bash
+Packages the project for local development
+echo “Packaging Software City for local export…” pnpm install pnpm run build cp .env.template .env echo “” echo “Setup complete.
+Edit .env then run:” echo “ node artifacts/api-server/dist/index.js” echo “ cd artifacts/software-city && pnpm preview”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERIFICATION — RUN THESE AFTER ALL 10 STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All checks must pass before declaring this session done.
+CHECK 1 — Real analysis: Load the demo repo. Verify buildings have non-random LOC values. Two different files should have different
+complexity scores. console.log first 3 buildings’ loc and complexity values. They must NOT all be the same number.
+CHECK 2 — WebSocket: Open browser devtools → Network → WS tab Load city. Verify /ws connection appears. Verify messages arrive
+with type=“npc_
+move” within 10 seconds.
+CHECK 3 — Ollama (if running locally): GET /api/ollama/status → { available: true/false, models: […] } Should not throw — returns
+available:false gracefully if not running.
+CHECK 4 — Agent chat is real: Click any building → open chat → ask “what does this file do?” Response must contain content specific
+to that building’s filename. Must NOT return a hardcoded canned string.
+CHECK 5 — Knowledge base grows: Trigger an escalation (spawn an agent, let it run on a complex file) GET /api/knowledge/entries →
+should show at least 1 real entry Entry question field must contain actual file-related content.
+CHECK 6 — Health score is real: Load a repo where all files are test files. Health score should be higher than loading a repo with zero
+tests. The numbers must differ — not both return 55.
+CHECK 7 — No broken images: GET /api/assets/hero → returns a PNG (Content-Type: image/png) GET /api/assets/logo → returns a
+PNG Landing page shows the city skyline image and logo.
+CHECK 8 — Local watcher (if local path accessible): POST /api/repo/watch { localPath: “.” } GET /api/repo/watch/status → { watching:
+true } Modify any file in the watched path. Within 2 seconds: WebSocket message type=“city_patch” received.
+CHECK 9 — Export works: GET /api/city/snapshot → downloads a JSON file JSON contains: districts, buildings, agents, events,
+healthScore File is not empty and not just { error: … }
+CHECK 10 — Zero TypeScript errors: pnpm run typecheck Must return 0 errors. Fix any that appear.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BEFORE YOU FINISH THIS SESSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When all 10 steps and all checks are done, generate a new handoff document in the same format as COMPLETE_
+HANDOFF.md. Name
+it PHASE2
+HANDOFF.md. Include:
+_
+1. Every new file created in this session
+2. Every file modified and what changed
+3. All 10 checks: PASS / FAIL / PARTIAL with notes
+4. Current full file tree
+5. Any TypeScript errors remaining
+6. Exact current package.json dependencies for both packages
+7. What the app does NOW that it didn’t do before
+8. What is still fake or missing
+9. Recommended next phase focus
+This handoff document is what the next AI session will read first. Make it precise and honest. Do not omit failures.
