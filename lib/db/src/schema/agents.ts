@@ -18,6 +18,12 @@ export const agentsTable = pgTable("agents", {
   x: real("x").default(0).notNull(),
   y: real("y").default(0).notNull(),
   color: text("color").notNull(),
+  truePositives: integer("true_positives").default(0).notNull(),
+  falsePositives: integer("false_positives").default(0).notNull(),
+  escalationCount: integer("escalation_count").default(0).notNull(),
+  kbHits: integer("kb_hits").default(0).notNull(),
+  rank: text("rank").default("junior").notNull(),
+  totalTasksCompleted: integer("total_tasks_completed").default(0).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Component } from "react";
+import { useState, useEffect, useRef, Component, useCallback } from "react";
 import type { ReactNode, ErrorInfo } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { CityMap } from "@/components/city/CityMap";
@@ -6,10 +6,11 @@ import { BuildingInspector } from "@/components/city/BuildingInspector";
 import { HUD } from "@/components/city/HUD";
 import { useGetCityLayout, useGetCityHealth, useGetLiveMetrics, useListAgents } from "@workspace/api-client-react";
 import type { Agent } from "@workspace/api-client-react";
-import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download } from "lucide-react";
+import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
 
 class CityMapErrorBoundary extends Component<
   { children: ReactNode },
@@ -103,10 +104,14 @@ function DebugRow({ label, value, color, icon: Icon }: { label: string; value: s
 }
 
 export function CityView() {
+  const { toast } = useToast();
   const [selectedBuildingId, setSelectedBuildingId] = useState<string | null>(null);
   const [debugVisible, setDebugVisible] = useState(false);
   const [wsAgentOverrides, setWsAgentOverrides] = useState<Map<string, { x: number; y: number }>>(new Map());
   const [flashedBuildings, setFlashedBuildings] = useState<Set<string>>(new Set());
+  const [npcThoughts, setNpcThoughts] = useState<Map<string, string>>(new Map());
+  const [sharing, setSharing] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
 
   const { data: layout, isLoading: layoutLoading } = useGetCityLayout({ query: { refetchInterval: 10000 } });
   const { data: health, refetch: refetchHealth } = useGetCityHealth({ query: { refetchInterval: 10000 } });
@@ -128,6 +133,16 @@ export function CityView() {
     if (type === "npc_move") {
       const { npcId, x, y } = payload as { npcId: string; x: number; y: number };
       setWsAgentOverrides(prev => new Map(prev).set(npcId, { x, y }));
+    } else if (type === "npc_thought") {
+      const { npcId, thought, duration } = payload as { npcId: string; thought: string; duration: number };
+      setNpcThoughts(prev => new Map(prev).set(npcId, thought));
+      setTimeout(() => {
+        setNpcThoughts(prev => {
+          const next = new Map(prev);
+          next.delete(npcId);
+          return next;
+        });
+      }, duration ?? 4000);
     } else if (type === "bug_found") {
       const { buildingId } = payload as { buildingId: string };
       setFlashedBuildings(prev => new Set(prev).add(buildingId));
@@ -142,6 +157,24 @@ export function CityView() {
       refetchAgents();
     }
   }, [lastMessage]);
+
+  const handleShare = useCallback(async () => {
+    setSharing(true);
+    try {
+      const res = await fetch("/api/city/share", { method: "POST" });
+      const data = await res.json() as { url?: string; token?: string };
+      if (data.url) {
+        const fullUrl = `${window.location.origin}${import.meta.env.BASE_URL.replace(/\/$/, "")}${data.url}`;
+        setShareUrl(fullUrl);
+        await navigator.clipboard.writeText(fullUrl).catch(() => {});
+        toast({ title: "Share link copied!", description: "City snapshot link copied to clipboard." });
+      }
+    } catch {
+      toast({ title: "Share failed", variant: "destructive" });
+    } finally {
+      setSharing(false);
+    }
+  }, [toast]);
 
   const [ollamaAvailable, setOllamaAvailable] = useState<boolean | undefined>(undefined);
   useEffect(() => {
@@ -206,6 +239,16 @@ export function CityView() {
             <Button variant="outline" size="sm" onClick={handleExport} className="h-8 text-xs font-mono border-primary/30">
               <Download size={12} className="mr-1.5" /> Export
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleShare}
+              disabled={sharing}
+              className={cn("h-8 text-xs font-mono", shareUrl ? "border-green-400/50 text-green-400" : "border-primary/30")}
+            >
+              {shareUrl ? <Check size={12} className="mr-1.5" /> : <Share2 size={12} className="mr-1.5" />}
+              {sharing ? "Sharing…" : shareUrl ? "Copied!" : "Share"}
+            </Button>
           </div>
 
           <CityMapErrorBoundary>
@@ -215,6 +258,7 @@ export function CityView() {
               selectedBuildingId={selectedBuildingId}
               onSelectBuilding={setSelectedBuildingId}
               flashedBuildings={flashedBuildings}
+              npcThoughts={npcThoughts}
             />
           </CityMapErrorBoundary>
 

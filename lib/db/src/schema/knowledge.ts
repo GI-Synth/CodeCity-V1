@@ -21,6 +21,7 @@ export const knowledgeTable = pgTable("knowledge", {
   provider: text("provider").notNull(),
   wasUseful: integer("was_useful").default(1).notNull(),
   producedBugs: integer("produced_bugs").default(0).notNull(),
+  qualityScore: real("quality_score").default(0.5).notNull(),
 });
 
 export const insertKnowledgeSchema = createInsertSchema(knowledgeTable).omit({ id: true, createdAt: true });

@@ -1,4 +1,4 @@
-import { pgTable, text, serial, integer, real, timestamp, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, integer, real, timestamp, boolean } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -7,6 +7,8 @@ export const reposTable = pgTable("repos", {
   repoUrl: text("repo_url").notNull(),
   repoName: text("repo_name").notNull(),
   branch: text("branch").default("main").notNull(),
+  slug: text("slug").unique(),
+  isActive: boolean("is_active").default(false).notNull(),
   fileCount: integer("file_count").default(0).notNull(),
   districtCount: integer("district_count").default(0).notNull(),
   healthScore: real("health_score").default(50).notNull(),

@@ -104,6 +104,31 @@ class WSServerManager {
     });
   }
 
+  broadcastThought(npcId: string, thought: string, duration: number): void {
+    const truncated = thought.length > 60 ? thought.slice(0, 57) + "…" : thought;
+    this.broadcast({
+      type: "npc_thought",
+      payload: { npcId, thought: truncated, duration },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  broadcastTestResult(buildingId: string, passed: number, failed: number, coverage: number | null): void {
+    this.broadcast({
+      type: "test_result",
+      payload: { buildingId, passed, failed, coverage },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  closeAll(): void {
+    for (const ws of this.clients) {
+      try { ws.close(); } catch { }
+    }
+    this.clients.clear();
+    this.wss?.close();
+  }
+
   get clientCount(): number {
     return this.clients.size;
   }

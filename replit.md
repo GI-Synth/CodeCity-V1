@@ -162,13 +162,16 @@ Analyzed repository cache — stores the generated city layout JSON.
 - `artifacts/api-server/src/lib/gitHistory.ts` — simple-git commit age + frequency reader
 - `artifacts/api-server/src/lib/assetGenerator.ts` — SVG hero background + logo generation
 - `artifacts/api-server/src/lib/githubFetcher.ts` — GitHub API integration + demo data
-- `artifacts/software-city/src/components/city/CityMap.tsx` — SVG city renderer with flash animations
+- `artifacts/software-city/src/components/city/CityMap.tsx` — SVG city renderer: flash animations, coverage bars, NPC thought bubbles
 - `artifacts/software-city/src/components/city/BuildingInspector.tsx` — Real agent chat + source badges
 - `artifacts/software-city/src/components/city/HUD.tsx` — Health/metrics/WS/Ollama status bar
-- `artifacts/software-city/src/components/layout/AppLayout.tsx` — WS-powered color-coded event stream
+- `artifacts/software-city/src/components/layout/AppLayout.tsx` — WS-powered color-coded event stream + Leaderboard nav
 - `artifacts/software-city/src/hooks/useWebSocket.ts` — WebSocket hook with auto-reconnect
-- `artifacts/software-city/src/pages/CityView.tsx` — City page with error boundary + WS NPC moves
+- `artifacts/software-city/src/pages/CityView.tsx` — City page with error boundary, WS NPC moves, thought bubbles, Share button
 - `artifacts/software-city/src/pages/Landing.tsx` — Hero with GitHub input + local folder watcher
+- `artifacts/software-city/src/pages/Leaderboard.tsx` — Agent leaderboard with rank badges and stat pills
+- `artifacts/software-city/src/pages/SharedCity.tsx` — Read-only shared city snapshot viewer (token-based)
+- `artifacts/software-city/src/pages/KnowledgeBase.tsx` — Sortable, paginated knowledge table with quality stars, delete, export
 - `lib/api-client-react/src/generated/api.schemas.ts` — Handwritten TypeScript types (update manually)
 - `lib/api-spec/openapi.yaml` — Full API contract
 

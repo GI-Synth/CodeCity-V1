@@ -162,8 +162,39 @@ async function callOllama(req: EscalationRequest, attempts: string[]): Promise<E
   }
 }
 
+function computeQualityScore(useCount: number, confidence: string, producedBugs: number): number {
+  const confNum = confidence === "high" ? 1.0 : confidence === "medium" ? 0.7 : parseFloat(confidence) || 0.3;
+  return Math.min(1.0, producedBugs * 0.4 + Math.min(useCount, 10) * 0.05 + confNum * 0.5);
+}
+
 async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationResult): Promise<void> {
   try {
+    const existing = await db.select().from(knowledgeTable)
+      .where(eq(knowledgeTable.language, req.language))
+      .limit(100);
+
+    let bestMatch: (typeof existing)[0] | null = null;
+    let bestSim = 0;
+
+    for (const entry of existing) {
+      const lenDiff = Math.abs((entry.question?.length ?? 0) - req.question.length);
+      if (lenDiff > 100) continue;
+      const sim = wordSimilarity(req.question, entry.question ?? "");
+      if (sim > bestSim) { bestSim = sim; bestMatch = entry; }
+    }
+
+    if (bestMatch && bestSim >= 0.80) {
+      const newConfidence = result.confidence > (parseFloat(bestMatch.confidence) || 0)
+        ? String(result.confidence) : bestMatch.confidence;
+      const newUseCount = (bestMatch.useCount ?? 1) + 1;
+      const qs = computeQualityScore(newUseCount, newConfidence, bestMatch.producedBugs ?? 0);
+      await db.update(knowledgeTable)
+        .set({ useCount: newUseCount, answer: result.answer.slice(0, 2000), confidence: newConfidence, lastUsed: new Date(), qualityScore: qs })
+        .where(eq(knowledgeTable.id, bestMatch.id));
+      return;
+    }
+
+    const qs = computeQualityScore(1, String(result.confidence), 0);
     await db.insert(knowledgeTable).values({
       problemType: "test_generation",
       language: req.language,
@@ -174,6 +205,7 @@ async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationRes
       actionItems: JSON.stringify(result.action_items),
       useCount: 1,
       producedBugs: 0,
+      qualityScore: qs,
     });
   } catch { }
 }

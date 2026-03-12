@@ -4,11 +4,12 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 
-// Pages
 import { Landing } from "@/pages/Landing";
 import { CityView } from "@/pages/CityView";
 import { Agents } from "@/pages/Agents";
 import { KnowledgeBase } from "@/pages/KnowledgeBase";
+import { SharedCity } from "@/pages/SharedCity";
+import { Leaderboard } from "@/pages/Leaderboard";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -26,6 +27,8 @@ function Router() {
       <Route path="/city" component={CityView} />
       <Route path="/agents" component={Agents} />
       <Route path="/knowledge" component={KnowledgeBase} />
+      <Route path="/leaderboard" component={Leaderboard} />
+      <Route path="/shared/:token" component={SharedCity} />
       <Route component={NotFound} />
     </Switch>
   );

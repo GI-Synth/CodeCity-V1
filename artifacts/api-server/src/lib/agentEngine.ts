@@ -8,6 +8,17 @@ import { escalate } from "./escalationEngine";
 import type { CityLayout, Building } from "./types";
 import { eq } from "drizzle-orm";
 
+function computeRank(totalTasks: number, accuracy: number, truePositives: number): string {
+  if (accuracy >= 0.90 && totalTasks >= 100 && truePositives >= 10) return "principal";
+  if (accuracy >= 0.80 && totalTasks >= 50) return "senior";
+  if (accuracy >= 0.60 && totalTasks >= 20) return "mid";
+  return "junior";
+}
+
+function emitThought(agentId: string, thought: string, duration = 3000): void {
+  wsServer.broadcastThought(agentId, thought, duration);
+}
+
 const AGENT_NAMES: Record<string, string[]> = {
   qa_inspector: ["Inspector Rex", "QA Quinn", "Test Titan", "Vera Verifix", "Ace Auditor"],
   api_fuzzer: ["Fuzzy McFuzz", "API Breaker", "Zara Zero-Day", "Rex Randomizer", "Glitch Hunter"],
@@ -97,6 +108,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
   }
 
   state.status = "moving";
+  emitThought(agentId, "Scanning for high-complexity targets…");
   const target = chooseTarget(agentRow.role, state.visitedBuildings, currentLayout);
   if (!target) return;
 
@@ -128,6 +140,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
   const ollamaAvailable = await ollamaClient.isAvailable();
   if (ollamaAvailable) {
     for (let attempt = 0; attempt < 3; attempt++) {
+      emitThought(agentId, `Analyzing ${target.name}… attempt ${attempt + 1}/3`);
       try {
         const result = await ollamaClient.generate({
           model: "deepseek-coder-v2:16b",
@@ -144,6 +157,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
           break;
         } else {
           attempts.push(`Attempt ${attempt + 1}: trivial or empty result`);
+          emitThought(agentId, "Tests too trivial. Trying different approach…");
         }
       } catch (e) {
         attempts.push(`Attempt ${attempt + 1}: ${e instanceof Error ? e.message : "failed"}`);
@@ -153,6 +167,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
   let bugsFound = 0;
   let escalated = false;
+  let kbHit = false;
 
   if (localSucceeded && tests.length > 0) {
     await db.update(agentsTable).set({ currentTask: "testing" }).where(eq(agentsTable.id, agentId));
@@ -164,6 +179,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
     }
 
     if (bugsFound > 0) {
+      emitThought(agentId, `Found ${bugsFound} issue(s) in ${target.name}!`, 5000);
       state.recentFindings.push(`Found ${bugsFound} bug(s) in ${target.name}`);
       if (state.recentFindings.length > 5) state.recentFindings.shift();
     }
@@ -173,6 +189,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
     await db.update(agentsTable).set({ currentTask: "escalating" }).where(eq(agentsTable.id, agentId));
     wsServer.broadcastEscalation(agentId, target.id, false, "pending");
+    emitThought(agentId, "This is beyond me. Consulting senior AI…", 5000);
 
     try {
       const result = await escalate({
@@ -183,6 +200,11 @@ async function runAgentCycle(agentId: string): Promise<void> {
       });
 
       wsServer.broadcastEscalation(agentId, target.id, result.source === "knowledge_base", result.source);
+      kbHit = result.source === "knowledge_base";
+
+      if (kbHit) {
+        emitThought(agentId, "Found a similar case in memory! Applying…", 5000);
+      }
 
       if (result.confidence > 0.5) {
         bugsFound = result.action_items.length > 0 ? 1 : 0;
@@ -191,11 +213,25 @@ async function runAgentCycle(agentId: string): Promise<void> {
     } catch { }
   }
 
+  emitThought(agentId, "Filing report at the tower.");
+
+  const newTotalTasks = agentRow.totalTasksCompleted + 1;
+  const newBugsTotal = agentRow.bugsFound + bugsFound;
+  const newTruePositives = agentRow.truePositives + (bugsFound > 0 ? bugsFound : 0);
+  const newEscalationCount = agentRow.escalationCount + (escalated ? 1 : 0);
+  const newKbHits = agentRow.kbHits + (kbHit ? 1 : 0);
+  const newRank = computeRank(newTotalTasks, agentRow.accuracy, newTruePositives);
+
   await db.update(agentsTable).set({
     currentTask: "reporting",
-    bugsFound: agentRow.bugsFound + bugsFound,
+    bugsFound: newBugsTotal,
     testsGenerated: agentRow.testsGenerated + tests.length,
     escalations: agentRow.escalations + (escalated ? 1 : 0),
+    escalationCount: newEscalationCount,
+    kbHits: newKbHits,
+    truePositives: newTruePositives,
+    totalTasksCompleted: newTotalTasks,
+    rank: newRank,
     status: "reporting",
     x: 50,
     y: 50,
@@ -216,7 +252,6 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
   wsServer.broadcastEventLog("TASK_COMPLETE", `${agentRow.name} analyzed ${target.name}`, bugsFound > 0 ? "warning" : "info");
 
-  const newBugsTotal = agentRow.bugsFound + bugsFound;
   if (newBugsTotal >= agentRow.level * 10) {
     const newLevel = agentRow.level + 1;
     await db.update(agentsTable).set({ level: newLevel }).where(eq(agentsTable.id, agentId));

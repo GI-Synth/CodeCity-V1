@@ -9,6 +9,7 @@ interface CityMapProps {
   onSelectBuilding: (id: string) => void;
   highlightDistrictId?: string | null;
   flashedBuildings?: Set<string>;
+  npcThoughts?: Map<string, string>;
 }
 
 const TYPE_COLORS: Record<string, string> = {
@@ -58,7 +59,7 @@ function getRoadColor(road: any, isHighlighted: boolean, selectedBuildingId: str
   return { stroke: "#00ff88", width: 3 };
 }
 
-export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, highlightDistrictId, flashedBuildings }: CityMapProps) {
+export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, highlightDistrictId, flashedBuildings, npcThoughts }: CityMapProps) {
   const bounds = useMemo(() => {
     if (!layout.districts || layout.districts.length === 0) {
       return { minX: 0, minY: 0, width: 1000, height: 1000 };
@@ -246,6 +247,21 @@ export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, 
                       strokeWidth="1"
                       strokeDasharray="2 2"
                     />
+                    {/* Coverage bar */}
+                    <rect
+                      x="0" y={building.height + 2}
+                      width={building.width}
+                      height={3}
+                      fill="rgba(0,0,0,0.5)"
+                      rx="1"
+                    />
+                    <rect
+                      x="0" y={building.height + 2}
+                      width={building.width * Math.max(0, Math.min(1, building.testCoverage ?? 0))}
+                      height={3}
+                      fill={building.testCoverage >= 0.8 ? "#00ff88" : building.testCoverage >= 0.5 ? "#ffcc00" : "#ff3333"}
+                      rx="1"
+                    />
                     <g transform={`translate(${building.width / 2}, ${building.height / 2})`} className="pointer-events-none">
                       {building.activeEvent === 'fire' && <text x="-12" y="8" fontSize="22" className="animate-bounce">🔥</text>}
                       {building.activeEvent === 'sparkle' && <text x="-12" y="8" fontSize="22" className="animate-pulse">✨</text>}
@@ -265,6 +281,8 @@ export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, 
         <AnimatePresence>
           {agents?.map(agent => {
             const taskIcon = AGENT_TASK_ICONS[agent.currentTask as string] || AGENT_TASK_ICONS[agent.status] || "";
+            const thought = npcThoughts?.get(agent.id);
+            const thoughtWords = thought ? thought.slice(0, 40) : "";
             return (
               <motion.g
                 key={agent.id}
@@ -273,6 +291,33 @@ export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, 
                 transition={{ type: "spring", stiffness: 50, damping: 10 }}
                 className="pointer-events-none"
               >
+                {/* Thought bubble */}
+                {thought && (
+                  <g transform="translate(0, -60)">
+                    <rect
+                      x={-thoughtWords.length * 3.2}
+                      y="-12"
+                      width={thoughtWords.length * 6.4 + 12}
+                      height="22"
+                      rx="6"
+                      fill="rgba(0,0,0,0.75)"
+                      stroke="rgba(0,255,247,0.5)"
+                      strokeWidth="1"
+                    />
+                    <text
+                      x="0"
+                      y="4"
+                      textAnchor="middle"
+                      fill="#00fff7"
+                      fontSize="9"
+                      fontFamily="JetBrains Mono"
+                    >
+                      {thoughtWords}
+                    </text>
+                    <circle cx="0" cy="14" r="2" fill="rgba(0,255,247,0.4)" />
+                    <circle cx="0" cy="22" r="1.5" fill="rgba(0,255,247,0.3)" />
+                  </g>
+                )}
                 {agent.status === 'working' && (
                   <circle r="14" fill="none" stroke={agent.color} strokeWidth="1" opacity="0.4" className="animate-ping" />
                 )}

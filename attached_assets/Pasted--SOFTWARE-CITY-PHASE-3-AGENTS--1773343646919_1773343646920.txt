@@ -1,0 +1,299 @@
+═══════════════════════════════════════════════════════════════════
+SOFTWARE CITY — PHASE 3: AGENTS THAT ACTUALLY WORK Real test execution. Real coverage. Real results. The city stops
+pretending and starts doing.
+═══════════════════════════════════════════════════════════════════
+You are continuing development of SOFTWARE CITY. Read PROGRESS.md and PHASE2_HANDOFF.md before doing anything else.
+CURRENT STATE — what Phase 2 completed: ✓ Real AST analysis (LOC, complexity, imports via acorn/@ts-eslint) ✓ WebSocket
+server (ws) — live NPC movement, bug flash, events ✓ Ollama client wired with Semaphore(8) — graceful unavailable handling ✓
+Escalation chain: knowledge_base → Groq → Claude ✓ Knowledge base grows with every escalation ✓ Real NPC agent loop (3 local
+attempts → escalate) ✓ Agent chat with source badges (LOCAL / KB / GROQ / CLAUDE) ✓ Chokidar local file watcher → city_patch in
+<2s ✓ Git history timeline (simple-git) ✓ City snapshot export (JSON + SVG→PNG) ✓ SVG assets served programmatically ✓ Zero
+TypeScript errors
+WHAT IS STILL FAKE — your mission this phase: ✗ Agents generate test code but never actually RUN it ✗ Coverage numbers come
+from estimates, not real execution ✗ Bug reports are “simulated” — not real failures from real tests ✗ No diff view — can’t see what
+changed between git commits ✗ No shareable city URL — can’t send someone a link to your city ✗ No multi-repo support — one city at
+a time ✗ Agent reputation persists in memory only — resets on restart ✗ No NPC “thought bubble” visible in city while working ✗
+Knowledge base has no deduplication — same pattern saved multiple times ✗ No city “time-lapse” mode — git timeline exists but no
+animation
+DO NOT rebuild anything that works. Extend only. Every step must leave the app in a runnable state. Run pnpm run typecheck after
+every step. Fix errors before next step.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — REAL TEST EXECUTION ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is the most important step. When an NPC agent generates test code, it must actually execute and return real pass/fail results.
+Create artifacts/api-server/src/lib/testExecutor.ts
+Install these packages (add to artifacts/api-server/package.json): tsx ← already installed (TypeScript executor) c8 ← V8 native
+coverage (wraps any Node script)
+class TestExecutor {
+async executeTests(params: {
+ targetFile: string, // absolute path to file being tested
+ testCode: string, // generated test code as string
+ language: string, // "typescript" | "javascript" | "python"
+ timeoutMs?: number, // default 15000
+}): Promise<TestExecutionResult>
+IMPLEMENTATION:
+ 1. Write testCode to a temp file:
+ /tmp/sc_test_[uuid].[ts|js|py]
+ Prepend the correct import for the target file
+ 2. For TypeScript/JavaScript:
+ Run: npx c8 --reporter=json-summary tsx [tempFile]
+ Use child_process.spawn with timeout
+ Parse stdout for test results (look for PASS/FAIL lines)
+ Parse coverage-summary.json if it exists in ./coverage/
+ 3. For Python:
+ Run: python -m pytest [tempFile] --json-report
+ --json-report-file=/tmp/sc_pytest_[uuid].json
+ Parse the JSON report file for results
+ 4. Parse stdout/stderr for any thrown errors → these are bugs
+ Capture: error message, line number, stack trace
+ 5. Clean up temp files always (try/finally)
+ 6. Return TestExecutionResult:
+ {
+ passed: number,
+ failed: number,
+ errors: TestError[], // { message, line, stack }
+ coverage: number, // 0.0-1.0, null if not available
+ durationMs: number,
+ rawOutput: string, // truncated to 2000 chars
+ }
+async runQuickSanity(filePath: string): Promise<SanityResult>
+ Just try to import/require the file and catch any syntax errors
+ Run: node --input-type=module <<< "import './[file]'"
+ Returns { ok: boolean, error?: string }
+}
+parseTestOutput(stdout: string, stderr: string): ParsedResults Look for patterns: “X passing” / “X failing” (Mocha style) “Tests: X
+passed, Y failed” (Jest style) “PASSED” / “FAILED” per line (pytest style) Any “Error:” or “TypeError:” or “AssertionError:” in stderr
+parseCoverageJSON(jsonPath: string): number Read coverage-summary.json Return total.lines.pct / 100 as 0.0-1.0 Return null if file
+doesn’t exist
+Wire TestExecutor into agentEngine.ts: After generating test code in _executeLocalAttempt(): const execResult = await
+testExecutor.executeTests({ targetFile: building.filePath, testCode: generatedCode, language: building.language, }) Use
+execResult.errors as the real bug list Use execResult.coverage as the real coverage value Update building.coverage in DB with real
+number Update building.status: execResult.failed > 0 → “fire” | “alarm”
+Add POST /api/agents/:id/run-tests route: Manually trigger test execution on a specific building Returns TestExecutionResult
+immediately (await, not background) This powers the “Gen Tests” button in BuildingInspector
+Update BuildingInspector.tsx “Gen Tests” button: Was: dispatches task and shows spinner indefinitely Now: calls POST
+/api/agents/:id/run-tests Shows real-time output in a scrollable code panel Updates coverage bar when result returns Lists each error
+with message + line number
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — REAL COVERAGE TRACKING + BUILDING STATES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Now that we have real coverage numbers, make them drive the city.
+Update the DB schema (lib/db/src/schema/repos.ts): Add to the buildings JSON structure (no new table — buildings are stored as
+JSON inside repos.layoutData): coverage: number // 0.0-1.0, null = never tested lastTestedAt: string // ISO timestamp testsPassed:
+number testsFailed: number realBugs: TestError[] // actual errors from execution
+Update cityAnalyzer.ts to initialize these fields as null/0.
+Update healthScorer.ts to use real coverage values: testCoverageScore = avg of buildings where coverage !== null If no building has
+been tested yet: testCoverageScore = 0 (This makes the health score start low and improve as agents work)
+Update CityMap.tsx building rendering: Add a coverage bar under each building rect (2px tall, full width) Color: coverage=null → #333
+(dark, unknown) coverage 0–0.4 → #ff3b3b (red, dangerous) coverage 0.4–0.7 → #ffc107 (yellow, partial) coverage 0.7–1.0 → #00ff88
+(green, well tested)
+Building STATUS overlays (small icon in corner of building rect): status=“healthy” → no overlay status=“fire” → red glow pulse
+(already exists, keep) status=“alarm” → orange glow pulse status=“untested” → dark building, grey windows status=“excellent” →
+green sparkle (coverage ≥ 0.9 + 0 bugs)
+Update BuildingInspector.tsx: Show “Last tested: X minutes ago” or “Never tested” Show pass/fail counts from real execution Show
+each real bug as an expandable row with stack trace
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — KNOWLEDGE BASE DEDUPLICATION + QUALITY SCORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Currently the knowledge base saves every escalation answer regardless of whether a similar one already exists. Fix this.
+Update escalationEngine.ts search(): BEFORE inserting a new entry, check for near-duplicates: SELECT * FROM knowledge_entries
+WHERE language = $language AND ABS(LENGTH(question) - LENGTH($question)) < 100 Compute word overlap similarity for each
+candidate If best_similarity >= 0.80: UPDATE existing entry: increment useCount, update answer if new confidence is higher, update
+lastUsedAt Return existing entry — do NOT insert duplicate
+Add quality scoring to knowledge_entries: Add column: qualityScore REAL DEFAULT 0.5 Computed as: (bugsFound * 0.4) + (useCount
+* 0.1) + (confidence_num * 0.5) where confidence_num: high=1.0, medium=0.7, low=0.3 Recompute after every use
+Update GET /api/knowledge/entries: Add sort options: ?sort=quality (default) | uses | date | language Add pagination: ?
+page=1&limit=20 Return total count for pagination UI
+Update KnowledgeBase.tsx page: Add sort dropdown: Quality Score / Most Used / Newest / Language Add pagination controls
+(prev/next, page numbers) Show quality score as a star rating (0.0-1.0 → 0-5 stars, half-star) Add “Delete” button on each row (with
+confirmation) Add “Export KB” button: downloads all entries as JSON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — NPC THOUGHT BUBBLES IN THE CITY MAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Agents currently move and show emoji. Make their thinking visible.
+Update wsServer.ts — add new broadcast type: broadcastThought(npcId: string, thought: string, duration: number) Message: { type:
+“npc_thought”, payload: { npcId, thought, duration } }
+Update agentEngine.ts — emit thoughts at key moments: When choosing target: “Scanning for high-complexity targets…” When
+starting local attempt: “Analyzing [filename]… attempt [n]/3” When local attempt fails: “Tests too trivial. Trying different approach…”
+When escalating: “This is beyond me. Consulting senior AI…” When KB hit: “Found a similar case in memory! Applying…” When bugs
+found: “Found [n] issue(s) in [filename]!” When task complete: “Filing report at the tower.”
+Thoughts are truncated to 60 chars. Duration: 3000ms default, 5000ms for escalation/bugs.
+Update CityMap.tsx thought bubble rendering: Add a SVG <text> element above each agent dot when thought is active Style: white
+text, dark semi-transparent rounded rect background Animate in: fade + slide up (0.2s) Animate out: fade out after duration ms If
+thought is too long for current zoom: truncate with “…”
+Keep a Map<npcId, { thought: string, expiresAt: number }> in state Clear expired thoughts in a useEffect with setInterval(100ms)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — MULTI-REPO SUPPORT + REPO HISTORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Currently only one city exists at a time. Loading a new repo destroys the previous one.
+Update lib/db/src/schema/repos.ts — add: id: serial primary key (already exists) slug: text unique ← URL-safe identifier e.g. “facebookreact” isActive: boolean default false
+Update routes/repo.ts POST /api/repo/load: Generate slug from repoUrl: take last two path segments, lowercase, replace / with -, strip
+special chars e.g. “github.com/facebook/react” → “facebook-react” Set isActive=true on new repo, isActive=false on all others Do NOT
+delete old repos — keep history
+Add GET /api/repos route: Returns all repos ordered by loadedAt desc Each: { id, slug, repoName, fileCount, healthScore, season,
+isActive, loadedAt, analysisTime }
+Add GET /api/repos/:slug/layout (mirrors /api/city/layout but for any slug) Add POST /api/repos/:slug/activate — sets this repo as active
+city
+Update Landing.tsx: Below the load form, add “Recent Cities” section Shows last 5 loaded repos as cards with: repo name, health
+score badge, season icon, file count, date Click any card → POST /api/repos/:slug/activate → navigate to /city “Delete” (×) button on
+each card → DELETE /api/repos/:slug
+Add DELETE /api/repos/:slug route: Removes repo + its agents + its events from DB If deleting active repo: set most recent other repo
+as active
+Update App.tsx routes: /city → active city (existing behavior) /city/:slug → specific repo by slug
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — SHAREABLE CITY URL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Make it possible to share a read-only snapshot of a city.
+Add GET /api/city/share route: Creates a share token: random 8-char alphanumeric string Stores in a new DB table: shared_snapshots {
+token, repoSlug, snapshotData (JSON), createdAt, viewCount } Returns: { url: “/shared/[token]”, token }
+Add GET /api/shared/:token route: Increments viewCount Returns the frozen snapshot JSON (city layout at share time) Include: {
+layout, healthScore, season, agentCount, bugsFound, repoName, sharedAt }
+Add lib/db/src/schema/snapshots.ts: shared_snapshots table with the fields above Export from schema/index.ts
+Update App.tsx — add route /shared/:token New page: src/pages/SharedCity.tsx Read-only city view — same SVG renderer, no agent
+controls Shows banner: “ Snapshot of [repoName] — shared [date]” Shows view count: “Viewed X times” “Load this repo” button if
+viewer wants to analyze it themselves No WebSocket connection (static snapshot)
+Update CityView.tsx toolbar: Add “Share” button next to Export On click: POST /api/city/share → copy URL to clipboard Show toast:
+“Link copied! /shared/abc12345”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — GIT DIFF VIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The git timeline exists. Now show what actually changed.
+Install: diff2html (add to artifacts/software-city/package.json) (renders git diffs as beautiful HTML side-by-side)
+Add GET /api/city/diff?path=…&from=HASH&to=HASH route: Use simple-git to run: git diff [from] [to] – [path] Returns: { rawDiff:
+string, stats: { additions, deletions, files } } If path not provided: full repo diff between commits
+Add GET /api/city/commit/:hash route: Returns commit detail: { hash, author, date, message, changedFiles: [{ path, additions, deletions,
+status }] }
+Update GitTimeline in CityView.tsx: When user hovers a commit tick mark: show tooltip with commit message, author, date,
++additions/-deletions When user CLICKS a commit (not just hovers): Fetch /api/city/diff from previous commit to this one Open a slideup panel (DiffPanel) at bottom of screen Panel shows: Top: commit info (hash short, author, date, message) Left list: changed files with
++/- counts, click to view diff Right: diff2html rendered diff for selected file “Close” button or Escape key closes panel
+Create src/components/city/DiffPanel.tsx: Receives: { commit: CommitDetail, diff: string, onClose: () => void } Renders diff2html output
+inside a dark-themed wrapper Override diff2html default colors to match city theme: additions: rgba(0,255,136,0.15) border-left: 3px
+solid #00ff88 deletions: rgba(255,59,59,0.15) border-left: 3px solid #ff3b3b When a changed file is clicked in the list: Highlight the
+corresponding building in CityMap (yellow pulse)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — AGENT REPUTATION PERSISTENCE + LEADERBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Agent reputation currently resets on server restart. Fix this and add a leaderboard.
+Update lib/db/src/schema/agents.ts — add columns: truePositives: integer default 0 ← bugs confirmed real falsePositives: integer
+default 0 ← bugs that were wrong escalationCount: integer default 0 kbHits: integer default 0 ← times KB saved an escalation rank:
+text default ‘junior’ ← junior|mid|senior|principal totalTasksCompleted: integer default 0
+Update agentEngine.ts: On every task complete: persist agent stats to DB (currently only in-memory Map) Load agent stats from DB
+on server start (not just create fresh) Compute rank from DB values, not recalculate from scratch
+RANK RULES (same as original spec): junior: default mid: accuracy >= 0.60 AND totalTasks >= 20 senior: accuracy >= 0.80 AND
+totalTasks >= 50 principal: accuracy >= 0.90 AND totalTasks >= 100 AND truePositives >= 10
+Add GET /api/agents/leaderboard route: Returns all agents sorted by: primary: rank (principal > senior > mid > junior) secondary:
+bugsFound desc Each agent: full stats including accuracy, rank badge color
+Add new page: src/pages/Leaderboard.tsx Hall of fame style layout — darkroom neon aesthetic Rank 1-3 get gold/silver/bronze crown
+icons Each row: agent avatar (color circle with role initial), name, rank badge, bugs found, accuracy %, KB hits, escalations “Retire”
+button — marks agent as retired (status=“retired”), excluded from active spawning but stays in leaderboard forever Animated counter
+on bugsFound (counts up on page load)
+Add to AppLayout.tsx sidebar nav: “Leaderboard” link → /leaderboard Update App.tsx with the new route.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — CITY TIME-LAPSE MODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The git timeline slider exists. Now animate it.
+Add “Play” button to the GitTimeline component (existing in CityView): ▶ PLAY | PAUSE | RESTART | Speed: [1×] [2×] [5×]
+When PLAY is pressed: Start at commit[0] (oldest) Every (2000ms / speed) advance one commit: POST /api/city/at-commit {
+commitHash } Wait for city layout response Animate building changes: New buildings: fade in from 0 opacity + scale from 0.5 Removed
+buildings: fade out + scale to 0 Changed buildings: pulse yellow briefly New districts: slide in from edge Update health score + season
+smoothly Show current commit message as subtitle under timeline Show speed indicator: “Replaying history at 2× speed” Auto-pause
+at HEAD (latest commit)
+The animation uses existing Framer Motion (already installed). Each building in CityMap gets a key={building.id} so React reconciles
+additions/removals correctly with exit animations.
+Add layoutId={building.id} to building rects in CityMap.tsx This enables Framer Motion’s shared layout animation — buildings physically
+move between their old and new positions when commits change district layout.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — PRODUCTION HARDENING + EXPORT PACKAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 10A. RATE LIMITING ──────────────────────────────────────────────
+Install: express-rate-limit (add to artifacts/api-server/package.json)
+Add to src/app.ts: const apiLimiter = rateLimit({ windowMs: 60 * 1000, // 1 minute max: 100, // 100 requests per minute per IP message:
+{ error: “Too many requests, please slow down” } }) const heavyLimiter = rateLimit({ windowMs: 60000, max: 10 })
+app.use(’/api/’, apiLimiter) app.use(’/api/repo/load’, heavyLimiter) // repo loads are expensive app.use(’/api/city/at-commit’, heavyLimiter)
+// git checkouts too
+── 10B. REQUEST LOGGING ────────────────────────────────────────────
+Install: morgan (add to artifacts/api-server/package.json)
+Add to src/app.ts: import morgan from ‘morgan’ app.use(morgan(’[:date[iso]] :method :url :status :response-time ms’))
+── 10C. GRACEFUL SHUTDOWN ──────────────────────────────────────────
+Update src/index.ts: Handle SIGTERM and SIGINT: Stop all agent loops (clear all agent setIntervals) Close all WebSocket connections
+gracefully Close DB connection Log “Software City shutting down cleanly” process.exit(0)
+── 10D. ENVIRONMENT VALIDATION ─────────────────────────────────────
+Create artifacts/api-server/src/lib/envValidator.ts
+function validateEnv(): void Required: DATABASE_URL Warn if missing (not error): ANTHROPIC_API_KEY, GROQ_API_KEY Log status
+table on startup:
+┌─────────────────────────────────────────────────────┐
+│ SOFTWARE CITY — Environment Check │
+├──────────────────────┬──────────────────────────────┤
+│ DATABASE_URL │ ✓ Connected │
+│ Ollama │ ✓ Available (3 models) │
+│ GROQ_API_KEY │ ✓ Set │
+│ ANTHROPIC_API_KEY │ ✓ Set │
+│ File Watcher │ Ready │
+└──────────────────────┴──────────────────────────────┘
+Call this at startup before app.listen()
+── 10E. README.md ──────────────────────────────────────────────────
+Create (or overwrite) README.md at repo root:
+SOFTWARE CITY
+Transform any code repository into a living, explorable pixel-art city. Autonomous AI agents walk through your code, find bugs, and
+grow smarter over time.
+Quick Start
+Option A — Load a GitHub repo
+1. Clone this repo
+2. Copy .env.template → .env, fill in DATABASE_URL
+3. pnpm install
+4. pnpm –filter @workspace/db run db:push
+5. pnpm –filter @workspace/api-server run dev
+6. pnpm –filter @workspace/software-city run dev
+7. Open http://localhost:25205
+8. Enter any GitHub URL and click Analyze
+Option B — Watch a local folder
+Same steps 1-6, then use the “Watch Local Folder” input on the landing page. Any file save updates the city in real time.
+Optional: Enable local AI (Ollama)
+1. Install Ollama: https://ollama.com/download
+2. ollama pull deepseek-coder-v2:16b
+3. ollama pull deepseek-coder:6.7b Agents will use local AI automatically when available.
+Optional: Enable cloud AI escalation
+Add to .env: GROQ_API_KEY (free tier) or ANTHROPIC_API_KEY Agents escalate to these when stuck locally.
+Architecture
+[brief description of the 3-layer stack]
+All Free, All Local
+[list of free tools used]
+── 10F. PHASE 3 HANDOFF DOCUMENT ───────────────────────────────────
+After completing all 10 steps, run pnpm run typecheck. Zero errors required before generating the handoff.
+Generate PHASE3_HANDOFF.md: Same format as PHASE2_HANDOFF.md. Sections: 1. New files created this session (with one-line
+descriptions) 2. Modified files (what changed) 3. Verification results — run and report all checks below 4. Current full file tree 5.
+Current package.json deps (both packages) 6. TypeScript check result (zero errors or list remaining) 7. What the app does NOW vs
+Phase 2 8. What is still simulated or missing 9. Recommended Phase 4 focus
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VERIFICATION CHECKLIST — ALL MUST PASS BEFORE HANDOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHECK 1 — Real test execution: POST /api/agents/[any-id]/run-tests with a real building ID Response must contain { passed: N, failed:
+N, coverage: 0.X } coverage must NOT be null or a round number like 0.5 exactly rawOutput must contain actual test framework output
+(not empty)
+CHECK 2 — Coverage drives city visuals: A building with coverage=0 must appear darker in CityMap than a building with coverage=0.9
+Coverage bar must be visible under building rects at normal zoom
+CHECK 3 — Knowledge base deduplication: Load the same repo twice with the same config Trigger escalations both times GET
+/api/knowledge/entries — entry count should NOT double useCount on existing entries should increment instead
+CHECK 4 — Thought bubbles: Open city view with active agents Within 30 seconds, at least one thought bubble should appear above
+an NPC dot in the SVG map Text should match one of the defined thought templates
+CHECK 5 — Multi-repo: Load repo A → GET /api/repos → shows 1 entry Load repo B → GET /api/repos → shows 2 entries POST
+/api/repos/[slug-A]/activate → city shows repo A’s layout Both repos still in DB (none deleted)
+CHECK 6 — Share URL: POST /api/city/share → returns { url: “/shared/XXXXXX” } GET /api/shared/XXXXXX → returns valid snapshot
+JSON Navigate to /shared/XXXXXX → read-only city renders viewCount increments on each page load
+CHECK 7 — Diff view: git history must exist on local repo (skip if GitHub-only) Click a commit in timeline → DiffPanel opens rawDiff
+must contain actual +/- lines Clicking a changed file highlights that building in CityMap
+CHECK 8 — Agent persistence: Spawn 2 agents, let them complete 2 tasks Restart the API server (kill and restart) GET /api/agents →
+agents still exist with their stats intact bugsFound count must be preserved from before restart
+CHECK 9 — Time-lapse: Click ▶ PLAY on timeline Buildings must visually animate between commits Season badge must update as
+health changes through history PAUSE must stop advancement, PLAY must resume from paused position
+CHECK 10 — TypeScript clean + rate limiting: pnpm run typecheck → zero errors Make 150 requests to /api/health in 1 minute Requests
+101+ must return 429 Too Many Requests
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRIORITY ORDER IF TIME/USAGE RUNS SHORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If you cannot complete all 10 steps, do them in this order: MUST DO: Steps 1, 2, 4, 8, 10A-10E SHOULD DO: Steps 3, 5, 6 NICE TO
+HAVE: Steps 7, 9
+Step 1 (real test execution) is the core of this entire phase. Do not skip it under any circumstances. Steps 2 and 4 (coverage visuals +
+thought bubbles) are what make the city feel alive now that real data flows in. Step 8 (reputation persistence) prevents progress loss
+on restart. Steps 10A-10E harden the app for real use.
+Always end with PHASE3_HANDOFF.md — even if incomplete. A partial handoff is infinitely more useful than no handoff.
