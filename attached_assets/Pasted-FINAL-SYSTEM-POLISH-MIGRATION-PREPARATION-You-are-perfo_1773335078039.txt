@@ -1,0 +1,184 @@
+FINAL SYSTEM POLISH + MIGRATION PREPARATION
+
+You are performing the final improvement pass on the Software City repository before it is exported out of Replit and moved to a local development environment using Visual Studio Code and GitHub Copilot.
+
+Your task is to audit the entire repository, improve UX, performance, and developer observability, and prepare the project for long-term development. This must be done safely and without breaking any existing functionality.
+
+---
+
+## GLOBAL SAFETY RULES
+
+Before implementing anything:
+
+1. Scan the entire repository and understand the architecture.
+2. Verify whether each requested feature already exists.
+3. If a feature exists, improve it safely rather than replacing it.
+4. If a feature does not exist, implement it using the current architecture.
+5. Do NOT refactor unrelated systems.
+6. Do NOT rename files unless absolutely necessary.
+7. Do NOT change the existing architecture.
+8. Maintain compatibility with the current Godot + FastAPI + WebSocket system.
+9. Ensure performance targets remain valid:
+
+   * 60 FPS rendering
+   * < 2 second city reloads
+   * scalable to 1000+ files
+10. Prefer additive improvements rather than structural changes.
+
+---
+
+## STEP 1 — FULL REPOSITORY AUDIT
+
+Perform a full analysis of the project:
+
+Identify:
+
+* main backend modules
+* Godot client architecture
+* WebSocket communication flow
+* NPC agent systems
+* knowledge base storage
+* file watcher / reload system
+* dependency graph logic
+* city generation system
+* metrics collection system
+
+After analyzing the project, create a short internal plan describing where each improvement should integrate.
+
+---
+
+## STEP 2 — IMPLEMENT OR IMPROVE CORE UX FEATURES
+
+Only implement these features if they are missing or incomplete.
+
+---
+
+1. CITY LOADING PROGRESS UI
+
+---
+
+Verify whether the city loading system displays progress.
+
+If missing:
+
+Add a streaming loading UI showing:
+
+* progress bar
+* buildings loaded counter
+* spinner animation
+
+Backend WebSocket message:
+
+{
+"type": "city_loading",
+"loaded": X,
+"total": Y
+}
+
+Godot HUD should show progress while still allowing exploration of already-loaded districts.
+
+Do not block rendering.
+
+---
+
+2. DEPENDENCY VISUALIZATION MODE
+
+---
+
+Verify if dependency relationships between buildings are interactively visible.
+
+If not implemented:
+
+Add a dependency highlight mode.
+
+When selecting a building:
+
+* highlight connected dependency roads
+* color code relationships:
+
+green = dependency
+yellow = high coupling
+red = circular dependency
+
+Ensure the visualization remains lightweight.
+
+---
+
+3. PERFORMANCE DEBUG HUD
+
+---
+
+Verify whether runtime metrics are visible in the interface.
+
+If missing:
+
+Create a toggleable debug HUD activated with F3.
+
+Display:
+
+* FPS
+* CPU usage
+* RAM usage
+* number of active NPC agents
+* active AI requests
+* knowledge base hit rate
+
+This panel must be disabled by default.
+
+---
+
+4. ADVANCED BUILDING INSPECTOR
+
+---
+
+Verify the current inspector UI.
+
+If incomplete:
+
+Extend the inspector panel to show:
+
+Code metrics:
+
+* lines of code
+* complexity
+* test coverage
+* dependency count
+* last commit date
+
+Developer actions:
+
+* Ask NPC about this building
+* Generate tests
+* Run fuzzing
+
+Ensure inspector loading is instant.
+
+---
+
+5. KNOWLEDGE BASE VISUALIZATION
+
+---
+
+Verify whether the knowledge_base database is visible in the UI.
+
+If missing:
+
+Add a "Knowledge Library" inside the Developer Tower.
+
+Display:
+
+* total stored solutions
+* most reused answers
+* categorized problems
+
+Allow:
+
+* searching the database
+* viewing stored answers
+* viewing associated code snippets
+
+Use lightweight SQLite queries only.
+
+---
+
+6. NPC ACTIVITY VISUALIZAT
