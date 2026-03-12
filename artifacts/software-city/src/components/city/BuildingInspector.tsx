@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Building, Agent, useAssignAgentTask, useChatWithAgent } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { Terminal, Shield, ShieldCheck, Flame, Activity, GitCommit, FileCode, MessageSquare, Send, Zap, FlaskConical, X, Bot } from "lucide-react";
+import { Terminal, Shield, ShieldCheck, Flame, Activity, GitCommit, FileCode, MessageSquare, Send, Zap, FlaskConical, X, Bot, ThumbsUp, ThumbsDown, Target } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 interface ChatMessage {
@@ -42,6 +42,7 @@ export function BuildingInspector({
   const [chatMsg, setChatMsg] = useState("");
   const [chatLog, setChatLog] = useState<ChatMessage[]>([]);
   const [pendingEscalation, setPendingEscalation] = useState(false);
+  const [verdictPending, setVerdictPending] = useState(false);
 
   const firstAgent = agents.length > 0 ? agents[0] : null;
   const workingAgent = agents.find(a => a.status === "working") ?? firstAgent;
@@ -84,6 +85,49 @@ export function BuildingInspector({
       agentId,
       data: { taskType: type, buildingId: building.id, context: "Perform analysis on " + building.name },
     });
+  };
+
+  const handleTargetBuilding = async () => {
+    if (!agentId) {
+      toast({ title: "No agents available", description: "Spawn an agent first.", variant: "destructive" });
+      return;
+    }
+    try {
+      const res = await fetch(`/api/agents/${agentId}/task`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskType: "analyze_bug", buildingId: building.id, context: `Targeted inspection of ${building.name}` }),
+      });
+      if (!res.ok) throw new Error("Target failed");
+      toast({ title: "Agent targeted", description: `${workingAgent?.name} is now inspecting ${building.name}` });
+    } catch {
+      toast({ title: "Failed to target building", variant: "destructive" });
+    }
+  };
+
+  const handleVerdict = async (verdict: "true_positive" | "false_positive") => {
+    if (!agentId) {
+      toast({ title: "No agent to rate", variant: "destructive" });
+      return;
+    }
+    setVerdictPending(true);
+    try {
+      const res = await fetch(`/api/agents/${agentId}/verdict`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verdict }),
+      });
+      if (!res.ok) throw new Error();
+      const result = await res.json() as { accuracy: number };
+      toast({
+        title: verdict === "true_positive" ? "Marked as real bug" : "Marked as false positive",
+        description: `Agent accuracy updated to ${Math.round(result.accuracy * 100)}%`,
+      });
+    } catch {
+      toast({ title: "Failed to record verdict", variant: "destructive" });
+    } finally {
+      setVerdictPending(false);
+    }
   };
 
   const handleChat = (e: React.FormEvent) => {
@@ -178,10 +222,19 @@ export function BuildingInspector({
         </div>
 
         {workingAgent && (
-          <div className="text-[10px] font-mono text-muted-foreground flex items-center gap-1.5 bg-primary/5 px-2 py-1.5 rounded border border-primary/10">
-            <Bot size={11} className="text-primary" />
-            <span className="text-primary">{workingAgent.name}</span>
-            <span>({workingAgent.role.replace("_", " ")}) assigned</span>
+          <div className="flex items-center justify-between bg-primary/5 px-2 py-1.5 rounded border border-primary/10">
+            <div className="text-[10px] font-mono text-muted-foreground flex items-center gap-1.5">
+              <Bot size={11} className="text-primary" />
+              <span className="text-primary">{workingAgent.name}</span>
+              <span>({workingAgent.role.replace("_", " ")}) assigned</span>
+            </div>
+            <button
+              onClick={handleTargetBuilding}
+              className="flex items-center gap-1 text-[10px] font-mono text-primary/70 hover:text-primary transition-colors border border-primary/20 hover:border-primary/40 rounded px-1.5 py-0.5"
+              title="Target this building for inspection"
+            >
+              <Target size={10} /> Focus
+            </button>
           </div>
         )}
 
@@ -204,6 +257,36 @@ export function BuildingInspector({
             </div>
           )}
         </div>
+
+        {/* Verdict buttons — rate last bug finding */}
+        {agentId && (
+          <div className="space-y-2">
+            <h3 className="font-mono text-xs uppercase text-muted-foreground tracking-wider">Rate Last Finding</h3>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handleVerdict("true_positive")}
+                disabled={verdictPending}
+                className="flex-1 h-9 border-green-400/30 text-green-400 hover:bg-green-400/10 text-xs font-mono gap-1.5"
+              >
+                <ThumbsUp size={12} /> Real Bug
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handleVerdict("false_positive")}
+                disabled={verdictPending}
+                className="flex-1 h-9 border-orange-400/30 text-orange-400 hover:bg-orange-400/10 text-xs font-mono gap-1.5"
+              >
+                <ThumbsDown size={12} /> False +
+              </Button>
+            </div>
+            <p className="text-[10px] font-mono text-muted-foreground/50">
+              Voting updates the agent's accuracy score
+            </p>
+          </div>
+        )}
 
         <div className="border border-primary/20 rounded-lg overflow-hidden flex flex-col h-64 bg-black/40">
           <div className="bg-primary/10 p-2 border-b border-primary/20 text-xs font-mono text-primary flex items-center gap-2">

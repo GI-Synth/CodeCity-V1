@@ -1,7 +1,7 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useGetKnowledgeStats, useGetKnowledgeEntries } from "@workspace/api-client-react";
-import { Brain, DatabaseZap, ShieldAlert, BookOpen, Search, X, Download, Trash2, Star, ArrowUpDown, ChevronLeft, ChevronRight } from "lucide-react";
+import { Brain, DatabaseZap, ShieldAlert, BookOpen, Search, X, Download, Trash2, Star, ArrowUpDown, ChevronLeft, ChevronRight, Upload } from "lucide-react";
 import { format } from "date-fns";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,8 @@ export function KnowledgeBase() {
   const [sortKey, setSortKey] = useState<SortKey>("createdAt");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(1);
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -97,6 +99,35 @@ export function KnowledgeBase() {
     link.click();
   };
 
+  const handleImportClick = () => importInputRef.current?.click();
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const entries = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.entries) ? parsed.entries : null);
+      if (!entries) throw new Error("Expected array or { entries: [...] }");
+      const res = await fetch("/api/knowledge/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(entries),
+      });
+      if (!res.ok) throw new Error("Server error");
+      const result = await res.json() as { imported: number; skipped: number };
+      toast({ title: `Imported ${result.imported} entries`, description: result.skipped > 0 ? `${result.skipped} skipped (missing question/answer)` : undefined });
+      refetchEntries();
+      refetchStats();
+    } catch (err: any) {
+      toast({ title: "Import failed", description: err.message ?? "Invalid JSON or network error", variant: "destructive" });
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  };
+
   const SortButton = ({ label, sk }: { label: string; sk: SortKey }) => (
     <button
       onClick={() => handleSort(sk)}
@@ -122,9 +153,21 @@ export function KnowledgeBase() {
               The collective memory of all agents. Escalations are saved here to improve future performance.
             </p>
           </div>
-          <Button variant="outline" size="sm" onClick={handleExport} className="font-mono border-secondary/30 text-secondary hover:bg-secondary/10">
-            <Download size={13} className="mr-1.5" /> Export JSON
-          </Button>
+          <div className="flex items-center gap-2">
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={handleImportFile}
+            />
+            <Button variant="outline" size="sm" onClick={handleImportClick} disabled={importing} className="font-mono border-primary/30 text-primary hover:bg-primary/10">
+              <Upload size={13} className="mr-1.5" /> {importing ? "Importing…" : "Import JSON"}
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleExport} className="font-mono border-secondary/30 text-secondary hover:bg-secondary/10">
+              <Download size={13} className="mr-1.5" /> Export JSON
+            </Button>
+          </div>
         </div>
 
         {stats && (

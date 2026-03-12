@@ -57,6 +57,86 @@ router.post("/spawn", async (req, res) => {
   }
 });
 
+router.patch("/:agentId/pause", async (req, res): Promise<void> => {
+  const { agentId } = req.params;
+  try {
+    const agents = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
+    if (agents.length === 0) {
+      res.status(404).json({ error: "NOT_FOUND" });
+      return;
+    }
+    const agent = agents[0];
+    const nowPaused = agent.status !== "paused";
+    const newStatus = nowPaused ? "paused" : "idle";
+    await db.update(agentsTable).set({ status: newStatus }).where(eq(agentsTable.id, agentId));
+    res.json({ success: true, paused: nowPaused, status: newStatus });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "PAUSE_ERROR", message });
+  }
+});
+
+router.patch("/pause-all", async (_req, res) => {
+  try {
+    const agents = await db.select().from(agentsTable);
+    const anyActive = agents.some(a => a.status !== "paused" && a.status !== "retired");
+    const newStatus = anyActive ? "paused" : "idle";
+    for (const agent of agents) {
+      if (agent.status !== "retired") {
+        await db.update(agentsTable).set({ status: newStatus }).where(eq(agentsTable.id, agent.id));
+      }
+    }
+    res.json({ success: true, paused: anyActive, status: newStatus });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "PAUSE_ALL_ERROR", message });
+  }
+});
+
+router.patch("/:agentId/verdict", async (req, res): Promise<void> => {
+  const { agentId } = req.params;
+  const { verdict } = req.body as { verdict: "true_positive" | "false_positive" };
+
+  if (verdict !== "true_positive" && verdict !== "false_positive") {
+    res.status(400).json({ error: "INVALID_VERDICT", message: "verdict must be true_positive or false_positive" });
+    return;
+  }
+
+  try {
+    const agents = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
+    if (agents.length === 0) {
+      res.status(404).json({ error: "NOT_FOUND" });
+      return;
+    }
+    const agent = agents[0];
+
+    const newTp = agent.truePositives + (verdict === "true_positive" ? 1 : 0);
+    const newFp = agent.falsePositives + (verdict === "false_positive" ? 1 : 0);
+    const total = newTp + newFp;
+    const newAccuracy = total > 0 ? newTp / total : 0.8;
+
+    await db.update(agentsTable).set({
+      truePositives: newTp,
+      falsePositives: newFp,
+      accuracy: newAccuracy,
+    }).where(eq(agentsTable.id, agentId));
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}`,
+      type: "verdict",
+      agentId,
+      agentName: agent.name,
+      message: `${agent.name} verdict: ${verdict.replace("_", " ")} — accuracy now ${Math.round(newAccuracy * 100)}%`,
+      severity: verdict === "false_positive" ? "warning" : "info",
+    }).catch(() => {});
+
+    res.json({ success: true, verdict, truePositives: newTp, falsePositives: newFp, accuracy: newAccuracy });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "VERDICT_ERROR", message });
+  }
+});
+
 router.post("/:agentId/task", async (req, res): Promise<void> => {
   try {
     const { agentId } = req.params;

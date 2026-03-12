@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef, Component, useCallback } from "react";
 import type { ReactNode, ErrorInfo } from "react";
+import { useLocation } from "wouter";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { CityMap } from "@/components/city/CityMap";
 import { BuildingInspector } from "@/components/city/BuildingInspector";
 import { HUD } from "@/components/city/HUD";
+import { GuidedTour, useTour } from "@/components/GuidedTour";
+import { ShortcutsPanel } from "@/components/ShortcutsPanel";
 import { useGetCityLayout, useGetCityHealth, useGetLiveMetrics, useListAgents } from "@workspace/api-client-react";
 import type { Agent } from "@workspace/api-client-react";
-import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check } from "lucide-react";
+import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check, Keyboard, MapPin } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { Button } from "@/components/ui/button";
@@ -50,7 +53,13 @@ class CityMapErrorBoundary extends Component<
   }
 }
 
-function DebugHUD({ metrics, agents, visible }: { metrics: any; agents: Agent[]; visible: boolean }) {
+function DebugHUD({ metrics, agents, visible, visibleBuildings, totalBuildings }: {
+  metrics: any;
+  agents: Agent[];
+  visible: boolean;
+  visibleBuildings?: number;
+  totalBuildings?: number;
+}) {
   const [fps, setFps] = useState(60);
   const frameCount = useRef(0);
   const lastTime = useRef(performance.now());
@@ -87,6 +96,14 @@ function DebugHUD({ metrics, agents, visible }: { metrics: any; agents: Agent[];
       <DebugRow label="Active Agents" value={activeAgents.toString()} color="text-primary" icon={Activity} />
       <DebugRow label="Escalating" value={escalatingAgents.toString()} color={escalatingAgents > 0 ? "text-warning" : "text-muted-foreground"} icon={Brain} />
       <DebugRow label="Bugs Found" value={metrics?.bugsFound?.toString() ?? "—"} color="text-destructive" icon={Zap} />
+      {visibleBuildings !== undefined && totalBuildings !== undefined && (
+        <DebugRow
+          label="Rendering"
+          value={`${visibleBuildings}/${totalBuildings}`}
+          color={visibleBuildings === totalBuildings ? "text-muted-foreground" : "text-primary"}
+          icon={MapPin}
+        />
+      )}
       <div className="border-t border-yellow-400/20 pt-2 text-[10px] text-muted-foreground">
         Press <kbd className="px-1 py-0.5 bg-black/40 border border-border rounded text-yellow-400">F3</kbd> to toggle
       </div>
@@ -105,13 +122,17 @@ function DebugRow({ label, value, color, icon: Icon }: { label: string; value: s
 
 export function CityView() {
   const { toast } = useToast();
+  const [, setLocation] = useLocation();
   const [selectedBuildingId, setSelectedBuildingId] = useState<string | null>(null);
   const [debugVisible, setDebugVisible] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [wsAgentOverrides, setWsAgentOverrides] = useState<Map<string, { x: number; y: number }>>(new Map());
   const [flashedBuildings, setFlashedBuildings] = useState<Set<string>>(new Set());
   const [npcThoughts, setNpcThoughts] = useState<Map<string, string>>(new Map());
   const [sharing, setSharing] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState<number | undefined>(undefined);
+  const [totalCount, setTotalCount] = useState<number | undefined>(undefined);
 
   const { data: layout, isLoading: layoutLoading } = useGetCityLayout({ query: { refetchInterval: 10000 } });
   const { data: health, refetch: refetchHealth } = useGetCityHealth({ query: { refetchInterval: 10000 } });
@@ -119,6 +140,7 @@ export function CityView() {
   const { data: agentsData, refetch: refetchAgents } = useListAgents({ query: { refetchInterval: 5000 } });
 
   const { connected: wsConnected, lastMessage } = useWebSocket();
+  const { showTour, startTour, endTour } = useTour();
 
   const agents: Agent[] = (agentsData?.agents ?? []).map(a => {
     const override = wsAgentOverrides.get(a.id);
@@ -190,11 +212,25 @@ export function CityView() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+
       if (e.key === "F3") { e.preventDefault(); setDebugVisible(v => !v); }
+      else if (e.key === "?") { e.preventDefault(); setShortcutsOpen(v => !v); }
+      else if (e.key === "Escape") {
+        if (shortcutsOpen) { setShortcutsOpen(false); return; }
+        if (showTour) { endTour(); return; }
+        setSelectedBuildingId(null);
+      }
+      else if (e.key === "t" || e.key === "T") { startTour(); }
+      else if (e.key === "k" || e.key === "K") { setLocation("/knowledge"); }
+      else if (e.key === "a" || e.key === "A") { setLocation("/agents"); }
+      else if (e.key === "g" || e.key === "G") { setLocation("/city"); }
+      else if (e.key === "l" || e.key === "L") { setLocation("/leaderboard"); }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [shortcutsOpen, showTour, endTour, startTour, setLocation]);
 
   const handleExport = () => {
     const link = document.createElement("a");
@@ -231,11 +267,19 @@ export function CityView() {
   return (
     <AppLayout>
       <div className="relative w-full h-full flex">
-        <div className="flex-1 relative">
-          <HUD health={health} metrics={metrics} wsConnected={wsConnected} ollamaAvailable={ollamaAvailable} />
-          <DebugHUD metrics={metrics} agents={agents} visible={debugVisible} />
+        <div className="flex-1 relative" data-tour="city-map">
+          <div data-tour="hud">
+            <HUD health={health} metrics={metrics} wsConnected={wsConnected} ollamaAvailable={ollamaAvailable} />
+          </div>
+          <DebugHUD
+            metrics={metrics}
+            agents={agents}
+            visible={debugVisible}
+            visibleBuildings={visibleCount}
+            totalBuildings={totalCount}
+          />
 
-          <div className="absolute top-4 right-4 z-20 flex gap-2">
+          <div className="absolute top-4 right-4 z-20 flex gap-2" data-tour="share-btn">
             <Button variant="outline" size="sm" onClick={handleExport} className="h-8 text-xs font-mono border-primary/30">
               <Download size={12} className="mr-1.5" /> Export
             </Button>
@@ -249,6 +293,15 @@ export function CityView() {
               {shareUrl ? <Check size={12} className="mr-1.5" /> : <Share2 size={12} className="mr-1.5" />}
               {sharing ? "Sharing…" : shareUrl ? "Copied!" : "Share"}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShortcutsOpen(true)}
+              className="h-8 text-xs font-mono border-primary/30"
+              title="Keyboard shortcuts (?)"
+            >
+              <Keyboard size={12} />
+            </Button>
           </div>
 
           <CityMapErrorBoundary>
@@ -259,12 +312,13 @@ export function CityView() {
               onSelectBuilding={setSelectedBuildingId}
               flashedBuildings={flashedBuildings}
               npcThoughts={npcThoughts}
+              onVisibleCountChange={(visible, total) => { setVisibleCount(visible); setTotalCount(total); }}
             />
           </CityMapErrorBoundary>
 
           {!debugVisible && (
             <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] font-mono text-muted-foreground/40 pointer-events-none select-none">
-              Press F3 for debug metrics
+              Press F3 for debug metrics · ? for shortcuts · T for tour
             </div>
           )}
         </div>
@@ -277,6 +331,9 @@ export function CityView() {
           />
         )}
       </div>
+
+      <ShortcutsPanel open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      {showTour && <GuidedTour onDone={endTour} />}
     </AppLayout>
   );
 }

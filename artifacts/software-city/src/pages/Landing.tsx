@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import {
   Github, Play, Terminal, ChevronDown, ChevronUp,
   KeyRound, ExternalLink, FolderOpen, Eye, Save, X, Clock, Zap,
+  Building2, Bot, Search, Flame,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
@@ -40,6 +41,36 @@ function healthColor(score: number) {
   return "text-red-400";
 }
 
+const HOW_IT_WORKS = [
+  {
+    icon: Building2,
+    step: "01",
+    title: "Paste a Repo URL",
+    body: "Point Software City at any public GitHub repository — or a private one with a personal access token. You can also watch a local folder.",
+    color: "text-primary",
+    bg: "bg-primary/10",
+    border: "border-primary/30",
+  },
+  {
+    icon: Search,
+    step: "02",
+    title: "City Generates",
+    body: "Our AI mapper scans every file and turns it into a building. Size = lines of code. Color = file type. Districts group related files. Coverage bars show test health.",
+    color: "text-yellow-400",
+    bg: "bg-yellow-400/10",
+    border: "border-yellow-400/30",
+  },
+  {
+    icon: Bot,
+    step: "03",
+    title: "Agents Patrol",
+    body: "Autonomous AI agents patrol your city around the clock. When they find a bug, a fire breaks out. Fixes heal the building. Learnings are saved to a shared knowledge base.",
+    color: "text-orange-400",
+    bg: "bg-orange-400/10",
+    border: "border-orange-400/30",
+  },
+];
+
 export function Landing() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
@@ -50,6 +81,7 @@ export function Landing() {
   const [localPath, setLocalPath] = useState(() => localStorage.getItem(LS_LOCAL) ?? "");
   const [watchStatus, setWatchStatus] = useState<"idle" | "watching">("idle");
   const [savedIndicator, setSavedIndicator] = useState(false);
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
 
   const hasSaved = !!(localStorage.getItem(LS_REPO) || localStorage.getItem(LS_TOKEN));
 
@@ -145,24 +177,38 @@ export function Landing() {
   const isLoading = loadMutation.isPending;
 
   return (
-    <div className="min-h-screen w-full bg-background relative flex items-center justify-center overflow-hidden">
+    <div className="min-h-screen w-full bg-background relative overflow-x-hidden">
+      {/* Animated background */}
       <div className="absolute inset-0 z-0">
         <img
           src="/api/assets/hero"
           alt="Cyberpunk City"
-          className="w-full h-full object-cover opacity-30 object-center"
+          className="w-full h-full object-cover opacity-25 object-center"
         />
         <div className="absolute inset-0 bg-gradient-to-b from-background/80 via-background/60 to-background" />
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#80808012_1px,transparent_1px),linear-gradient(to_bottom,#80808012_1px,transparent_1px)] bg-[size:24px_24px] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)]" />
+        {/* Floating particles */}
+        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+          {[...Array(6)].map((_, i) => (
+            <motion.div
+              key={i}
+              className="absolute w-1 h-1 rounded-full bg-primary/40"
+              style={{ left: `${15 + i * 15}%`, top: `${20 + (i % 3) * 20}%` }}
+              animate={{ y: [0, -30, 0], opacity: [0.4, 0.8, 0.4] }}
+              transition={{ duration: 3 + i * 0.5, repeat: Infinity, delay: i * 0.4 }}
+            />
+          ))}
+        </div>
       </div>
 
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.8, ease: "easeOut" }}
-        className="z-10 w-full max-w-2xl px-6"
-      >
-        <div className="text-center mb-10">
+      <div className="relative z-10 flex flex-col items-center px-6 py-12">
+        {/* Hero */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.8, ease: "easeOut" }}
+          className="text-center mb-12 max-w-3xl w-full"
+        >
           <motion.div
             initial={{ scale: 0.8 }}
             animate={{ scale: 1 }}
@@ -176,242 +222,298 @@ export function Landing() {
           <h1 className="text-5xl md:text-7xl font-mono font-bold text-white mb-4 tracking-tighter text-glow">
             SOFTWARE <span className="text-primary">CITY</span>
           </h1>
-          <p className="text-lg md:text-xl text-muted-foreground font-mono max-w-xl mx-auto leading-relaxed">
+          <p className="text-lg md:text-xl text-muted-foreground font-mono max-w-xl mx-auto leading-relaxed mb-6">
             A living, breathing visualization of your codebase.
             Watch AI agents patrol your architecture, find bugs, and maintain city health.
           </p>
-        </div>
 
-        <div className="glass-panel p-8 rounded-2xl">
-          {/* Recent repos */}
-          {recentRepos.length > 0 && (
-            <div className="mb-6">
-              <div className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2 mb-3">
-                <Clock size={12} /> Recent Cities
-              </div>
-              <div className="space-y-2">
-                {recentRepos.slice(0, 3).map(repo => (
-                  <button
-                    key={repo.id}
-                    onClick={() => handleQuickLoad(repo)}
-                    disabled={isLoading}
-                    className={cn(
-                      "w-full flex items-center justify-between gap-3 px-4 py-3 rounded-lg border transition-all duration-200 text-left group",
-                      repo.isActive
-                        ? "border-primary/50 bg-primary/8 hover:bg-primary/15"
-                        : "border-border/30 bg-black/30 hover:border-primary/30 hover:bg-black/50"
-                    )}
+          <div className="flex justify-center gap-8 text-xs font-mono text-muted-foreground/60 mb-8">
+            <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-success animate-pulse" /> Live Metrics</div>
+            <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-warning animate-pulse" /> Auto-Scaling</div>
+            <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-primary animate-pulse" /> AI Agents</div>
+          </div>
+
+          {/* How It Works toggle */}
+          <button
+            onClick={() => setShowHowItWorks(v => !v)}
+            className="inline-flex items-center gap-2 text-xs font-mono text-primary/70 hover:text-primary transition-colors border border-primary/20 hover:border-primary/40 rounded-full px-4 py-1.5"
+          >
+            {showHowItWorks ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+            {showHowItWorks ? "Hide" : "How it works"}
+          </button>
+        </motion.div>
+
+        {/* How It Works Section */}
+        <AnimatePresence>
+          {showHowItWorks && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.35, ease: "easeInOut" }}
+              className="w-full max-w-4xl mb-10 overflow-hidden"
+            >
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {HOW_IT_WORKS.map((step, i) => (
+                  <motion.div
+                    key={step.step}
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: i * 0.1 }}
+                    className={cn("glass-panel rounded-xl p-6 border", step.border)}
                   >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <span className="text-base shrink-0">{SEASON_ICONS[repo.season] ?? "🏙️"}</span>
-                      <div className="min-w-0">
-                        <div className="font-mono font-bold text-sm text-foreground truncate group-hover:text-primary transition-colors">
-                          {repo.repoName || repo.slug}
-                        </div>
-                        <div className="text-[11px] font-mono text-muted-foreground truncate">
-                          {repo.repoUrl}
-                        </div>
+                    <div className="flex items-center gap-3 mb-4">
+                      <div className={cn("p-2.5 rounded-lg border", step.bg, step.border)}>
+                        <step.icon size={20} className={step.color} />
                       </div>
+                      <span className={cn("font-mono text-3xl font-bold opacity-30", step.color)}>{step.step}</span>
                     </div>
-                    <div className="flex items-center gap-3 shrink-0 text-xs font-mono">
-                      <span className={healthColor(repo.healthScore ?? 0)}>
-                        {repo.healthScore ?? 0}%
-                      </span>
-                      {repo.isActive && (
-                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-primary/20 text-primary border border-primary/30 uppercase tracking-widest">
-                          active
-                        </span>
-                      )}
-                      <Zap size={12} className="text-muted-foreground group-hover:text-primary transition-colors" />
-                    </div>
-                  </button>
+                    <h3 className={cn("font-mono font-bold text-base mb-2", step.color)}>{step.title}</h3>
+                    <p className="text-sm font-mono text-muted-foreground leading-relaxed">{step.body}</p>
+                  </motion.div>
                 ))}
               </div>
-
-              <div className="relative flex items-center py-4">
-                <div className="flex-grow border-t border-border/30" />
-                <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or load new</span>
-                <div className="flex-grow border-t border-border/30" />
-              </div>
-            </div>
+            </motion.div>
           )}
+        </AnimatePresence>
 
-          <form onSubmit={handleSubmit} className="space-y-5">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-mono text-primary uppercase tracking-widest flex items-center gap-2">
-                  <Terminal size={14} /> Initialize Repository
-                </label>
-                {hasSaved && (
-                  <button
-                    type="button"
-                    onClick={handleForget}
-                    className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-red-400 transition-colors"
-                  >
-                    <X size={10} /> Forget saved
-                  </button>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <div className="relative flex-1 group">
-                  <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={20} />
-                  <Input
-                    placeholder="https://github.com/user/repo"
-                    value={repoUrl}
-                    onChange={(e) => setRepoUrl(e.target.value)}
-                    className="pl-10 h-12 bg-black/50 border-primary/30 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/50"
-                  />
+        {/* Main Form Panel */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.8, ease: "easeOut", delay: 0.15 }}
+          className="w-full max-w-2xl"
+        >
+          <div className="glass-panel p-8 rounded-2xl">
+            {/* Recent repos */}
+            {recentRepos.length > 0 && (
+              <div className="mb-6">
+                <div className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2 mb-3">
+                  <Clock size={12} /> Recent Cities
                 </div>
-                <Button type="submit" size="lg" className="h-12 w-32 font-bold" disabled={isLoading || !repoUrl}>
-                  {isLoading ? (
-                    <span className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "0ms" }} />
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "150ms" }} />
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "300ms" }} />
-                    </span>
-                  ) : savedIndicator ? (
-                    <span className="flex items-center gap-1.5 text-green-300">
-                      <Save size={13} /> Saved
-                    </span>
-                  ) : "LOAD CITY"}
-                </Button>
-              </div>
-
-              {/* Auto-save notice */}
-              <p className="text-[11px] font-mono text-muted-foreground/50 flex items-center gap-1.5">
-                <Save size={10} />
-                Repo URL and token are automatically saved in your browser for next time.
-              </p>
-            </div>
-
-            <div>
-              <button
-                type="button"
-                onClick={() => setShowAdvanced(v => !v)}
-                className="flex items-center gap-2 text-xs font-mono text-muted-foreground hover:text-primary transition-colors"
-              >
-                {showAdvanced ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                {showAdvanced ? "Hide" : "Private repo?"} — GitHub token
-                {localStorage.getItem(LS_TOKEN) && (
-                  <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400 border border-green-500/30 font-mono uppercase tracking-widest">
-                    saved
-                  </span>
-                )}
-              </button>
-
-              <AnimatePresence>
-                {showAdvanced && (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: "auto" }}
-                    exit={{ opacity: 0, height: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="overflow-hidden"
-                  >
-                    <div className="mt-3 p-4 rounded-lg border border-primary/20 bg-black/30 space-y-3">
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-mono text-primary/80 uppercase tracking-widest flex items-center gap-2">
-                          <KeyRound size={12} /> GitHub Personal Access Token
-                        </label>
-                        <div className="relative group">
-                          <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={16} />
-                          <Input
-                            type="password"
-                            placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                            value={githubToken}
-                            onChange={(e) => setGithubToken(e.target.value)}
-                            className="pl-9 h-10 bg-black/50 border-primary/20 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/40"
-                          />
-                          {githubToken && (
-                            <button
-                              type="button"
-                              onClick={() => setGithubToken("")}
-                              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-red-400 transition-colors"
-                              title="Clear token"
-                            >
-                              <X size={13} />
-                            </button>
-                          )}
+                <div className="space-y-2">
+                  {recentRepos.slice(0, 3).map(repo => (
+                    <button
+                      key={repo.id}
+                      onClick={() => handleQuickLoad(repo)}
+                      disabled={isLoading}
+                      className={cn(
+                        "w-full flex items-center justify-between gap-3 px-4 py-3 rounded-lg border transition-all duration-200 text-left group",
+                        repo.isActive
+                          ? "border-primary/50 bg-primary/8 hover:bg-primary/15"
+                          : "border-border/30 bg-black/30 hover:border-primary/30 hover:bg-black/50"
+                      )}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span className="text-base shrink-0">{SEASON_ICONS[repo.season] ?? "🏙️"}</span>
+                        <div className="min-w-0">
+                          <div className="font-mono font-bold text-sm text-foreground truncate group-hover:text-primary transition-colors">
+                            {repo.repoName || repo.slug}
+                          </div>
+                          <div className="text-[11px] font-mono text-muted-foreground truncate">
+                            {repo.repoUrl}
+                          </div>
                         </div>
                       </div>
-                      <div className="text-[11px] font-mono text-muted-foreground/70 space-y-1 leading-relaxed">
-                        <p>Your token is stored only in your browser's local storage — never sent anywhere except your own server.</p>
-                        <p>
-                          <a
-                            href="https://github.com/settings/tokens/new?scopes=repo&description=SoftwareCity"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-primary/70 hover:text-primary underline flex items-center gap-1 w-fit"
-                          >
-                            <ExternalLink size={11} /> Generate a token (needs "repo" scope)
-                          </a>
-                        </p>
+                      <div className="flex items-center gap-3 shrink-0 text-xs font-mono">
+                        <span className={healthColor(repo.healthScore ?? 0)}>
+                          {repo.healthScore ?? 0}%
+                        </span>
+                        {repo.isActive && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] bg-primary/20 text-primary border border-primary/30 uppercase tracking-widest">
+                            active
+                          </span>
+                        )}
+                        <Zap size={12} className="text-muted-foreground group-hover:text-primary transition-colors" />
                       </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
+                    </button>
+                  ))}
+                </div>
 
-            <div className="relative flex items-center py-1">
-              <div className="flex-grow border-t border-border/50"></div>
-              <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or</span>
-              <div className="flex-grow border-t border-border/50"></div>
-            </div>
-
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full h-12 group hover:bg-primary/5 border-primary/30"
-              onClick={() => demoMutation.mutate()}
-              disabled={demoMutation.isPending}
-            >
-              <Play size={16} className="mr-2 text-primary group-hover:text-primary animate-pulse" />
-              <span className="text-foreground">Run Demo Simulation</span>
-            </Button>
-
-            <div className="relative flex items-center py-1">
-              <div className="flex-grow border-t border-border/50"></div>
-              <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or watch local</span>
-              <div className="flex-grow border-t border-border/50"></div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2">
-                <FolderOpen size={14} /> Watch a Local Folder
-              </label>
-              <div className="flex gap-2">
-                <Input
-                  placeholder="C:\projects\myapp or /home/user/myapp"
-                  value={localPath}
-                  onChange={(e) => setLocalPath(e.target.value)}
-                  className="flex-1 h-10 bg-black/50 border-border/30 font-mono text-xs text-white placeholder:text-muted-foreground/40"
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-10 px-4 border-border/30"
-                  onClick={handleWatchLocal}
-                  disabled={!localPath || watchStatus === "watching"}
-                >
-                  <Eye size={14} className="mr-2" />
-                  {watchStatus === "watching" ? "Watching" : "Watch"}
-                </Button>
+                <div className="relative flex items-center py-4">
+                  <div className="flex-grow border-t border-border/30" />
+                  <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or load new</span>
+                  <div className="flex-grow border-t border-border/30" />
+                </div>
               </div>
-              <p className="text-[11px] font-mono text-muted-foreground/50">
-                Live re-analysis on file changes via WebSocket. Only works when the server has filesystem access to this path.
-              </p>
-            </div>
-          </form>
-        </div>
+            )}
 
-        <div className="mt-8 flex justify-center gap-8 text-xs font-mono text-muted-foreground/60">
-          <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-success animate-pulse" /> Live Metrics</div>
-          <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-warning animate-pulse" /> Auto-Scaling</div>
-          <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-primary animate-pulse" /> AI Agents</div>
-        </div>
-      </motion.div>
+            <form onSubmit={handleSubmit} className="space-y-5">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-mono text-primary uppercase tracking-widest flex items-center gap-2">
+                    <Terminal size={14} /> Initialize Repository
+                  </label>
+                  {hasSaved && (
+                    <button
+                      type="button"
+                      onClick={handleForget}
+                      className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-red-400 transition-colors"
+                    >
+                      <X size={10} /> Forget saved
+                    </button>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <div className="relative flex-1 group">
+                    <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={20} />
+                    <Input
+                      placeholder="https://github.com/user/repo"
+                      value={repoUrl}
+                      onChange={(e) => setRepoUrl(e.target.value)}
+                      className="pl-10 h-12 bg-black/50 border-primary/30 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/50"
+                    />
+                  </div>
+                  <Button type="submit" size="lg" className="h-12 w-32 font-bold" disabled={isLoading || !repoUrl}>
+                    {isLoading ? (
+                      <span className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "0ms" }} />
+                        <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "150ms" }} />
+                        <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "300ms" }} />
+                      </span>
+                    ) : savedIndicator ? (
+                      <span className="flex items-center gap-1.5 text-green-300">
+                        <Save size={13} /> Saved
+                      </span>
+                    ) : "LOAD CITY"}
+                  </Button>
+                </div>
+
+                <p className="text-[11px] font-mono text-muted-foreground/50 flex items-center gap-1.5">
+                  <Save size={10} />
+                  Repo URL and token are automatically saved in your browser for next time.
+                </p>
+              </div>
+
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced(v => !v)}
+                  className="flex items-center gap-2 text-xs font-mono text-muted-foreground hover:text-primary transition-colors"
+                >
+                  {showAdvanced ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                  {showAdvanced ? "Hide" : "Private repo?"} — GitHub token
+                  {localStorage.getItem(LS_TOKEN) && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400 border border-green-500/30 font-mono uppercase tracking-widest">
+                      saved
+                    </span>
+                  )}
+                </button>
+
+                <AnimatePresence>
+                  {showAdvanced && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="mt-3 p-4 rounded-lg border border-primary/20 bg-black/30 space-y-3">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-mono text-primary/80 uppercase tracking-widest flex items-center gap-2">
+                            <KeyRound size={12} /> GitHub Personal Access Token
+                          </label>
+                          <div className="relative group">
+                            <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={16} />
+                            <Input
+                              type="password"
+                              placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                              value={githubToken}
+                              onChange={(e) => setGithubToken(e.target.value)}
+                              className="pl-9 h-10 bg-black/50 border-primary/20 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/40"
+                            />
+                            {githubToken && (
+                              <button
+                                type="button"
+                                onClick={() => setGithubToken("")}
+                                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-red-400 transition-colors"
+                                title="Clear token"
+                              >
+                                <X size={13} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="text-[11px] font-mono text-muted-foreground/70 space-y-1 leading-relaxed">
+                          <p>Your token is stored only in your browser's local storage — never sent anywhere except your own server.</p>
+                          <p>
+                            <a
+                              href="https://github.com/settings/tokens/new?scopes=repo&description=SoftwareCity"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-primary/70 hover:text-primary underline flex items-center gap-1 w-fit"
+                            >
+                              <ExternalLink size={11} /> Generate a token (needs "repo" scope)
+                            </a>
+                          </p>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              <div className="relative flex items-center py-1">
+                <div className="flex-grow border-t border-border/50"></div>
+                <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or</span>
+                <div className="flex-grow border-t border-border/50"></div>
+              </div>
+
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full h-12 group hover:bg-primary/5 border-primary/30"
+                onClick={() => demoMutation.mutate()}
+                disabled={demoMutation.isPending}
+              >
+                <Play size={16} className="mr-2 text-primary group-hover:text-primary animate-pulse" />
+                <span className="text-foreground">Run Demo Simulation</span>
+              </Button>
+
+              <div className="relative flex items-center py-1">
+                <div className="flex-grow border-t border-border/50"></div>
+                <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or watch local</span>
+                <div className="flex-grow border-t border-border/50"></div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2">
+                  <FolderOpen size={14} /> Watch a Local Folder
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="C:\projects\myapp or /home/user/myapp"
+                    value={localPath}
+                    onChange={(e) => setLocalPath(e.target.value)}
+                    className="flex-1 h-10 bg-black/50 border-border/30 font-mono text-xs text-white placeholder:text-muted-foreground/40"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-10 px-4 border-border/30"
+                    onClick={handleWatchLocal}
+                    disabled={!localPath || watchStatus === "watching"}
+                  >
+                    <Eye size={14} className="mr-2" />
+                    {watchStatus === "watching" ? "Watching" : "Watch"}
+                  </Button>
+                </div>
+                <p className="text-[11px] font-mono text-muted-foreground/50">
+                  Live re-analysis on file changes via WebSocket. Only works when the server has filesystem access to this path.
+                </p>
+              </div>
+            </form>
+          </div>
+
+          <div className="mt-8 flex justify-center gap-8 text-xs font-mono text-muted-foreground/60">
+            <div className="flex items-center gap-2"><Flame size={12} className="text-orange-400" /> Bugs as fires</div>
+            <div className="flex items-center gap-2"><Bot size={12} className="text-primary" /> AI agent patrols</div>
+            <div className="flex items-center gap-2"><Building2 size={12} className="text-green-400" /> 1 file = 1 building</div>
+          </div>
+        </motion.div>
+      </div>
     </div>
   );
 }
