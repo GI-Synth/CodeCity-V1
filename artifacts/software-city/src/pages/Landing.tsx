@@ -1,24 +1,93 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
 import { useLoadRepo, useLoadDemoRepo } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Github, Play, Terminal, ChevronDown, ChevronUp, KeyRound, ExternalLink, FolderOpen, Eye } from "lucide-react";
+import {
+  Github, Play, Terminal, ChevronDown, ChevronUp,
+  KeyRound, ExternalLink, FolderOpen, Eye, Save, X, Clock, Zap,
+} from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
+import { useQuery } from "@tanstack/react-query";
+import { cn } from "@/lib/utils";
+
+const LS_REPO = "sc_saved_repo_url";
+const LS_TOKEN = "sc_saved_github_token";
+const LS_LOCAL = "sc_saved_local_path";
+
+interface RepoListItem {
+  id: number;
+  slug: string;
+  repoName: string;
+  repoUrl: string;
+  healthScore: number;
+  season: string;
+  isActive: boolean;
+  loadedAt: string;
+}
+
+const SEASON_ICONS: Record<string, string> = {
+  summer: "☀️",
+  spring: "🌱",
+  autumn: "🍂",
+  winter: "❄️",
+};
+
+function healthColor(score: number) {
+  if (score >= 80) return "text-green-400";
+  if (score >= 50) return "text-yellow-400";
+  return "text-red-400";
+}
 
 export function Landing() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
-  const [repoUrl, setRepoUrl] = useState("");
-  const [githubToken, setGithubToken] = useState("");
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [localPath, setLocalPath] = useState("");
+
+  const [repoUrl, setRepoUrl] = useState(() => localStorage.getItem(LS_REPO) ?? "");
+  const [githubToken, setGithubToken] = useState(() => localStorage.getItem(LS_TOKEN) ?? "");
+  const [showAdvanced, setShowAdvanced] = useState(() => !!localStorage.getItem(LS_TOKEN));
+  const [localPath, setLocalPath] = useState(() => localStorage.getItem(LS_LOCAL) ?? "");
   const [watchStatus, setWatchStatus] = useState<"idle" | "watching">("idle");
+  const [savedIndicator, setSavedIndicator] = useState(false);
+
+  const hasSaved = !!(localStorage.getItem(LS_REPO) || localStorage.getItem(LS_TOKEN));
+
+  const { data: repoListData, refetch: refetchRepos } = useQuery<{ repos: RepoListItem[] }>({
+    queryKey: ["repo-list"],
+    queryFn: () => fetch("/api/repo/list").then(r => r.json()),
+  });
+
+  const recentRepos = repoListData?.repos ?? [];
+
+  const persist = (url: string, token: string, local: string) => {
+    if (url) localStorage.setItem(LS_REPO, url);
+    else localStorage.removeItem(LS_REPO);
+    if (token) localStorage.setItem(LS_TOKEN, token);
+    else localStorage.removeItem(LS_TOKEN);
+    if (local) localStorage.setItem(LS_LOCAL, local);
+    else localStorage.removeItem(LS_LOCAL);
+  };
+
+  const handleForget = () => {
+    localStorage.removeItem(LS_REPO);
+    localStorage.removeItem(LS_TOKEN);
+    localStorage.removeItem(LS_LOCAL);
+    setRepoUrl("");
+    setGithubToken("");
+    setLocalPath("");
+    toast({ title: "Saved credentials cleared" });
+  };
 
   const loadMutation = useLoadRepo({
     mutation: {
-      onSuccess: () => setLocation("/city"),
+      onSuccess: () => {
+        persist(repoUrl, githubToken, localPath);
+        setSavedIndicator(true);
+        setTimeout(() => setSavedIndicator(false), 2500);
+        refetchRepos();
+        setLocation("/city");
+      },
       onError: (err: any) => toast({
         title: "Failed to load repository",
         description: err.message || "Could not fetch repo. Check the URL and token.",
@@ -45,6 +114,16 @@ export function Landing() {
     });
   };
 
+  const handleQuickLoad = (repo: RepoListItem) => {
+    setRepoUrl(repo.repoUrl ?? "");
+    loadMutation.mutate({
+      data: {
+        repoUrl: repo.repoUrl ?? "",
+        ...(githubToken ? { githubToken } : {}),
+      },
+    });
+  };
+
   const handleWatchLocal = async () => {
     if (!localPath) return;
     try {
@@ -54,6 +133,7 @@ export function Landing() {
         body: JSON.stringify({ localPath }),
       });
       if (!res.ok) throw new Error("Watch failed");
+      persist(repoUrl, githubToken, localPath);
       setWatchStatus("watching");
       toast({ title: "Watching local folder", description: localPath });
       setLocation("/city");
@@ -103,11 +183,75 @@ export function Landing() {
         </div>
 
         <div className="glass-panel p-8 rounded-2xl">
+          {/* Recent repos */}
+          {recentRepos.length > 0 && (
+            <div className="mb-6">
+              <div className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2 mb-3">
+                <Clock size={12} /> Recent Cities
+              </div>
+              <div className="space-y-2">
+                {recentRepos.slice(0, 3).map(repo => (
+                  <button
+                    key={repo.id}
+                    onClick={() => handleQuickLoad(repo)}
+                    disabled={isLoading}
+                    className={cn(
+                      "w-full flex items-center justify-between gap-3 px-4 py-3 rounded-lg border transition-all duration-200 text-left group",
+                      repo.isActive
+                        ? "border-primary/50 bg-primary/8 hover:bg-primary/15"
+                        : "border-border/30 bg-black/30 hover:border-primary/30 hover:bg-black/50"
+                    )}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-base shrink-0">{SEASON_ICONS[repo.season] ?? "🏙️"}</span>
+                      <div className="min-w-0">
+                        <div className="font-mono font-bold text-sm text-foreground truncate group-hover:text-primary transition-colors">
+                          {repo.repoName || repo.slug}
+                        </div>
+                        <div className="text-[11px] font-mono text-muted-foreground truncate">
+                          {repo.repoUrl}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0 text-xs font-mono">
+                      <span className={healthColor(repo.healthScore ?? 0)}>
+                        {repo.healthScore ?? 0}%
+                      </span>
+                      {repo.isActive && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] bg-primary/20 text-primary border border-primary/30 uppercase tracking-widest">
+                          active
+                        </span>
+                      )}
+                      <Zap size={12} className="text-muted-foreground group-hover:text-primary transition-colors" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              <div className="relative flex items-center py-4">
+                <div className="flex-grow border-t border-border/30" />
+                <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or load new</span>
+                <div className="flex-grow border-t border-border/30" />
+              </div>
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="space-y-2">
-              <label className="text-xs font-mono text-primary uppercase tracking-widest flex items-center gap-2">
-                <Terminal size={14} /> Initialize Repository
-              </label>
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-mono text-primary uppercase tracking-widest flex items-center gap-2">
+                  <Terminal size={14} /> Initialize Repository
+                </label>
+                {hasSaved && (
+                  <button
+                    type="button"
+                    onClick={handleForget}
+                    className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-red-400 transition-colors"
+                  >
+                    <X size={10} /> Forget saved
+                  </button>
+                )}
+              </div>
               <div className="flex gap-2">
                 <div className="relative flex-1 group">
                   <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={20} />
@@ -125,9 +269,19 @@ export function Landing() {
                       <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "150ms" }} />
                       <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "300ms" }} />
                     </span>
+                  ) : savedIndicator ? (
+                    <span className="flex items-center gap-1.5 text-green-300">
+                      <Save size={13} /> Saved
+                    </span>
                   ) : "LOAD CITY"}
                 </Button>
               </div>
+
+              {/* Auto-save notice */}
+              <p className="text-[11px] font-mono text-muted-foreground/50 flex items-center gap-1.5">
+                <Save size={10} />
+                Repo URL and token are automatically saved in your browser for next time.
+              </p>
             </div>
 
             <div>
@@ -137,7 +291,12 @@ export function Landing() {
                 className="flex items-center gap-2 text-xs font-mono text-muted-foreground hover:text-primary transition-colors"
               >
                 {showAdvanced ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                {showAdvanced ? "Hide" : "Private repo?"} — add GitHub token
+                {showAdvanced ? "Hide" : "Private repo?"} — GitHub token
+                {localStorage.getItem(LS_TOKEN) && (
+                  <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400 border border-green-500/30 font-mono uppercase tracking-widest">
+                    saved
+                  </span>
+                )}
               </button>
 
               <AnimatePresence>
@@ -163,10 +322,20 @@ export function Landing() {
                             onChange={(e) => setGithubToken(e.target.value)}
                             className="pl-9 h-10 bg-black/50 border-primary/20 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/40"
                           />
+                          {githubToken && (
+                            <button
+                              type="button"
+                              onClick={() => setGithubToken("")}
+                              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-red-400 transition-colors"
+                              title="Clear token"
+                            >
+                              <X size={13} />
+                            </button>
+                          )}
                         </div>
                       </div>
                       <div className="text-[11px] font-mono text-muted-foreground/70 space-y-1 leading-relaxed">
-                        <p>Your token is sent directly to the server and never stored. Used only for this request.</p>
+                        <p>Your token is stored only in your browser's local storage — never sent anywhere except your own server.</p>
                         <p>
                           <a
                             href="https://github.com/settings/tokens/new?scopes=repo&description=SoftwareCity"
