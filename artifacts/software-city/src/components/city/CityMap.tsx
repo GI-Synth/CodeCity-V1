@@ -8,6 +8,7 @@ interface CityMapProps {
   selectedBuildingId: string | null;
   onSelectBuilding: (id: string) => void;
   highlightDistrictId?: string | null;
+  flashedBuildings?: Set<string>;
 }
 
 const TYPE_COLORS: Record<string, string> = {
@@ -57,7 +58,7 @@ function getRoadColor(road: any, isHighlighted: boolean, selectedBuildingId: str
   return { stroke: "#00ff88", width: 3 };
 }
 
-export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, highlightDistrictId }: CityMapProps) {
+export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, highlightDistrictId, flashedBuildings }: CityMapProps) {
   const bounds = useMemo(() => {
     if (!layout.districts || layout.districts.length === 0) {
       return { minX: 0, minY: 0, width: 1000, height: 1000 };
@@ -179,6 +180,8 @@ export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, 
                 if (building.age === 'ancient') opacity = 0.45;
                 if (isDimmed) opacity = Math.min(opacity, 0.3);
 
+                const isFlashing = flashedBuildings?.has(building.id) ?? false;
+
                 return (
                   <g
                     key={building.id}
@@ -190,6 +193,18 @@ export function CityMap({ layout, agents, selectedBuildingId, onSelectBuilding, 
                     style={{ transition: "opacity 0.3s" }}
                     opacity={opacity}
                   >
+                    {isFlashing && (
+                      <rect
+                        x="-8" y="-8"
+                        width={building.width + 16}
+                        height={building.height + 16}
+                        fill="rgba(255,0,0,0.35)"
+                        stroke="#ff0000"
+                        strokeWidth="3"
+                        rx="6"
+                        className="animate-ping"
+                      />
+                    )}
                     {(isSelected || building.status === 'glowing') && (
                       <rect
                         x="-6" y="-6"

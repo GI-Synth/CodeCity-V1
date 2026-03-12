@@ -7,11 +7,12 @@ import { desc } from "drizzle-orm";
 
 const router: IRouter = Router();
 
-router.post("/load", async (req, res) => {
+router.post("/load", async (req, res): Promise<void> => {
   const { repoUrl, branch = "main", githubToken } = req.body;
 
   if (!repoUrl || typeof repoUrl !== "string") {
-    return res.status(400).json({ error: "INVALID_URL", message: "repoUrl is required" });
+    res.status(400).json({ error: "INVALID_URL", message: "repoUrl is required" });
+    return;
   }
 
   const startTime = Date.now();

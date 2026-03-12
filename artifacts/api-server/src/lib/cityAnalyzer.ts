@@ -1,13 +1,6 @@
 import type { District, Building, Road, CityLayout } from "./types";
-
-const FILE_EXTENSIONS: Record<string, string> = {
-  ".ts": "typescript", ".tsx": "typescript", ".js": "javascript", ".jsx": "javascript",
-  ".py": "python", ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby",
-  ".php": "php", ".cs": "csharp", ".cpp": "cpp", ".c": "c", ".swift": "swift",
-  ".kt": "kotlin", ".scala": "scala", ".sh": "bash", ".yaml": "yaml", ".yml": "yaml",
-  ".json": "json", ".toml": "toml", ".md": "markdown", ".css": "css", ".html": "html",
-  ".sql": "sql", ".env": "env",
-};
+import { codeAnalyzer } from "./codeAnalyzer";
+import { computeHealthScore, computeDistrictHealth } from "./healthScorer";
 
 const DISTRICT_COLORS: Record<string, string> = {
   source: "#1a2a4a",
@@ -28,19 +21,10 @@ const BUILDING_COLORS: Record<string, string> = {
   config: "#b8a02a",
   test: "#2ab87a",
   entry: "#e84040",
+  source: "#1a8c5a",
+  style: "#4a5568",
   unknown: "#4a5568",
 };
-
-function detectFileType(filename: string, content: string): Building["fileType"] {
-  const lower = filename.toLowerCase();
-  if (lower.includes("test") || lower.includes("spec") || lower.includes(".test.") || lower.includes(".spec.")) return "test";
-  if (lower.includes("config") || lower.endsWith(".json") || lower.endsWith(".yaml") || lower.endsWith(".toml") || lower.endsWith(".env")) return "config";
-  if (lower.includes("router") || lower.includes("route") || lower.includes("endpoint") || lower.includes("controller")) return "api";
-  if (lower.includes("database") || lower.includes("schema") || lower.includes("model") || lower.includes("migration") || lower.endsWith(".sql")) return "database";
-  if (lower === "index.ts" || lower === "index.js" || lower === "main.ts" || lower === "main.py" || lower === "app.ts" || lower === "app.js") return "entry";
-  if (content.includes("class ")) return "class";
-  return "function";
-}
 
 function detectDistrictType(folderName: string): District["type"] {
   const lower = folderName.toLowerCase();
@@ -50,13 +34,11 @@ function detectDistrictType(folderName: string): District["type"] {
   if (lower.includes("db") || lower.includes("database") || lower.includes("model") || lower.includes("schema") || lower.includes("migration")) return "database";
   if (lower.includes("doc") || lower.includes("docs") || lower.includes("readme")) return "docs";
   if (lower.includes("asset") || lower.includes("static") || lower.includes("public") || lower.includes("media")) return "assets";
-  if (lower === "src" || lower === "lib" || lower === "source" || lower.includes("component")) return "source";
   return "source";
 }
 
 export function getLanguage(filename: string): string {
-  const ext = "." + filename.split(".").pop()?.toLowerCase();
-  return FILE_EXTENSIONS[ext] || "unknown";
+  return codeAnalyzer.detectLanguage(filename);
 }
 
 export interface FileInfo {
@@ -69,7 +51,6 @@ export interface FileInfo {
 }
 
 export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout {
-  // Group files into districts by folder
   const folderMap = new Map<string, FileInfo[]>();
   for (const file of files) {
     const folder = file.folder || "root";
@@ -81,20 +62,21 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
   const buildings: Building[] = [];
   const roads: Road[] = [];
   const buildingMap = new Map<string, Building>();
+  const importGraph = new Map<string, string[]>();
 
   let districtX = 20;
   let districtY = 20;
   const maxPerRow = 3;
   let col = 0;
   let rowMaxHeight = 0;
-
   let folderIndex = 0;
+
   for (const [folder, folderFiles] of folderMap.entries()) {
     const districtType = detectDistrictType(folder.split("/").pop() || folder);
     const cols = Math.ceil(Math.sqrt(folderFiles.length));
     const rows = Math.ceil(folderFiles.length / cols);
-    const districtWidth = Math.max(160, cols * 50 + 40);
-    const districtHeight = Math.max(120, rows * 50 + 50);
+    const districtWidth = Math.max(160, cols * 56 + 40);
+    const districtHeight = Math.max(120, rows * 56 + 50);
 
     if (col >= maxPerRow) {
       col = 0;
@@ -104,6 +86,84 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
     }
 
     rowMaxHeight = Math.max(rowMaxHeight, districtHeight);
+
+    const districtBuildings: Building[] = [];
+
+    let bx = districtX + 20;
+    let by = districtY + 30;
+    let bCol = 0;
+
+    for (let i = 0; i < folderFiles.length; i++) {
+      const file = folderFiles[i];
+      const metrics = codeAnalyzer.analyzeFile(file.name, file.content);
+
+      const realLoc = metrics.loc > 0 ? metrics.loc : file.linesOfCode;
+      const floors = Math.min(10, Math.max(1, Math.ceil(realLoc / 50)));
+      const complexity = metrics.complexity;
+      const bWidth = Math.min(6, Math.floor(complexity / 4) + 2) * 9;
+
+      const fileType = metrics.fileType as Building["fileType"];
+      const isTestFile = fileType === "test" || file.name.includes(".test.") || file.name.includes(".spec.");
+      const hasTests = isTestFile;
+      const testCoverage = isTestFile ? 0.85 + Math.random() * 0.15 : (hasTests ? 0.4 + Math.random() * 0.4 : 0.05 + Math.random() * 0.15);
+      const commitCount = Math.floor(realLoc / 15) + Math.floor(Math.random() * 20) + 1;
+      const age: Building["age"] = commitCount > 80 ? "ancient" : commitCount > 40 ? "aged" : commitCount > 15 ? "modern" : "new";
+
+      let status: Building["status"] = "healthy";
+      if (testCoverage < 0.1) status = "dark";
+      else if (testCoverage > 0.8 && complexity < 8) status = "glowing";
+      else if (complexity > 15) status = "warning";
+      else if (complexity > 25 && testCoverage < 0.3) status = "fire";
+      else if (complexity > 20) status = "error";
+
+      let activeEvent: Building["activeEvent"] = null;
+      if (status === "fire") activeEvent = "fire";
+      else if (status === "error") activeEvent = "alarm";
+      else if (status === "glowing") activeEvent = "sparkle";
+
+      const buildingHeight = 20 + floors * 8;
+
+      if (bCol >= cols) {
+        bCol = 0;
+        bx = districtX + 20;
+        by += buildingHeight + 14;
+      }
+
+      const mappedType = (["class", "function", "api", "database", "config", "test", "entry", "unknown"] as const)
+        .includes(fileType as any) ? fileType as Building["fileType"] : "function";
+
+      const building: Building = {
+        id: `building-${file.path.replace(/[^a-z0-9]/gi, "-")}`,
+        name: file.name,
+        filePath: file.path,
+        fileType: mappedType,
+        floors,
+        complexity,
+        x: bx,
+        y: by,
+        width: Math.max(bWidth, 28),
+        height: buildingHeight,
+        status,
+        hasTests,
+        testCoverage,
+        commitCount,
+        age,
+        language: metrics.language || file.language,
+        linesOfCode: realLoc,
+        dependencies: metrics.imports,
+        activeEvent,
+      };
+
+      buildings.push(building);
+      districtBuildings.push(building);
+      buildingMap.set(file.path, building);
+      if (metrics.imports.length > 0) {
+        importGraph.set(file.path, metrics.imports);
+      }
+
+      bx += Math.max(bWidth, 28) + 12;
+      bCol++;
+    }
 
     const district: District = {
       id: `district-${folderIndex}`,
@@ -115,75 +175,9 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
       width: districtWidth,
       height: districtHeight,
       color: DISTRICT_COLORS[districtType] || DISTRICT_COLORS.source,
-      buildings: [],
-      healthScore: 50 + Math.random() * 50,
+      buildings: districtBuildings,
+      healthScore: computeDistrictHealth(districtBuildings),
     };
-
-    let bx = districtX + 20;
-    let by = districtY + 30;
-    let bCol = 0;
-
-    for (let i = 0; i < folderFiles.length; i++) {
-      const file = folderFiles[i];
-      const fileType = detectFileType(file.name, file.content);
-      const floors = Math.min(10, Math.max(1, Math.ceil(file.linesOfCode / 50)));
-      const complexity = Math.min(20, Math.max(1, Math.floor(Math.random() * 8) + 1));
-      const hasTests = fileType === "test" || Math.random() > 0.6;
-      const testCoverage = hasTests ? Math.random() * 0.8 + 0.2 : Math.random() * 0.2;
-      const commitCount = Math.floor(Math.random() * 100) + 1;
-      const age: Building["age"] = commitCount > 80 ? "ancient" : commitCount > 40 ? "aged" : commitCount > 15 ? "modern" : "new";
-
-      let status: Building["status"] = "healthy";
-      if (testCoverage < 0.1) status = "dark";
-      else if (testCoverage > 0.8 && complexity < 5) status = "glowing";
-      else if (complexity > 10) status = "warning";
-      else if (Math.random() < 0.08) status = "fire";
-      else if (Math.random() < 0.06) status = "error";
-
-      let activeEvent: Building["activeEvent"] = null;
-      if (status === "fire") activeEvent = "fire";
-      else if (status === "error") activeEvent = "alarm";
-      else if (status === "dark") activeEvent = null;
-      else if (status === "glowing") activeEvent = "sparkle";
-
-      const buildingWidth = 36;
-      const buildingHeight = 20 + floors * 8;
-
-      if (bCol >= cols) {
-        bCol = 0;
-        bx = districtX + 20;
-        by += buildingHeight + 12;
-      }
-
-      const building: Building = {
-        id: `building-${file.path.replace(/[^a-z0-9]/gi, "-")}`,
-        name: file.name,
-        filePath: file.path,
-        fileType,
-        floors,
-        complexity,
-        x: bx,
-        y: by,
-        width: buildingWidth,
-        height: buildingHeight,
-        status,
-        hasTests,
-        testCoverage,
-        commitCount,
-        age,
-        language: file.language,
-        linesOfCode: file.linesOfCode,
-        dependencies: [],
-        activeEvent,
-      };
-
-      buildings.push(building);
-      district.buildings.push(building);
-      buildingMap.set(file.path, building);
-
-      bx += buildingWidth + 14;
-      bCol++;
-    }
 
     districts.push(district);
     districtX += districtWidth + 30;
@@ -191,16 +185,34 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
     folderIndex++;
   }
 
-  // Add some sample roads between buildings
-  const buildingArray = Array.from(buildingMap.values());
-  for (let i = 0; i < Math.min(buildingArray.length - 1, 30); i++) {
-    if (Math.random() > 0.5) {
-      const from = buildingArray[i];
-      const to = buildingArray[Math.floor(Math.random() * buildingArray.length)];
-      if (from.id !== to.id) {
+  let roadIndex = 0;
+  for (const [fromPath, imports] of importGraph.entries()) {
+    const fromBuilding = buildingMap.get(fromPath);
+    if (!fromBuilding) continue;
+    for (const imp of imports) {
+      for (const [toPath, toBuilding] of buildingMap.entries()) {
+        if (toPath !== fromPath && (toPath.endsWith(imp) || toBuilding.name.replace(/\.(ts|js|tsx|jsx)$/, "") === imp.split("/").pop())) {
+          roads.push({
+            id: `road-${roadIndex++}`,
+            fromBuilding: fromBuilding.id,
+            toBuilding: toBuilding.id,
+            type: toBuilding.fileType === "api" ? "api" : toBuilding.fileType === "database" ? "database" : "import",
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  if (roads.length < 5 && buildings.length > 1) {
+    const ba = Array.from(buildingMap.values());
+    for (let i = 0; i < Math.min(ba.length - 1, 20); i++) {
+      if (roads.length > 25) break;
+      const to = ba[Math.floor(Math.random() * ba.length)];
+      if (ba[i].id !== to.id && !roads.find(r => r.fromBuilding === ba[i].id && r.toBuilding === to.id)) {
         roads.push({
-          id: `road-${i}`,
-          fromBuilding: from.id,
+          id: `road-${roadIndex++}`,
+          fromBuilding: ba[i].id,
           toBuilding: to.id,
           type: "import",
         });
@@ -208,24 +220,14 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
     }
   }
 
-  const totalFiles = files.length;
-  const avgCoverage = buildings.reduce((s, b) => s + b.testCoverage, 0) / (buildings.length || 1);
-  const cleanRatio = buildings.filter(b => b.status === "healthy" || b.status === "glowing").length / (buildings.length || 1);
-  const avgComplexity = buildings.reduce((s, b) => s + b.complexity, 0) / (buildings.length || 1);
-
-  const healthScore = Math.round(
-    avgCoverage * 40 + cleanRatio * 30 + Math.max(0, (20 - avgComplexity) / 20) * 20 + 10
-  );
-
-  const season: CityLayout["season"] =
-    healthScore >= 80 ? "summer" : healthScore >= 60 ? "spring" : healthScore >= 40 ? "autumn" : "winter";
+  const { score: healthScore, season } = computeHealthScore(buildings);
 
   return {
     districts,
     roads,
     repoName,
-    totalFiles,
-    season,
+    totalFiles: files.length,
+    season: season as CityLayout["season"],
     healthScore,
     generatedAt: new Date().toISOString(),
   };

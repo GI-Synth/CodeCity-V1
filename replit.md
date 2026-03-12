@@ -123,16 +123,23 @@ Analyzed repository cache — stores the generated city layout JSON.
 |---|---|---|
 | POST | `/api/repo/load` | Load and analyze a GitHub repository |
 | POST | `/api/repo/demo` | Load the demo repository |
+| POST | `/api/repo/watch` | Start watching a local folder with chokidar |
+| GET | `/api/repo/watch/status` | File watcher status |
+| DELETE | `/api/repo/watch` | Stop file watcher |
 | GET | `/api/city/layout` | Get city layout (districts + buildings + roads) |
 | GET | `/api/city/health` | Get health score + season |
 | GET | `/api/city/metrics` | Get live CPU/memory/agent metrics |
+| GET | `/api/city/snapshot` | Export full city state as JSON file |
 | GET | `/api/agents/list` | List all NPC agents |
 | POST | `/api/agents/spawn` | Spawn a new NPC agent |
 | POST | `/api/agents/:id/task` | Assign a task to an agent |
-| POST | `/api/agents/:id/chat` | Chat with an NPC agent |
+| POST | `/api/agents/:id/chat` | Chat with an NPC agent (escalation chain) |
 | GET | `/api/knowledge/stats` | Knowledge base statistics |
 | GET | `/api/knowledge/entries` | Recent knowledge base entries |
-| GET | `/api/events/stream` | Recent city events (polled every 2s) |
+| GET | `/api/events/stream` | Recent city events (polled every 5s) |
+| GET | `/api/assets/hero` | SVG hero city skyline image |
+| GET | `/api/assets/logo` | SVG logo image |
+| GET | `/api/ollama/status` | Ollama availability + model list |
 
 ## Frontend Pages
 
@@ -143,11 +150,26 @@ Analyzed repository cache — stores the generated city layout JSON.
 
 ## Key Files
 
-- `artifacts/api-server/src/lib/cityAnalyzer.ts` — Converts file list to city layout
+- `artifacts/api-server/src/lib/cityAnalyzer.ts` — Real regex AST → city layout
+- `artifacts/api-server/src/lib/codeAnalyzer.ts` — LOC, cyclomatic complexity, imports, exports analysis
+- `artifacts/api-server/src/lib/healthScorer.ts` — Multi-factor health score → season mapping
+- `artifacts/api-server/src/lib/agentEngine.ts` — Real async NPC agent loop with Ollama 3-attempt fallback
+- `artifacts/api-server/src/lib/escalationEngine.ts` — KB→Groq→Anthropic→Ollama→fallback chain
+- `artifacts/api-server/src/lib/ollamaClient.ts` — Ollama HTTP client with concurrency semaphore
+- `artifacts/api-server/src/lib/ollamaPrompts.ts` — Test generation + dialogue prompt templates
+- `artifacts/api-server/src/lib/wsServer.ts` — WebSocket server with typed broadcast methods
+- `artifacts/api-server/src/lib/fileWatcher.ts` — Chokidar local file watcher → city re-analysis
+- `artifacts/api-server/src/lib/gitHistory.ts` — simple-git commit age + frequency reader
+- `artifacts/api-server/src/lib/assetGenerator.ts` — SVG hero background + logo generation
 - `artifacts/api-server/src/lib/githubFetcher.ts` — GitHub API integration + demo data
-- `artifacts/api-server/src/lib/agentEngine.ts` — NPC agent creation + dialogue + task simulation
-- `artifacts/software-city/src/components/city/CityMap.tsx` — Canvas-based city renderer
-- `artifacts/software-city/src/pages/CityView.tsx` — Main city page
+- `artifacts/software-city/src/components/city/CityMap.tsx` — SVG city renderer with flash animations
+- `artifacts/software-city/src/components/city/BuildingInspector.tsx` — Real agent chat + source badges
+- `artifacts/software-city/src/components/city/HUD.tsx` — Health/metrics/WS/Ollama status bar
+- `artifacts/software-city/src/components/layout/AppLayout.tsx` — WS-powered color-coded event stream
+- `artifacts/software-city/src/hooks/useWebSocket.ts` — WebSocket hook with auto-reconnect
+- `artifacts/software-city/src/pages/CityView.tsx` — City page with error boundary + WS NPC moves
+- `artifacts/software-city/src/pages/Landing.tsx` — Hero with GitHub input + local folder watcher
+- `lib/api-client-react/src/generated/api.schemas.ts` — Handwritten TypeScript types (update manually)
 - `lib/api-spec/openapi.yaml` — Full API contract
 
 ## TypeScript & Composite Projects

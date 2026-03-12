@@ -298,15 +298,21 @@ export interface AgentTaskResult {
 export interface ChatRequest {
   message: string;
   buildingContext?: string | null;
+  buildingContent?: string | null;
+  buildingLanguage?: string | null;
 }
 
 export interface ChatResponse {
-  agentId: string;
+  agentId?: string | null;
   agentName: string;
+  agentRole?: string | null;
   message: string;
-  escalated: boolean;
-  fromKnowledgeBase: boolean;
-  actionItems: string[];
+  source?: string | null;
+  confidence?: number | null;
+  offerEscalation?: boolean | null;
+  escalated?: boolean | null;
+  fromKnowledgeBase?: boolean | null;
+  actionItems?: string[] | null;
 }
 
 export type KnowledgeStatsTopProblemsItem = {

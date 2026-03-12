@@ -3,7 +3,7 @@ import { useLocation } from "wouter";
 import { useLoadRepo, useLoadDemoRepo } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Github, Play, Terminal, ChevronDown, ChevronUp, KeyRound, ExternalLink } from "lucide-react";
+import { Github, Play, Terminal, ChevronDown, ChevronUp, KeyRound, ExternalLink, FolderOpen, Eye } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
 
@@ -13,6 +13,8 @@ export function Landing() {
   const [repoUrl, setRepoUrl] = useState("");
   const [githubToken, setGithubToken] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [localPath, setLocalPath] = useState("");
+  const [watchStatus, setWatchStatus] = useState<"idle" | "watching">("idle");
 
   const loadMutation = useLoadRepo({
     mutation: {
@@ -20,16 +22,16 @@ export function Landing() {
       onError: (err: any) => toast({
         title: "Failed to load repository",
         description: err.message || "Could not fetch repo. Check the URL and token.",
-        variant: "destructive"
-      })
-    }
+        variant: "destructive",
+      }),
+    },
   });
 
   const demoMutation = useLoadDemoRepo({
     mutation: {
       onSuccess: () => setLocation("/city"),
-      onError: () => toast({ title: "Error", description: "Failed to load demo", variant: "destructive" })
-    }
+      onError: () => toast({ title: "Error", description: "Failed to load demo", variant: "destructive" }),
+    },
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -38,19 +40,35 @@ export function Landing() {
     loadMutation.mutate({
       data: {
         repoUrl,
-        ...(githubToken ? { githubToken } : {})
-      }
+        ...(githubToken ? { githubToken } : {}),
+      },
     });
+  };
+
+  const handleWatchLocal = async () => {
+    if (!localPath) return;
+    try {
+      const res = await fetch("/api/repo/watch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ localPath }),
+      });
+      if (!res.ok) throw new Error("Watch failed");
+      setWatchStatus("watching");
+      toast({ title: "Watching local folder", description: localPath });
+      setLocation("/city");
+    } catch {
+      toast({ title: "Failed to watch folder", variant: "destructive" });
+    }
   };
 
   const isLoading = loadMutation.isPending;
 
   return (
     <div className="min-h-screen w-full bg-background relative flex items-center justify-center overflow-hidden">
-      {/* Background */}
       <div className="absolute inset-0 z-0">
         <img
-          src={`${import.meta.env.BASE_URL}images/hero-city.png`}
+          src="/api/assets/hero"
           alt="Cyberpunk City"
           className="w-full h-full object-cover opacity-30 object-center"
         />
@@ -72,7 +90,7 @@ export function Landing() {
             className="w-24 h-24 mx-auto mb-6 relative"
           >
             <div className="absolute inset-0 bg-primary/20 blur-xl rounded-full" />
-            <img src={`${import.meta.env.BASE_URL}images/logo.png`} alt="Logo" className="w-full h-full relative z-10" />
+            <img src="/api/assets/logo" alt="Logo" className="w-full h-full relative z-10 rounded-xl" />
           </motion.div>
 
           <h1 className="text-5xl md:text-7xl font-mono font-bold text-white mb-4 tracking-tighter text-glow">
@@ -100,24 +118,18 @@ export function Landing() {
                     className="pl-10 h-12 bg-black/50 border-primary/30 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/50"
                   />
                 </div>
-                <Button
-                  type="submit"
-                  size="lg"
-                  className="h-12 w-32 font-bold"
-                  disabled={isLoading || !repoUrl}
-                >
+                <Button type="submit" size="lg" className="h-12 w-32 font-bold" disabled={isLoading || !repoUrl}>
                   {isLoading ? (
                     <span className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: '150ms' }} />
-                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: '300ms' }} />
+                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "0ms" }} />
+                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "150ms" }} />
+                      <span className="w-2 h-2 rounded-full bg-white animate-bounce" style={{ animationDelay: "300ms" }} />
                     </span>
                   ) : "LOAD CITY"}
                 </Button>
               </div>
             </div>
 
-            {/* Advanced: GitHub Token */}
             <div>
               <button
                 type="button"
@@ -154,7 +166,7 @@ export function Landing() {
                         </div>
                       </div>
                       <div className="text-[11px] font-mono text-muted-foreground/70 space-y-1 leading-relaxed">
-                        <p>Your token is sent directly to the server and never stored. It's used only for this request.</p>
+                        <p>Your token is sent directly to the server and never stored. Used only for this request.</p>
                         <p>
                           <a
                             href="https://github.com/settings/tokens/new?scopes=repo&description=SoftwareCity"
@@ -162,7 +174,7 @@ export function Landing() {
                             rel="noopener noreferrer"
                             className="text-primary/70 hover:text-primary underline flex items-center gap-1 w-fit"
                           >
-                            <ExternalLink size={11} /> Generate a token on GitHub (needs "repo" scope)
+                            <ExternalLink size={11} /> Generate a token (needs "repo" scope)
                           </a>
                         </p>
                       </div>
@@ -188,6 +200,40 @@ export function Landing() {
               <Play size={16} className="mr-2 text-primary group-hover:text-primary animate-pulse" />
               <span className="text-foreground">Run Demo Simulation</span>
             </Button>
+
+            <div className="relative flex items-center py-1">
+              <div className="flex-grow border-t border-border/50"></div>
+              <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or watch local</span>
+              <div className="flex-grow border-t border-border/50"></div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-mono text-muted-foreground uppercase tracking-widest flex items-center gap-2">
+                <FolderOpen size={14} /> Watch a Local Folder
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="C:\projects\myapp or /home/user/myapp"
+                  value={localPath}
+                  onChange={(e) => setLocalPath(e.target.value)}
+                  className="flex-1 h-10 bg-black/50 border-border/30 font-mono text-xs text-white placeholder:text-muted-foreground/40"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-10 px-4 border-border/30"
+                  onClick={handleWatchLocal}
+                  disabled={!localPath || watchStatus === "watching"}
+                >
+                  <Eye size={14} className="mr-2" />
+                  {watchStatus === "watching" ? "Watching" : "Watch"}
+                </Button>
+              </div>
+              <p className="text-[11px] font-mono text-muted-foreground/50">
+                Live re-analysis on file changes via WebSocket. Only works when the server has filesystem access to this path.
+              </p>
+            </div>
           </form>
         </div>
 

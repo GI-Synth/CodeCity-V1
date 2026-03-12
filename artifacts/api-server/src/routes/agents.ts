@@ -2,16 +2,16 @@ import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { agentsTable, eventsTable } from "@workspace/db/schema";
 import { eq } from "drizzle-orm";
-import { createAgent, simulateAgentTask, simulateAgentChat } from "../lib/agentEngine";
+import { createAgent, simulateAgentTask } from "../lib/agentEngine";
+import { generateDialogue, escalate } from "../lib/escalationEngine";
 
 const router: IRouter = Router();
 
-// Seed some initial agents if none exist
 async function ensureAgents() {
   const existing = await db.select().from(agentsTable).limit(1);
   if (existing.length === 0) {
     const roles: Array<"qa_inspector" | "api_fuzzer" | "load_tester" | "edge_explorer" | "ui_navigator"> = [
-      "qa_inspector", "api_fuzzer", "load_tester", "edge_explorer", "ui_navigator"
+      "qa_inspector", "api_fuzzer", "load_tester", "edge_explorer", "ui_navigator",
     ];
     for (const role of roles) {
       const agent = createAgent(role);
@@ -24,16 +24,7 @@ router.get("/list", async (_req, res) => {
   try {
     await ensureAgents();
     const agents = await db.select().from(agentsTable);
-
-    // Simulate dynamic agent movement/status
-    const liveAgents = agents.map(a => ({
-      ...a,
-      x: (a.x + Math.random() * 10 - 5 + 800) % 800,
-      y: (a.y + Math.random() * 10 - 5 + 600) % 600,
-      status: Math.random() > 0.3 ? "working" : "idle",
-    }));
-
-    res.json({ agents: liveAgents, total: liveAgents.length });
+    res.json({ agents, total: agents.length });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: "AGENTS_ERROR", message });
@@ -46,7 +37,6 @@ router.post("/spawn", async (req, res) => {
     const agent = createAgent(role, targetBuilding ?? null);
     await db.insert(agentsTable).values(agent);
 
-    // Log event
     await db.insert(eventsTable).values({
       id: `evt-${Date.now()}`,
       type: "agent_promoted",
@@ -63,25 +53,20 @@ router.post("/spawn", async (req, res) => {
   }
 });
 
-router.post("/:agentId/task", async (req, res) => {
+router.post("/:agentId/task", async (req, res): Promise<void> => {
   try {
     const { agentId } = req.params;
     const { taskType, buildingId, context } = req.body;
 
     const agents = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
     if (agents.length === 0) {
-      return res.status(404).json({ error: "NOT_FOUND", message: "Agent not found" });
+      res.status(404).json({ error: "NOT_FOUND", message: "Agent not found" });
+      return;
     }
 
     const agent = agents[0];
-    const taskResult = simulateAgentTask(
-      agent as any,
-      taskType,
-      buildingId,
-      context
-    );
+    const taskResult = simulateAgentTask(agent as any, taskType, buildingId, context);
 
-    // Update agent stats
     await db.update(agentsTable).set({
       bugsFound: agent.bugsFound + taskResult.bugsFound,
       testsGenerated: agent.testsGenerated + (taskType === "generate_tests" ? 5 : 0),
@@ -91,7 +76,6 @@ router.post("/:agentId/task", async (req, res) => {
       status: "reporting",
     }).where(eq(agentsTable.id, agentId));
 
-    // Log event if bugs found
     if (taskResult.bugsFound > 0) {
       await db.insert(eventsTable).values({
         id: `evt-${Date.now()}`,
@@ -116,45 +100,99 @@ router.post("/:agentId/task", async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      taskType,
-      ...taskResult,
-    });
+    res.json({ success: true, taskType, ...taskResult });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: "TASK_ERROR", message });
   }
 });
 
-router.post("/:agentId/chat", async (req, res) => {
+const pendingEscalations = new Map<string, { question: string; buildingContent: string; language: string }>();
+
+router.post("/:agentId/chat", async (req, res): Promise<void> => {
   try {
     const { agentId } = req.params;
-    const { message, buildingContext } = req.body;
+    const { message, buildingContext, buildingContent, buildingLanguage } = req.body;
 
-    const agents = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
-    if (agents.length === 0) {
-      return res.status(404).json({ error: "NOT_FOUND", message: "Agent not found" });
+    const allAgents = await db.select().from(agentsTable);
+
+    let agent = allAgents.find(a => a.id === agentId);
+    if (!agent && allAgents.length > 0) agent = allAgents[0];
+    if (!agent) {
+      res.status(404).json({ error: "NOT_FOUND", message: "No agents available" });
+      return;
     }
 
-    const agent = agents[0];
-    const chatResult = simulateAgentChat(agent as any, message, buildingContext ?? null);
+    const escKey = `${agent.id}-${buildingContext ?? "unknown"}`;
 
-    if (chatResult.escalated) {
-      await db.insert(eventsTable).values({
-        id: `evt-${Date.now()}`,
-        type: "escalation",
-        agentId,
-        agentName: agent.name,
-        message: `${agent.name} escalated a question to external AI`,
-        severity: "info",
+    if (typeof message === "string" && message.toLowerCase().includes("yes escalate")) {
+      const pending = pendingEscalations.get(escKey);
+      if (pending) {
+        const result = await escalate({
+          question: pending.question,
+          codeSnippet: pending.buildingContent,
+          language: pending.language,
+          failedAttempts: [],
+        });
+
+        pendingEscalations.delete(escKey);
+
+        await db.insert(eventsTable).values({
+          id: `evt-${Date.now()}`,
+          type: "escalation",
+          agentId: agent.id,
+          agentName: agent.name,
+          message: `${agent.name} escalated to ${result.source} for ${buildingContext ?? "building"}`,
+          severity: "info",
+        }).catch(() => {});
+
+        res.json({
+          message: `[${result.source.toUpperCase()}] ${result.answer}${result.action_items.length > 0 ? "\n\nAction items:\n" + result.action_items.map(a => `• ${a}`).join("\n") : ""}`,
+          source: result.source,
+          confidence: result.confidence,
+          offerEscalation: false,
+          agentName: agent.name,
+          agentRole: agent.role,
+        });
+        return;
+      }
+    }
+
+    const dialogueResult = await generateDialogue({
+      npcRole: agent.role,
+      buildingFile: buildingContext ?? "unknown.ts",
+      buildingContent: typeof buildingContent === "string" ? buildingContent : `File: ${buildingContext ?? "unknown"}`,
+      recentFindings: [],
+      question: typeof message === "string" ? message : "What does this file do?",
+      language: typeof buildingLanguage === "string" ? buildingLanguage : "typescript",
+    });
+
+    if (dialogueResult.offerEscalation) {
+      pendingEscalations.set(escKey, {
+        question: typeof message === "string" ? message : "",
+        buildingContent: typeof buildingContent === "string" ? buildingContent : buildingContext ?? "",
+        language: typeof buildingLanguage === "string" ? buildingLanguage : "typescript",
       });
     }
 
+    if (dialogueResult.offerEscalation) {
+      await db.insert(eventsTable).values({
+        id: `evt-${Date.now()}`,
+        type: "escalation",
+        agentId: agent.id,
+        agentName: agent.name,
+        message: `${agent.name} offered escalation for ${buildingContext ?? "building"}`,
+        severity: "info",
+      }).catch(() => {});
+    }
+
     res.json({
-      agentId,
+      message: dialogueResult.message,
+      source: dialogueResult.source,
+      confidence: dialogueResult.confidence,
+      offerEscalation: dialogueResult.offerEscalation,
       agentName: agent.name,
-      ...chatResult,
+      agentRole: agent.role,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
