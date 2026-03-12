@@ -19,6 +19,8 @@ export interface LoadRepoRequest {
   repoUrl: string;
   /** Branch to analyze (default main) */
   branch?: string;
+  /** GitHub Personal Access Token for private repositories */
+  githubToken?: string;
 }
 
 export interface LoadRepoResponse {

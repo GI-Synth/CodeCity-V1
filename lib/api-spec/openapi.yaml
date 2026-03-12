@@ -259,6 +259,9 @@ components:
         branch:
           type: string
           description: Branch to analyze (default main)
+        githubToken:
+          type: string
+          description: GitHub Personal Access Token for private repositories
       required:
         - repoUrl
 

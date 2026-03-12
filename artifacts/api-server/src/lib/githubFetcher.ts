@@ -1,6 +1,6 @@
 import { getLanguage, type FileInfo } from "./cityAnalyzer";
 
-export async function fetchGithubRepo(repoUrl: string, branch = "main"): Promise<{ files: FileInfo[]; repoName: string }> {
+export async function fetchGithubRepo(repoUrl: string, branch = "main", token?: string): Promise<{ files: FileInfo[]; repoName: string }> {
   // Parse GitHub URL
   const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/|$)/);
   if (!match) throw new Error("Invalid GitHub URL. Expected format: https://github.com/owner/repo");
@@ -8,15 +8,20 @@ export async function fetchGithubRepo(repoUrl: string, branch = "main"): Promise
   const [, owner, repo] = match;
   const repoName = `${owner}/${repo}`;
 
+  const baseHeaders: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (token) baseHeaders["Authorization"] = `Bearer ${token}`;
+
   // Fetch file tree from GitHub API
   const treeUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
-  const treeRes = await fetch(treeUrl, {
-    headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-  });
+  const treeRes = await fetch(treeUrl, { headers: baseHeaders });
 
   if (!treeRes.ok) {
-    if (treeRes.status === 404) throw new Error(`Repository '${repoName}' not found or private`);
-    if (treeRes.status === 403) throw new Error("GitHub API rate limit exceeded. Try again later.");
+    if (treeRes.status === 404) throw new Error(`Repository '${repoName}' not found. If it's private, make sure your token has 'repo' scope.`);
+    if (treeRes.status === 401) throw new Error("Invalid GitHub token. Check that your Personal Access Token is correct and has 'repo' scope.");
+    if (treeRes.status === 403) throw new Error("GitHub API rate limit exceeded, or your token lacks permission. Try again later.");
     throw new Error(`GitHub API error: ${treeRes.status}`);
   }
 
@@ -50,9 +55,7 @@ export async function fetchGithubRepo(repoUrl: string, branch = "main"): Promise
     const results = await Promise.allSettled(
       batch.map(async (item) => {
         const contentUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${item.path}?ref=${branch}`;
-        const res = await fetch(contentUrl, {
-          headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-        });
+        const res = await fetch(contentUrl, { headers: baseHeaders });
         if (!res.ok) return null;
         const data = (await res.json()) as { content?: string };
         const content = data.content ? Buffer.from(data.content, "base64").toString("utf8") : "";

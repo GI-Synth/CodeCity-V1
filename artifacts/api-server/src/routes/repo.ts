@@ -8,7 +8,7 @@ import { desc } from "drizzle-orm";
 const router: IRouter = Router();
 
 router.post("/load", async (req, res) => {
-  const { repoUrl, branch = "main" } = req.body;
+  const { repoUrl, branch = "main", githubToken } = req.body;
 
   if (!repoUrl || typeof repoUrl !== "string") {
     return res.status(400).json({ error: "INVALID_URL", message: "repoUrl is required" });
@@ -16,7 +16,7 @@ router.post("/load", async (req, res) => {
 
   const startTime = Date.now();
   try {
-    const { files, repoName } = await fetchGithubRepo(repoUrl, branch);
+    const { files, repoName } = await fetchGithubRepo(repoUrl, branch, githubToken || undefined);
     const layout = buildCityLayout(files, repoName);
     const analysisTime = (Date.now() - startTime) / 1000;
 
