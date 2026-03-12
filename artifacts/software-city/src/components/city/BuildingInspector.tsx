@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Building, useAssignAgentTask, useChatWithAgent } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { Terminal, Shield, Flame, Activity, GitCommit, FileCode, MessageSquare, Send, Zap } from "lucide-react";
+import { Terminal, Shield, ShieldCheck, Flame, Activity, GitCommit, FileCode, MessageSquare, Send, Zap, FlaskConical, Network, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 export function BuildingInspector({ building, onClose }: { building: Building, onClose: () => void }) {
@@ -87,12 +87,12 @@ export function BuildingInspector({ building, onClose }: { building: Building, o
         <div className="space-y-2 bg-black/40 p-3 rounded border border-border/50">
           <div className="flex justify-between items-center text-sm font-mono">
             <span className="text-muted-foreground flex items-center gap-2"><Shield size={14}/> Test Coverage</span>
-            <span className={building.testCoverage > 80 ? "text-success" : "text-warning"}>{building.testCoverage}%</span>
+            <span className={building.testCoverage > 0.8 ? "text-success" : "text-warning"}>{Math.round(building.testCoverage * 100)}%</span>
           </div>
           <div className="h-2 bg-background rounded-full overflow-hidden">
             <div 
-              className={cn("h-full transition-all", building.testCoverage > 80 ? "bg-success" : "bg-warning")}
-              style={{ width: `${building.testCoverage}%` }}
+              className={cn("h-full transition-all", building.testCoverage > 0.8 ? "bg-success" : "bg-warning")}
+              style={{ width: `${Math.round(building.testCoverage * 100)}%` }}
             />
           </div>
         </div>
@@ -119,14 +119,22 @@ export function BuildingInspector({ building, onClose }: { building: Building, o
         {/* Actions */}
         <div className="space-y-2">
           <h3 className="font-mono text-xs uppercase text-muted-foreground tracking-wider">Agent Actions</h3>
-          <div className="grid grid-cols-2 gap-2">
-            <Button variant="outline" size="sm" onClick={() => handleTask('analyze_bug')} disabled={assignTaskMutation.isPending}>
-              <Activity size={14} className="mr-2" /> Analyze
+          <div className="grid grid-cols-3 gap-2">
+            <Button variant="outline" size="sm" onClick={() => handleTask('analyze_bug')} disabled={assignTaskMutation.isPending} className="flex flex-col h-14 gap-1">
+              <Activity size={14} /> <span className="text-[10px]">Analyze</span>
             </Button>
-            <Button variant="outline" size="sm" onClick={() => handleTask('generate_tests')} disabled={assignTaskMutation.isPending}>
-              <Shield size={14} className="mr-2" /> Write Tests
+            <Button variant="outline" size="sm" onClick={() => handleTask('generate_tests')} disabled={assignTaskMutation.isPending} className="flex flex-col h-14 gap-1">
+              <Shield size={14} /> <span className="text-[10px]">Gen Tests</span>
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => handleTask('fuzz_test')} disabled={assignTaskMutation.isPending} className="flex flex-col h-14 gap-1">
+              <FlaskConical size={14} /> <span className="text-[10px]">Fuzz</span>
             </Button>
           </div>
+          {assignTaskMutation.isPending && (
+            <div className="text-xs text-primary font-mono animate-pulse flex items-center gap-2">
+              <Zap size={12} /> Agent dispatched...
+            </div>
+          )}
         </div>
 
         {/* Agent Chat */}
