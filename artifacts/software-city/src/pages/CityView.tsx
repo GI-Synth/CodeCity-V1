@@ -9,11 +9,43 @@ import { GuidedTour, useTour } from "@/components/GuidedTour";
 import { ShortcutsPanel } from "@/components/ShortcutsPanel";
 import { useGetCityLayout, useGetCityHealth, useGetLiveMetrics, useListAgents } from "@workspace/api-client-react";
 import type { Agent } from "@workspace/api-client-react";
-import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check, Keyboard, MapPin, FileText, ChevronDown, ImageDown } from "lucide-react";
+import {
+  Loader2,
+  Cpu,
+  MemoryStick,
+  Activity,
+  Zap,
+  Brain,
+  Download,
+  Share2,
+  Check,
+  Keyboard,
+  MapPin,
+  FileText,
+  ChevronDown,
+  ImageDown,
+  Home,
+  Settings2,
+  RotateCcw,
+  Trash2,
+  UserX,
+  MessageSquare,
+  FileWarning,
+  Copy,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 class CityMapErrorBoundary extends Component<
   { children: ReactNode },
@@ -120,6 +152,63 @@ function DebugRow({ label, value, color, icon: Icon }: { label: string; value: s
   );
 }
 
+interface MayorMessage {
+  id: string;
+  role: "user" | "mayor";
+  text: string;
+}
+
+interface RecommendedTestFile {
+  buildingId: string;
+  sourceFilePath: string;
+  testFilePath: string;
+  whatToTest: string[];
+  testType: "unit" | "integration" | "e2e";
+  priority: "critical" | "high" | "medium";
+}
+
+interface GeneratedTestFile {
+  testFilePath: string;
+  testContent: string;
+  language: string;
+}
+
+interface UrgencyReportResponse {
+  report: string;
+  generatedAt: string;
+  summary: string;
+  recommendedTestFiles: RecommendedTestFile[];
+  cacheBust?: number;
+}
+
+interface SprintPlanResponse {
+  plan: string;
+  generatedAt: string;
+  summary: string;
+}
+
+interface WeeklySummaryResponse {
+  summary: string;
+  generatedAt: string;
+  range: string;
+}
+
+const WIPE_CONFIRMATION_TEXT = "RESET";
+const MAYOR_MESSAGE_LIMIT = 24;
+const MAYOR_SESSION_STORAGE_KEY = "software-city-mayor-session-id";
+
+function getOrCreateMayorSessionId(): string {
+  try {
+    const existing = sessionStorage.getItem(MAYOR_SESSION_STORAGE_KEY);
+    if (existing && existing.trim().length > 0) return existing;
+    const created = `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem(MAYOR_SESSION_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
 export function CityView() {
   const { toast } = useToast();
   const [, setLocation] = useLocation();
@@ -134,7 +223,28 @@ export function CityView() {
   const [visibleCount, setVisibleCount] = useState<number | undefined>(undefined);
   const [totalCount, setTotalCount] = useState<number | undefined>(undefined);
   const [exportOpen, setExportOpen] = useState(false);
+  const [mayorMessages, setMayorMessages] = useState<MayorMessage[]>([]);
+  const [mayorInput, setMayorInput] = useState("");
+  const [sendingMayorMessage, setSendingMayorMessage] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [reportData, setReportData] = useState<UrgencyReportResponse | null>(null);
+  const [sprintOpen, setSprintOpen] = useState(false);
+  const [sprintLoading, setSprintLoading] = useState(false);
+  const [isPlanningSprint, setIsPlanningSprint] = useState(false);
+  const [sprintData, setSprintData] = useState<SprintPlanResponse | null>(null);
+  const [weeklyOpen, setWeeklyOpen] = useState(false);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [isGeneratingWeekly, setIsGeneratingWeekly] = useState(false);
+  const [weeklyData, setWeeklyData] = useState<WeeklySummaryResponse | null>(null);
+  const [generatingTestFilePath, setGeneratingTestFilePath] = useState<string | null>(null);
+  const [generatedTestFile, setGeneratedTestFile] = useState<GeneratedTestFile | null>(null);
+  const [generatedTestOpen, setGeneratedTestOpen] = useState(false);
+  const [runningControlAction, setRunningControlAction] = useState<string | null>(null);
+  const mayorSessionIdRef = useRef<string>(getOrCreateMayorSessionId());
   const exportRef = useRef<HTMLDivElement>(null);
+  const isGeneratingReportRef = useRef(false);
 
   const { data: layout, isLoading: layoutLoading } = useGetCityLayout({ query: { refetchInterval: 10000 } });
   const { data: health, refetch: refetchHealth } = useGetCityHealth({ query: { refetchInterval: 10000 } });
@@ -276,6 +386,278 @@ export function CityView() {
     }
   };
 
+  const appendMayorMessage = useCallback((role: "user" | "mayor", text: string) => {
+    setMayorMessages(prev => {
+      const next = [...prev, { id: `mayor-${Date.now()}-${Math.random()}`, role, text }];
+      return next.slice(-MAYOR_MESSAGE_LIMIT);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (mayorMessages.length > 0) return;
+    const opening = health
+      ? `STATUS: Health at ${Math.round(health.score)}. Ask for guidance or request an urgency report.`
+      : "STATUS: Mayor channel online. Ask for guidance or request an urgency report.";
+    appendMayorMessage("mayor", opening);
+  }, [health?.score, mayorMessages.length, appendMayorMessage]);
+
+  const handleSendMayorMessage = async () => {
+    const message = mayorInput.trim();
+    if (!message || sendingMayorMessage) return;
+
+    appendMayorMessage("user", message);
+    setMayorInput("");
+    setSendingMayorMessage(true);
+
+    try {
+      const res = await fetch("/api/orchestrator/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, sessionId: mayorSessionIdRef.current }),
+      });
+      const data = await res.json() as { message?: string; error?: string };
+      if (!res.ok || !data.message) throw new Error(data.error ?? "Mayor chat failed");
+      appendMayorMessage("mayor", data.message);
+    } catch {
+      appendMayorMessage("mayor", "STATUS: Chat unavailable. Continue with direct controls and request a report once API is healthy.");
+      toast({ title: "Mayor chat failed", variant: "destructive" });
+    } finally {
+      setSendingMayorMessage(false);
+    }
+  };
+
+  const handleRequestReport = async () => {
+    if (isGeneratingReportRef.current || isGeneratingReport) return;
+
+    isGeneratingReportRef.current = true;
+    setIsGeneratingReport(true);
+    setReportLoading(true);
+    setReportOpen(true);
+
+    try {
+      const res = await fetch("/api/orchestrator/report", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+        },
+      });
+      const data = await res.json() as Partial<UrgencyReportResponse>;
+      if (!res.ok || !data.report || !data.generatedAt || !data.summary) {
+        throw new Error("Report unavailable");
+      }
+      const typedData: UrgencyReportResponse = {
+        report: data.report,
+        generatedAt: data.generatedAt,
+        summary: data.summary,
+        recommendedTestFiles: Array.isArray(data.recommendedTestFiles) ? data.recommendedTestFiles as RecommendedTestFile[] : [],
+        cacheBust: typeof data.cacheBust === "number" ? data.cacheBust : undefined,
+      };
+      setReportData(typedData);
+      appendMayorMessage("mayor", `${typedData.summary}\nUrgency report generated at ${typedData.generatedAt}.`);
+    } catch {
+      toast({ title: "Failed to generate urgency report", variant: "destructive" });
+    } finally {
+      setReportLoading(false);
+      setIsGeneratingReport(false);
+      isGeneratingReportRef.current = false;
+    }
+  };
+
+  const handlePlanSprint = async () => {
+    if (isPlanningSprint) return;
+
+    setIsPlanningSprint(true);
+    setSprintLoading(true);
+    setSprintOpen(true);
+
+    try {
+      const res = await fetch("/api/orchestrator/sprint", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+        },
+      });
+      const data = await res.json() as Partial<SprintPlanResponse>;
+      if (!res.ok || !data.plan || !data.generatedAt || !data.summary) {
+        throw new Error("Sprint plan unavailable");
+      }
+
+      const typedData: SprintPlanResponse = {
+        plan: data.plan,
+        generatedAt: data.generatedAt,
+        summary: data.summary,
+      };
+
+      setSprintData(typedData);
+      appendMayorMessage("mayor", `${typedData.summary}\nSprint plan generated at ${typedData.generatedAt}.`);
+    } catch {
+      toast({ title: "Failed to build sprint plan", variant: "destructive" });
+    } finally {
+      setSprintLoading(false);
+      setIsPlanningSprint(false);
+    }
+  };
+
+  const handleCopyReport = async () => {
+    if (!reportData?.report) return;
+    try {
+      await navigator.clipboard.writeText(reportData.report);
+      toast({ title: "Report copied", description: "Urgency report copied to clipboard." });
+    } catch {
+      toast({ title: "Copy failed", variant: "destructive" });
+    }
+  };
+
+  const handleCopySprintPlan = async () => {
+    if (!sprintData?.plan) return;
+    try {
+      await navigator.clipboard.writeText(sprintData.plan);
+      toast({ title: "Sprint plan copied", description: "Sprint plan copied to clipboard." });
+    } catch {
+      toast({ title: "Copy failed", variant: "destructive" });
+    }
+  };
+
+  const handleGenerateWeeklySummary = async () => {
+    if (isGeneratingWeekly) return;
+
+    setIsGeneratingWeekly(true);
+    setWeeklyLoading(true);
+    setWeeklyOpen(true);
+
+    try {
+      const res = await fetch("/api/orchestrator/weekly-summary", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "Cache-Control": "no-cache",
+        },
+      });
+      const data = await res.json() as Partial<WeeklySummaryResponse>;
+      if (!res.ok || !data.summary || !data.generatedAt || !data.range) {
+        throw new Error("Weekly summary unavailable");
+      }
+
+      const typedData: WeeklySummaryResponse = {
+        summary: data.summary,
+        generatedAt: data.generatedAt,
+        range: data.range,
+      };
+
+      setWeeklyData(typedData);
+      appendMayorMessage("mayor", `Weekly summary generated for ${typedData.range} at ${typedData.generatedAt}.`);
+    } catch {
+      toast({ title: "Failed to generate weekly summary", variant: "destructive" });
+    } finally {
+      setWeeklyLoading(false);
+      setIsGeneratingWeekly(false);
+    }
+  };
+
+  const handleCopyWeeklySummary = async () => {
+    if (!weeklyData?.summary) return;
+    try {
+      await navigator.clipboard.writeText(weeklyData.summary);
+      toast({ title: "Weekly summary copied", description: "Weekly summary copied to clipboard." });
+    } catch {
+      toast({ title: "Copy failed", variant: "destructive" });
+    }
+  };
+
+  const handleGenerateTestFile = async (recommendation: RecommendedTestFile) => {
+    if (generatingTestFilePath) return;
+    setGeneratingTestFilePath(recommendation.testFilePath);
+
+    try {
+      const res = await fetch("/api/orchestrator/generate-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          buildingId: recommendation.buildingId,
+          filePath: recommendation.sourceFilePath,
+        }),
+      });
+
+      const data = await res.json() as Partial<GeneratedTestFile> & { error?: string; message?: string };
+      if (!res.ok || !data.testFilePath || !data.testContent || !data.language) {
+        throw new Error(data.error ?? data.message ?? "Failed to generate test file");
+      }
+
+      setGeneratedTestFile({
+        testFilePath: data.testFilePath,
+        testContent: data.testContent,
+        language: data.language,
+      });
+      setGeneratedTestOpen(true);
+    } catch {
+      toast({ title: "Test generation failed", variant: "destructive" });
+    } finally {
+      setGeneratingTestFilePath(null);
+    }
+  };
+
+  const handleCopyGeneratedTest = async () => {
+    if (!generatedTestFile?.testContent) return;
+    try {
+      await navigator.clipboard.writeText(generatedTestFile.testContent);
+      toast({ title: "Test copied", description: `${generatedTestFile.testFilePath} copied to clipboard.` });
+    } catch {
+      toast({ title: "Copy failed", variant: "destructive" });
+    }
+  };
+
+  const runControlAction = async (
+    key: string,
+    endpoint: string,
+    successTitle: string,
+    body?: Record<string, unknown>,
+  ) => {
+    if (runningControlAction) return;
+    setRunningControlAction(key);
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const data = await res.json() as { message?: string; error?: string };
+      if (!res.ok) throw new Error(data.error ?? data.message ?? "Action failed");
+
+      toast({ title: successTitle, description: data.message ?? undefined });
+      refetchAgents();
+      refetchHealth();
+
+      if (endpoint.includes("wipe-all")) {
+        setMayorMessages([]);
+        setReportData(null);
+        setSprintData(null);
+        setWeeklyData(null);
+        setGeneratedTestFile(null);
+      }
+    } catch {
+      toast({ title: "Action failed", variant: "destructive" });
+    } finally {
+      setRunningControlAction(null);
+    }
+  };
+
+  const handleWipeEverything = async () => {
+    const confirmation = window.prompt("Type RESET to wipe everything:");
+    if (confirmation !== WIPE_CONFIRMATION_TEXT) {
+      toast({ title: "Wipe canceled", description: "Confirmation text did not match." });
+      return;
+    }
+    await runControlAction(
+      "wipe-all",
+      "/api/orchestrator/controls/wipe-all",
+      "All city data wiped",
+      { confirmation: WIPE_CONFIRMATION_TEXT },
+    );
+  };
+
   useEffect(() => {
     if (!exportOpen) return;
     const handle = (e: MouseEvent) => {
@@ -327,7 +709,77 @@ export function CityView() {
             totalBuildings={totalCount}
           />
 
+          <div className="absolute top-4 left-4 z-20 flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setLocation("/")}
+              className="h-8 text-xs font-mono border-primary/30"
+            >
+              <Home size={12} className="mr-1.5" /> HOME
+            </Button>
+          </div>
+
           <div className="absolute top-4 right-4 z-20 flex gap-2" data-tour="share-btn">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 text-xs font-mono border-primary/30"
+                >
+                  <Settings2 size={12} className="mr-1.5" /> City Controls <ChevronDown size={10} className="ml-1" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-64">
+                <DropdownMenuLabel>City Controls</DropdownMenuLabel>
+                <DropdownMenuItem onSelect={() => setLocation("/")}>Load New Repo</DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  disabled={runningControlAction !== null}
+                  onSelect={() => {
+                    void runControlAction("clear-events", "/api/orchestrator/controls/clear-events", "Events cleared");
+                  }}
+                >
+                  <Trash2 size={13} /> Clear Event Stream
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={runningControlAction !== null}
+                  onSelect={() => {
+                    void runControlAction("reset-agent-stats", "/api/orchestrator/controls/reset-agent-stats", "Agent stats reset");
+                  }}
+                >
+                  <RotateCcw size={13} /> Reset Agent Stats
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={runningControlAction !== null}
+                  onSelect={() => {
+                    void runControlAction("retire-all", "/api/orchestrator/controls/retire-all-agents", "All agents retired");
+                  }}
+                >
+                  <UserX size={13} /> Retire All Agents
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={runningControlAction !== null}
+                  onSelect={() => {
+                    void runControlAction("full-reset", "/api/orchestrator/controls/full-reset", "Full reset complete");
+                  }}
+                >
+                  <RotateCcw size={13} /> Full Reset (KB Session Included)
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  disabled={runningControlAction !== null}
+                  onSelect={() => {
+                    void handleWipeEverything();
+                  }}
+                  className="text-destructive focus:text-destructive"
+                >
+                  <Trash2 size={13} /> Wipe Everything (Type RESET)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
             <div ref={exportRef} className="relative">
               <Button
                 variant="outline"
@@ -381,6 +833,93 @@ export function CityView() {
             </Button>
           </div>
 
+          <div className="absolute bottom-4 left-4 z-20 w-[360px] max-w-[calc(100%-2rem)] glass-panel rounded-xl border border-primary/20 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-xs font-mono uppercase tracking-widest text-primary">
+                <MessageSquare size={12} /> Mayor Chat
+              </div>
+              <div className="flex items-center justify-end gap-1 flex-wrap">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    void handlePlanSprint();
+                  }}
+                  disabled={isPlanningSprint}
+                  className="h-7 border-primary/30 px-2 text-[10px] font-mono"
+                >
+                  {isPlanningSprint ? "Planning..." : "Plan Sprint"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    void handleGenerateWeeklySummary();
+                  }}
+                  disabled={isGeneratingWeekly}
+                  className="h-7 border-primary/30 px-2 text-[10px] font-mono"
+                >
+                  {isGeneratingWeekly ? "Working..." : "Weekly"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    void handleRequestReport();
+                  }}
+                  disabled={isGeneratingReport}
+                  className="h-7 border-primary/30 px-2 text-[10px] font-mono"
+                >
+                  <FileWarning size={11} className="mr-1" />
+                  {isGeneratingReport ? "Generating..." : "Request Report"}
+                </Button>
+              </div>
+            </div>
+
+            <div className="mb-2 h-36 overflow-y-auto rounded border border-border/40 bg-black/30 p-2 text-xs font-mono">
+              {mayorMessages.length === 0 ? (
+                <div className="text-muted-foreground">Mayor channel idle...</div>
+              ) : (
+                <div className="space-y-2">
+                  {mayorMessages.map(msg => (
+                    <div key={msg.id} className={cn("rounded px-2 py-1", msg.role === "mayor" ? "bg-primary/10" : "bg-muted/20")}>
+                      <div className="mb-1 text-[10px] uppercase tracking-widest text-muted-foreground">
+                        {msg.role === "mayor" ? "Mayor" : "You"}
+                      </div>
+                      <div className="whitespace-pre-wrap text-[11px] leading-relaxed">{msg.text}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                value={mayorInput}
+                onChange={(e) => setMayorInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleSendMayorMessage();
+                  }
+                }}
+                placeholder="Ask the mayor for next actions..."
+                className="h-8 flex-1 rounded border border-border/40 bg-black/40 px-2 text-xs font-mono text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+              />
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => {
+                  void handleSendMayorMessage();
+                }}
+                disabled={sendingMayorMessage || !mayorInput.trim()}
+                className="h-8 px-3 text-xs font-mono"
+              >
+                {sendingMayorMessage ? <Loader2 size={11} className="animate-spin" /> : "Send"}
+              </Button>
+            </div>
+          </div>
+
           <CityMapErrorBoundary>
             <CityMap
               layout={layout}
@@ -408,6 +947,141 @@ export function CityView() {
           />
         )}
       </div>
+
+      <Dialog open={reportOpen} onOpenChange={setReportOpen}>
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary">City Urgency Report</DialogTitle>
+          </DialogHeader>
+
+          <div className="text-xs text-muted-foreground">
+            {reportData ? `Generated at ${reportData.generatedAt}` : "Report will appear once generation completes."}
+          </div>
+
+          <div className="max-h-[60vh] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed">
+            {reportLoading && !reportData ? (
+              <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={12} className="animate-spin" /> Building urgency report...</div>
+            ) : (
+              <pre className="whitespace-pre-wrap">{reportData?.report ?? "No report available."}</pre>
+            )}
+          </div>
+
+          {reportData?.recommendedTestFiles && reportData.recommendedTestFiles.length > 0 && (
+            <div className="rounded border border-primary/30 bg-black/25 p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-primary">
+                Recommended Test Files to Create
+              </div>
+              <div className="space-y-2">
+                {reportData.recommendedTestFiles.map((recommendation) => (
+                  <div key={recommendation.testFilePath} className="rounded border border-border/40 p-2 text-[11px]">
+                    <div className="font-semibold text-foreground">{recommendation.testFilePath}</div>
+                    <div className="text-muted-foreground">Source: {recommendation.sourceFilePath}</div>
+                    <div className="text-muted-foreground">What to test: {recommendation.whatToTest.join(", ")}</div>
+                    <div className="text-muted-foreground">Type: {recommendation.testType} · Priority: {recommendation.priority}</div>
+                    <div className="mt-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={generatingTestFilePath !== null}
+                        onClick={() => {
+                          void handleGenerateTestFile(recommendation);
+                        }}
+                        className="h-7 text-[10px] font-mono"
+                      >
+                        {generatingTestFilePath === recommendation.testFilePath ? "Generating..." : "Generate"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setReportOpen(false)} className="h-8 text-xs font-mono">Close</Button>
+            <Button onClick={() => { void handleCopyReport(); }} disabled={!reportData?.report} className="h-8 text-xs font-mono">
+              <Copy size={12} className="mr-1.5" /> Copy Full Report
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={sprintOpen} onOpenChange={setSprintOpen}>
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary">Sprint Plan</DialogTitle>
+          </DialogHeader>
+
+          <div className="text-xs text-muted-foreground">
+            {sprintData ? `Generated at ${sprintData.generatedAt}` : "Sprint plan will appear once generation completes."}
+          </div>
+
+          <div className="max-h-[60vh] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed">
+            {sprintLoading && !sprintData ? (
+              <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={12} className="animate-spin" /> Building sprint plan...</div>
+            ) : (
+              <pre className="whitespace-pre-wrap">{sprintData?.plan ?? "No sprint plan available."}</pre>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setSprintOpen(false)} className="h-8 text-xs font-mono">Close</Button>
+            <Button onClick={() => { void handleCopySprintPlan(); }} disabled={!sprintData?.plan} className="h-8 text-xs font-mono">
+              <Copy size={12} className="mr-1.5" /> Copy Markdown
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={generatedTestOpen} onOpenChange={setGeneratedTestOpen}>
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary">Generated Test File</DialogTitle>
+          </DialogHeader>
+
+          <div className="text-xs text-muted-foreground">
+            {generatedTestFile ? `${generatedTestFile.testFilePath} (${generatedTestFile.language})` : "No generated test file."}
+          </div>
+
+          <div className="max-h-[60vh] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed">
+            <pre className="whitespace-pre-wrap">{generatedTestFile?.testContent ?? "No generated test content."}</pre>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setGeneratedTestOpen(false)} className="h-8 text-xs font-mono">Close</Button>
+            <Button onClick={() => { void handleCopyGeneratedTest(); }} disabled={!generatedTestFile?.testContent} className="h-8 text-xs font-mono">
+              <Copy size={12} className="mr-1.5" /> Copy
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={weeklyOpen} onOpenChange={setWeeklyOpen}>
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary">Weekly Summary</DialogTitle>
+          </DialogHeader>
+
+          <div className="text-xs text-muted-foreground">
+            {weeklyData ? `Generated at ${weeklyData.generatedAt} (${weeklyData.range})` : "Summary will appear once generation completes."}
+          </div>
+
+          <div className="max-h-[60vh] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed">
+            {weeklyLoading && !weeklyData ? (
+              <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={12} className="animate-spin" /> Building weekly summary...</div>
+            ) : (
+              <pre className="whitespace-pre-wrap">{weeklyData?.summary ?? "No weekly summary available."}</pre>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setWeeklyOpen(false)} className="h-8 text-xs font-mono">Close</Button>
+            <Button onClick={() => { void handleCopyWeeklySummary(); }} disabled={!weeklyData?.summary} className="h-8 text-xs font-mono">
+              <Copy size={12} className="mr-1.5" /> Copy Markdown
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <ShortcutsPanel open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       {showTour && <GuidedTour onDone={endTour} />}

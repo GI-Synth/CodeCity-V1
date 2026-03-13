@@ -153,6 +153,34 @@ function TextAreaInput({
   );
 }
 
+function TextInput({
+  defaultValue,
+  onSave,
+  savedKey,
+  settingKey,
+  maxLength,
+}: {
+  defaultValue: string;
+  onSave: (val: string) => void;
+  savedKey: string | null;
+  settingKey: string;
+  maxLength?: number;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="text"
+        className="flex-1 bg-background/80 border border-border/60 rounded-lg px-3 py-2 text-sm font-mono text-foreground focus:border-primary/60 focus:outline-none"
+        defaultValue={defaultValue}
+        maxLength={maxLength}
+        onBlur={e => onSave(e.target.value)}
+        onKeyDown={e => e.key === "Enter" && onSave((e.target as HTMLInputElement).value)}
+      />
+      {savedKey === settingKey && <CheckCircle size={14} className="text-green-400 flex-shrink-0" />}
+    </div>
+  );
+}
+
 const PROVIDER_OPTIONS = [
   { value: "groq", label: "Groq (fast, free)" },
   { value: "openai", label: "OpenAI GPT-4o" },
@@ -249,6 +277,15 @@ export function Settings() {
           </div>
 
           <Section title="AI Configuration" description="Control how AI agents escalate and communicate">
+            <FieldRow label="Mayor Name" description="Name used by the mayor persona in chat responses">
+              <TextInput
+                settingKey="mayor_name"
+                defaultValue={get("mayor_name", "Mayor")}
+                maxLength={40}
+                onSave={v => saveSetting("mayor_name", v.trim() || "Mayor")}
+                savedKey={savedKey}
+              />
+            </FieldRow>
             <FieldRow label="Escalation Provider" description="AI provider used when agents escalate hard problems">
               <SelectInput
                 settingKey="escalation_provider"

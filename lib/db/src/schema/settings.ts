@@ -10,6 +10,13 @@ export const settingsTable = sqliteTable("settings", {
 export const DEFAULT_SETTINGS: Record<string, string> = {
   escalation_provider: "groq",
   escalation_enabled: "true",
+  ollama_fast_model: "deepseek-coder:6.7b",
+  ollama_primary_model: "deepseek-coder-v2:16b",
+  groq_model: "llama-3.3-70b-versatile",
+  mayor_name: "Mayor",
+  openrouter_model: "openrouter/codellama-70b",
+  anthropic_model: "claude-sonnet-4-6",
+  orchestrator_model: "rule-based",
   agent_loop_interval_ms: "8000",
   max_concurrent_agents: "8",
   kb_similarity_threshold: "0.65",
