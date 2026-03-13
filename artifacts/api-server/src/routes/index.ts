@@ -9,6 +9,9 @@ import assetsRouter from "./assets";
 import ollamaRouter from "./ollama";
 import watchRouter from "./watch";
 import sharedRouter from "./shared";
+import settingsRouter from "./settings";
+import metricsRouter from "./metrics";
+import reportRouter from "./report";
 
 const router: IRouter = Router();
 
@@ -24,5 +27,8 @@ router.use("/assets", assetsRouter);
 router.use("/ollama", ollamaRouter);
 router.use("/city", sharedRouter);
 router.use("/shared", sharedRouter);
+router.use("/settings", settingsRouter);
+router.use("/metrics", metricsRouter);
+router.use("/city", reportRouter);
 
 export default router;

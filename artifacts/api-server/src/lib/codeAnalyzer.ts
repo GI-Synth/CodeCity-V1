@@ -11,6 +11,37 @@ export interface FileMetrics {
   fileType: FileType;
 }
 
+interface CacheEntry {
+  result: FileMetrics;
+  hash: string;
+  timestamp: number;
+}
+
+const MAX_CACHE_SIZE = 500;
+const analysisCache = new Map<string, CacheEntry>();
+
+function djb2(str: string): string {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) ^ str.charCodeAt(i);
+    hash = hash >>> 0;
+  }
+  return hash.toString(36);
+}
+
+function evictIfNeeded(): void {
+  if (analysisCache.size <= MAX_CACHE_SIZE) return;
+  let oldest = Infinity;
+  let oldestKey = "";
+  for (const [key, entry] of analysisCache) {
+    if (entry.timestamp < oldest) {
+      oldest = entry.timestamp;
+      oldestKey = key;
+    }
+  }
+  if (oldestKey) analysisCache.delete(oldestKey);
+}
+
 const EXT_LANG: Record<string, string> = {
   ".ts": "typescript", ".tsx": "typescript",
   ".js": "javascript", ".jsx": "javascript",
@@ -158,6 +189,14 @@ export class CodeAnalyzer {
   }
 
   analyzeFile(filename: string, content: string): FileMetrics {
+    const contentHash = djb2(filename + content);
+    const cacheKey = filename;
+    const cached = analysisCache.get(cacheKey);
+    if (cached && cached.hash === contentHash) {
+      cached.timestamp = Date.now();
+      return cached.result;
+    }
+
     const language = this.detectLanguage(filename);
     const fileType = this.detectFileType(filename, content);
     const loc = this.computeLOC(content);
@@ -167,7 +206,12 @@ export class CodeAnalyzer {
     const functions = this.extractFunctions(content, language);
     const classes = this.extractClasses(content, language);
 
-    return { loc, complexity, functions, classes, imports, exports, language, fileType };
+    const result: FileMetrics = { loc, complexity, functions, classes, imports, exports, language, fileType };
+
+    evictIfNeeded();
+    analysisCache.set(cacheKey, { result, hash: contentHash, timestamp: Date.now() });
+
+    return result;
   }
 }
 

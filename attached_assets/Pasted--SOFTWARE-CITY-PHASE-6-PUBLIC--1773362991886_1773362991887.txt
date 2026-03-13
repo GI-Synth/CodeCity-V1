@@ -1,0 +1,399 @@
+═══════════════════════════════════════════════════════════════════ SOFTWARE
+CITY — PHASE 6: PUBLIC LAUNCH READY The last phase. Ship it. Demo it. Be proud of it.
+═══════════════════════════════════════════════════════════════════
+Read PROGRESS.md and PHASE5_HANDOFF.md before doing anything else.
+CURRENT STATE — what Phase 5 completed: ✓ OpenAPI spec synced — zero as string casts remaining ✓ metric_snapshots table — snapshot
+every 30 seconds ✓ settings table — all config persists in SQLite ✓ GET/PUT /api/settings — full CRUD, defaults seeded on boot ✓ GET
+/api/metrics/history — time-windowed history (1–168h) ✓ /metrics page — live charts (health, bugs, agents over time) ✓ /settings page — auto-save,
+danger zone with typed confirm ✓ Tooltip flicker fixed (200ms debounce) ✓ Zero TypeScript errors across all packages
+THIS IS THE FINAL PHASE. The question is: “Can a stranger clone this and be impressed in 5 minutes?” Build until the answer is yes. Then stop.
+WHAT STILL NEEDS DOING: ✗ Docker — not yet built (planned in Phase 4/5, not completed) ✗ pnpm dev doesn’t start both services — need
+concurrently ✗ README is incomplete — doesn’t match current feature set ✗ No SVG export from city map ✗ No Markdown report generation ✗
+Building animations (fire, sparkle) are static emoji ✗ No agent path-following — still teleports ✗ Season overlay not visible on city map ✗ No DEMO.md
+script ✗ Memory leaks: agent intervals not cleared on shutdown ✗ Duplicate agent tasks (two agents same building) ✗ WS messages not batched
+(can flood client) ✗ No analysis result caching in codeAnalyzer ✗ Checkpoint error mentioned at end of Phase 5 — verify DB is OK
+DO THESE IN ORDER. After each: pnpm run typecheck, fix errors. Never skip the final handoff document.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 0
+— HEALTH CHECK (do this before anything else)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Verify the app is healthy after the Phase 5 checkpoint error.
+Run these checks and fix anything broken before proceeding:
+1. pnpm run typecheck (all packages) → must be zero errors
+2. Start API server → GET /api/health → must return 200
+3. GET /api/settings → must return settings object (not error)
+4. GET /api/metrics/history?hours=1 → must return { snapshots: [] } or array with data (not 500 error)
+5. Start frontend → /metrics page loads without crash
+6. /settings page loads without crash
+7. Check SQLite DB exists: ls -la artifacts/api-server/data/city.db If missing: run drizzle-kit push again
+Only proceed to Step 1 after all 7 checks pass. Document results in a brief note at the top of PHASE6_HANDOFF.md.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 1
+— ONE-COMMAND START: pnpm dev
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Right now you need two terminals to run the app. Fix this.
+Install at workspace root: pnpm add -D concurrently -w
+Update root package.json scripts: “dev”: “concurrently –names API,UI –prefix-colors cyan,magenta "pnpm –filter @workspace/api-server run dev"
+"pnpm –filter @workspace/software-city run dev"”, “build”: “pnpm –filter @workspace/api-server run build && pnpm –filter @workspace/software-city
+run build”, “typecheck”: “pnpm -r run typecheck”, “clean”: “find . -name ‘dist’ -not -path ‘/node_modules/’ -exec rm -rf {} + 2>/dev/null; find . -name
+‘*.tsbuildinfo’ -exec rm {} +”
+Verify: running pnpm dev from repo root starts both services. Both should appear in the same terminal with colored prefixes. API on port 8080,
+Frontend on port 5173 (or Replit’s assigned port).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 2
+— DOCKER: ONE-COMMAND DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create Dockerfile at repo root:
+FROM node:20-slim AS base RUN npm install -g pnpm@9 WORKDIR /app COPY package.json pnpm-workspace.yaml .npmrc ./ COPY artifacts/apiserver/package.json ./artifacts/api-server/ COPY artifacts/software-city/package.json ./artifacts/software-city/ COPY lib/db/package.json ./lib/db/
+COPY lib/api-client-react/package.json ./lib/api-client-react/ COPY lib/api-zod/package.json ./lib/api-zod/ COPY lib/api-spec/package.json ./lib/apispec/ RUN pnpm install –frozen-lockfile
+FROM base AS builder COPY . . RUN pnpm –filter @workspace/db run build 2>/dev/null || true RUN pnpm –filter @workspace/api-zod run build
+2>/dev/null || true RUN pnpm –filter @workspace/api-client-react run build 2>/dev/null || true RUN pnpm –filter @workspace/api-server run build RUN
+pnpm –filter @workspace/software-city run build
+FROM node:20-slim AS runner WORKDIR /app COPY –from=builder /app/artifacts/api-server/dist ./dist/ COPY –from=builder /app/artifacts/softwarecity/dist ./public/ COPY –from=builder /app/node_modules ./node_modules/ COPY –from=builder /app/artifacts/api-server/node_modules
+./artifacts/api-server/node_modules/ 2>/dev/null || true RUN mkdir -p data ENV NODE_ENV=production ENV PORT=8080 ENV
+DB_PATH=/app/data/city.db EXPOSE 8080 CMD [“node”, “dist/index.js”]
+Update artifacts/api-server/src/app.ts — add production static serving at the END of all route registrations:
+if (process.env.NODE_ENV === ‘production’) { const publicDir = new URL(’../../public’, import.meta.url).pathname app.use(express.static(publicDir))
+app.get(’*’, (req, res, next) => { if (req.path.startsWith(’/api/’) || req.path.startsWith(’/ws’)) { return next() } res.sendFile(new URL(’../../public/index.html’,
+import.meta.url).pathname) }) }
+Create docker-compose.yml:
+version: ‘3.8’ services: software-city: build: . ports: - “8080:8080” volumes: - ./data:/app/data environment: NODE_ENV: production PORT: “8080”
+DB_PATH: /app/data/city.db ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-} GROQ_API_KEY: ${GROQ_API_KEY:-} OLLAMA_HOST:
+${OLLAMA_HOST:-http://host.docker.internal:11434} extra_hosts: - “host.docker.internal:host-gateway” restart: unless-stopped healthcheck: test:
+[“CMD-SHELL”, “node -e "fetch(‘http://localhost:8080/api/health’).then(r=>process.exit(r.ok?0:1))"”] interval: 30s timeout: 10s retries: 3 start_period:
+20s
+Create .dockerignore: node_modules /node_modules data/.db .env .git coverage dist */dist *.md !README.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 3
+— STABILITY: THE THREE BUGS THAT MATTER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+These three bugs make the app feel unstable after 5+ minutes running. Fix them before any visual polish.
+── 3A. DUPLICATE AGENT TASKS ────────────────────────────────────────
+In artifacts/api-server/src/lib/agentEngine.ts:
+Add at module level: const activeTargets = new Set<string>()
+In chooseTarget() or equivalent target selection: Filter out buildings where activeTargets.has(building.id)
+When agent starts working on a building: activeTargets.add(building.id)
+When agent finishes (success, failure, or error): activeTargets.delete(building.id) (Wrap in try/finally so it always clears even on exception)
+── 3B. MEMORY LEAK: AGENT INTERVALS ────────────────────────────────
+In agentEngine.ts:
+Replace any raw setInterval calls with tracked intervals: const agentIntervals = new Map<string, ReturnType<typeof setInterval>>()
+When spawning an agent: const intervalId = setInterval(runAgentCycle, intervalMs) agentIntervals.set(agent.id, intervalId)
+When retiring/deleting an agent: const id = agentIntervals.get(agentId) if (id) { clearInterval(id); agentIntervals.delete(agentId) }
+Export a function: clearAllAgentIntervals() agentIntervals.forEach(id => clearInterval(id)) agentIntervals.clear()
+In artifacts/api-server/src/index.ts SIGTERM/SIGINT handler: import { clearAllAgentIntervals } from ‘./lib/agentEngine.js’ clearAllAgentIntervals() Then
+close WS server and DB connection, then process.exit(0)
+── 3C. WEBSOCKET MESSAGE BATCHING ───────────────────────────────────
+In artifacts/api-server/src/lib/wsServer.ts:
+Add message queue and 50ms flush: private messageQueue: WSMessage[] = [] private flushTimer: ReturnType<typeof setInterval> | null = null
+startFlushing(): void this.flushTimer = setInterval(() => this.flush(), 50)
+private flush(): void if (this.messageQueue.length === 0) return const batch = this.messageQueue.splice(0) // Group npc_move messages — keep
+only latest per npcId const moves = new Map<string, WSMessage>() const others: WSMessage[] = [] for (const msg of batch) { if (msg.type ===
+‘npc_move’) { moves.set(msg.payload.npcId, msg) } else { others.push(msg) } } const deduped = […moves.values(), …others] if (deduped.length ===
+1) { this.broadcastRaw(deduped[0]) } else { this.broadcastRaw({ type: ‘batch’, payload: deduped, timestamp: new Date().toISOString() }) }
+Change all broadcastX methods to push to messageQueue instead of calling broadcastRaw immediately. Call startFlushing() in initialize(). In
+closeAll(): clearInterval(flushTimer)
+Update useWebSocket.ts in frontend: Handle type === ‘batch’: const { payload } = data as { payload: WSMessage[] } for (const msg of payload) {
+handleMessage(msg) }
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 4
+— EXPORT: JSON + SVG + MARKDOWN REPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 4A. SVG EXPORT ───────────────────────────────────────────────────
+In CityView.tsx, update the Export button to a dropdown:
+Replace single Export button with:
+ <div style={{ position: 'relative' }}>
+ <button onClick={() => setExportOpen(o => !o)}>Export ▾</button>
+ {exportOpen && (
+ <div className="export-dropdown"> ← absolute positioned menu
+ <button onClick={downloadJSON}> JSON snapshot</button>
+ <button onClick={downloadSVG}> SVG city map</button>
+ <button onClick={downloadReport}> Markdown report</button>
+ <button onClick={copyShareLink}> Copy share link</button>
+ </div>
+ )}
+ </div>
+downloadSVG implementation: const svg = document.querySelector(‘svg[data-city-map]’) if (!svg) return const serializer = new XMLSerializer() let
+svgStr = serializer.serializeToString(svg) // Add XML declaration and encoding svgStr = ‘<?xml version="1.0" encoding="UTF-8"?>\n’ + svgStr const
+blob = new Blob([svgStr], { type: ‘image/svg+xml’ }) const url = URL.createObjectURL(blob) const a = document.createElement(‘a’) a.href = url
+a.download = software-city-${repoName}-${Date.now()}.svg a.click() URL.revokeObjectURL(url)
+Add data-city-map attribute to the <svg> element in CityMap.tsx.
+── 4B. MARKDOWN REPORT ──────────────────────────────────────────────
+Add POST /api/city/report route in a new file: artifacts/api-server/src/routes/report.ts
+Generate this Markdown string server-side:
+Software City Report — [repoName]
+Generated: [ISO date] Health Score: [N]/100 — [season]
+Coverage Summary
+District Files Tested Coverage Bugs
+[one row per district, sorted by coverage ascending]
+Critical Issues (Buildings on Fire)
+[list of buildings with status=fire, with their latest bug message] If none: “No critical issues found. ”
+Agent Activity
+[N] agents completed [M] tasks
+[K] escalations to external AI
+[X] served from knowledge base (saved ~$[Y])
+Top performing agent: [name] — [N] bugs found, [acc]% accuracy
+Untested Files (Coverage = 0%)
+[list of file paths with zero coverage, max 10, sorted by complexity] If none: “All files have been tested. ”
+Recommendations
+Top 5 files to focus on next:
+1. [filename] — complexity [N], coverage [%], [N] active bugs
+2. …
+Return as { report: string } from the route. Register in routes/index.ts.
+downloadReport in frontend: const res = await fetch(’/api/city/report’, { method: ‘POST’ }) const { report } = await res.json() const blob = new
+Blob([report], { type: ‘text/markdown’ }) // download as [repoName]-report.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 5
+— VISUAL POLISH: THE THINGS PEOPLE NOTICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 5A. FIRE ANIMATION (SVG SMIL) ───────────────────────────────────
+Replace static emoji on fire buildings with animated SVG flames.
+In CityMap.tsx, for buildings with status === ‘fire’: Render this SVG group above the building rect:
+<g transform={ translate(${bx + bw/2 - 4}, ${by - 10}) }> <rect x="0" y="0" width="4" height="8" rx="2" fill="#ff4400" opacity="0.9"> <animate
+attributeName="y" values="0;-3;0" dur="0.4s" repeatCount="indefinite"/> <animate attributeName="opacity" values="0.9;0.6;0.9" dur="0.4s"
+repeatCount="indefinite"/> </rect> <rect x="5" y="2" width="3" height="6" rx="1.5" fill="#ffaa00" opacity="0.8"> <animate attributeName="y"
+values="2;-1;2" dur="0.35s" repeatCount="indefinite"/> </rect> <rect x="-2" y="3" width="3" height="5" rx="1.5" fill="#ff6600" opacity="0.7">
+<animate attributeName="y" values="3;0;3" dur="0.45s" repeatCount="indefinite"/> </rect> </g>
+── 5B. EXCELLENT BUILDING SPARKLE ──────────────────────────────────
+For buildings with coverage >= 0.9 and no active bugs: Add status “excellent” in the building data Render 4 small orbiting circles (CSS animation, pure
+SVG):
+ <g>
+ {[0, 90, 180, 270].map((deg, i) => (
+ <circle key={i} r="2" fill="#00ff88" opacity="0.7">
+ <animateMotion
+ path={`M ${bx + bw/2} ${by + bh/2} m 12,0
+ a 12,12 0 1,1 -0.001,0`}
+ dur="3s"
+ begin={`${i * 0.75}s`}
+ repeatCount="indefinite"
+ />
+ </circle>
+ ))}
+ </g>
+── 5C. SEASON OVERLAY ON CITY MAP ──────────────────────────────────
+Add a season tint + particles to CityMap.tsx.
+After all buildings/roads are rendered, add a final SVG layer:
+{/* Season overlay */} <rect x={viewBox.x} y={viewBox.y} width={viewBox.width} height={viewBox.height} fill={seasonColor} opacity={seasonOpacity}
+style={{ pointerEvents: ‘none’ }} />
+seasonColor / seasonOpacity by season: summer: #7bc67e / 0.04 spring: #a8d8a8 / 0.03 autumn: #d4915a / 0.05 winter: #8bb8d4 / 0.08
+Winter snow particles (only if season === ‘winter’): Generate 20 fixed random positions (useMemo with seed) Each: a small white circle with
+animateMotion falling diagonally: <circle r="1.5" fill="white" opacity="0.6"> <animateMotion path=“M 0,0 L 20,40” dur=“3s” begin={ ${i * 0.15}s }
+repeatCount=“indefinite”/> </circle>
+Autumn leaves (only if season === ‘autumn’): Same approach with 15 orange/brown leaf shapes (simple polygon) Fall diagonally with slight rotation
+using animateTransform
+── 5D. HEALTH TREND IN HUD ─────────────────────────────────────────
+Update HUD.tsx to show trend arrow next to health score.
+Fetch from /api/city/metrics and read health.trend: trend === ‘up’: show ↑ in green (#00ff88) trend === ‘down’: show ↓ in red (#ff3b3b) trend ===
+‘stable’: show → in grey (#666)
+Show next to the health number: “78 ↑”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 6
+— ANALYSIS CACHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+In artifacts/api-server/src/lib/codeAnalyzer.ts:
+Add at module level: interface CacheEntry { result: FileMetrics; hash: string; timestamp: number } const analysisCache = new Map<string,
+CacheEntry>() const MAX_CACHE_SIZE = 500
+function djb2(str: string): string let hash = 5381 for (let i = 0; i < str.length; i++) { hash = ((hash << 5) + hash) ^ str.charCodeAt(i) } return (hash >>>
+0).toString(36)
+In analyzeFile(filename, content): const hash = djb2(content) const cached = analysisCache.get(filename) if (cached && cached.hash === hash)
+return cached.result
+// … existing analysis …
+// LRU eviction if (analysisCache.size >= MAX_CACHE_SIZE) { const oldest = […analysisCache.entries()] .sort((a, b) => a[1].timestamp -
+b[1].timestamp)[0] analysisCache.delete(oldest[0]) } analysisCache.set(filename, { result, hash, timestamp: Date.now() }) return result
+This makes file-watcher re-analysis near-instant for unchanged files.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 7
+— README + DEMO SCRIPT (the public face)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is what someone sees on GitHub before they decide to clone. Make it perfect.
+── 7A. README.md (complete rewrite) ─────────────────────────────────
+ Software City
+Walk through your code like a city. AI agents find bugs. The city gets healthier as you fix them.
+ <!-- Add screenshot here when ready -->
+What is this?
+Software City transforms any code repository into a living, explorable world:
+Folders become districts
+Files become buildings (height = lines of code)
+AI agents walk the city and test your code automatically
+Bugs appear as building fires
+Code health drives the season — untested code = winter
+Quick Start
+Requirements: Node.js 20+, pnpm
+git clone https://github.com/you/software-city
+cd software-city
+cp .env.template .env # optional — add API keys for AI features
+pnpm install
+pnpm dev
+Open http://localhost:5173 and enter any GitHub URL. No database setup. No API keys required for basic use.
+Optional: Enable AI Agents
+Local AI (free, no internet after setup)
+# Install Ollama: https://ollama.com/download
+ollama pull deepseek-coder-v2:16b
+Cloud AI (free tier available)
+# Groq — free tier, very fast
+echo "GROQ_API_KEY=gsk_..." >> .env
+# or Anthropic Claude
+echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
+Docker (one command)
+docker compose up
+# Open http://localhost:8080
+Features
+City
+Real AST analysis: TypeScript, JavaScript, Python, Go, Rust, Java
+Live code metrics: LOC, cyclomatic complexity, import graph
+Git history time-lapse: watch your codebase evolve
+Shareable city URLs
+AI Agents
+5 agent roles: QA Inspector, API Fuzzer, Load Tester, Edge Explorer, UI Navigator
+Local-first: Ollama handles 94%+ of tasks
+Smart escalation: KB cache → Groq → Claude (only when stuck)
+Learning knowledge base: every escalation answer saves forever
+Agent reputation system: junior → mid → senior → principal
+Dashboard
+Live metrics: health score, coverage, bugs, escalation rate
+Settings: configure AI provider, agent speed, analysis limits
+Leaderboard: agent career stats and promotions
+Architecture
+artifacts/software-city/ React + Vite frontend
+artifacts/api-server/ Express + TypeScript backend
+lib/db/ Drizzle ORM + SQLite
+lib/api-client-react/ TanStack Query hooks
+lib/api-zod/ Zod schemas from OpenAPI spec
+Contributing
+See CONTRIBUTING.md for how to add new agent roles, analysis metrics, and city visualizations.
+License
+MIT
+── 7B. DEMO.md ───────────────────────────────────────────────────────
+Create DEMO.md at repo root. A 5-minute script for showing this live.
+Software City — Live Demo (5 minutes)
+Prep (before the audience arrives)
+App running at localhost:5173
+Demo mode already loaded (click “Run Demo” once)
+3 agents spawned and running for 5+ minutes
+/metrics page open in another tab
+1. The Pitch (30 seconds)
+“This is a repository visualized as a city. Every folder is a district. Every file is a building. The height is lines of code. Fires are bugs. AI agents are
+walking through the code right now, testing it.”
+2. Load a Real Repo (60 seconds)
+Type: https://github.com/expressjs/express
+Watch the city generate
+“That’s the actual Express.js router. This district is middleware. That tower is the main application file — 847 lines.”
+3. Inspect a Building (60 seconds)
+Click the tallest building
+Inspector opens
+“See — 847 lines, complexity 23, last commit 3 days ago. Coverage is at 41%. The agent found 2 potential issues.”
+Click “Gen Tests” → show real output
+Type in chat: “What’s the most risky code in this file?”
+4. The Knowledge Base (30 seconds)
+Navigate to /knowledge
+“Every time an agent asks an AI something, the answer saves here. This pattern has been used 7 times. Never called the API again.”
+5. Git Time-lapse (60 seconds)
+Press T
+“Watch the codebase grow.”
+Press ▶ Play — city animates through history
+“You can literally watch them add the router module.”
+6. Share (30 seconds)
+Export → Copy share link
+Paste URL in browser
+“Anyone with this link sees this exact snapshot.”
+Show the Metrics page in another tab
+Total: ~5 minutes. Questions usually start during step 3.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 8
+— CONTRIBUTING.md + .env.template FINAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 8A. CONTRIBUTING.md ──────────────────────────────────────────────
+Create CONTRIBUTING.md at repo root:
+Contributing to Software City
+Setup
+git clone ...
+pnpm install
+pnpm dev
+Project Structure
+[brief table of directories and what they do]
+Adding a New Agent Role
+1. Add role to AgentRole enum in lib/db/src/schema/agents.ts
+2. Add targeting bonus in agentEngine.ts chooseTarget()
+3. Add card in Agents.tsx spawn dialog
+4. Add thought templates in ollamaPrompts.ts
+Adding a New Analysis Language
+1. Add extension mapping in codeAnalyzer.ts detectLanguage()
+2. Add complexity counting patterns in computeComplexity()
+3. Add import extraction patterns in extractImports()
+4. Test: load a repo with that language, verify metrics are non-zero
+Adding a New City Building Type
+1. Add FileType in lib/db/src/schema/types.ts
+2. Add detection rule in codeAnalyzer.ts detectFileType()
+3. Add color mapping in cityAnalyzer.ts (building.color)
+4. Add visual in CityMap.tsx building renderer
+Running Tests
+pnpm run typecheck ← TypeScript validation (must be 0 errors) pnpm run build ← Production build test
+PR Guidelines
+pnpm run typecheck must pass before submitting
+Describe what your change adds to the city metaphor
+Prefer extending existing systems over adding new ones
+── 8B. .env.template FINAL ──────────────────────────────────────────
+Overwrite .env.template:
+Software City — Environment Variables
+Copy to .env and fill in what you need.
+None of these are required for basic operation.
+──────────────────────────────────────────
+AI PROVIDERS (for agent escalation)
+──────────────────────────────────────────
+Groq — free tier, ~500 tokens/sec, recommended
+Get key: https://console.groq.com
+GROQ_API_KEY=
+Anthropic Claude — best reasoning, ~$0.005/escalation
+Get key: https://console.anthropic.com
+ANTHROPIC_API_KEY=
+Ollama host (if running on a different machine)
+Default: http://localhost:11434
+OLLAMA_HOST=
+──────────────────────────────────────────
+SERVER CONFIG (optional overrides)
+──────────────────────────────────────────
+API server port (default: 8080)
+PORT=
+SQLite database path (default: ./data/city.db)
+DB_PATH=
+──────────────────────────────────────────
+GITHUB (for private repo support)
+──────────────────────────────────────────
+Enter in the UI — never put your token in this file.
+GitHub PAT is never stored in the database.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 9
+— FINAL TYPECHECK + BUILD VERIFICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run all of these and fix everything before generating the handoff:
+1. pnpm run typecheck → must be zero errors
+2. pnpm run build → must succeed (both packages)
+3. pnpm dev → both services start from root
+4. GET /api/health → 200 with dbSizeBytes
+5. GET /api/settings → returns settings object
+6. GET /api/metrics/history → returns snapshots array
+7. POST /api/city/report → returns { report: string }
+8. docker build . (if possible) → no errors
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ STEP 10
+— PHASE 6 HANDOFF (THE FINAL ONE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Generate PHASE6_HANDOFF.md. This is the last handoff document. It must answer the question future contributors will have: “Is this ready? What
+works? What doesn’t? Where do I start?”
+Sections:
+Health Check Results (Step 0)
+List all 7 checks: PASS / FAIL
+What Was Built This Phase
+New files, modified files, one-line description each
+Feature Complete Checklist
+For every feature from Phase 1–6: Working / Partial / Missing Be honest. Partial credit exists.
+Verification Results (Step 9)
+All 8 checks: PASS / FAIL / SKIP (if Docker unavailable)
+Known Issues
+Any remaining bugs, limitations, or rough edges Prioritized: P1 (blocks use) / P2 (annoying) / P3 (nice to fix)
+Architecture Decision Record
+Key decisions made across all 6 phases: Why SQLite over PostgreSQL Why @libsql/client over better-sqlite3 Why SVG over Canvas for city rendering
+Why Ollama + escalation over pure cloud AI Why pnpm workspaces
+“Is it ready?” Assessment
+Honest 1-paragraph answer to: Can someone clone this and be impressed in 5 minutes? What is the single biggest thing still missing? What would
+Phase 7 focus on?
+Full File Tree
+Current complete file structure
+Final Package Dependencies
+Both package.json files, current state
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRIORITY IF RUNNING SHORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MUST DO: Steps 0, 1, 3, 7A, 9, 10 SHOULD DO: Steps 2, 4, 5C, 8 NICE TO HAVE: Steps 5A, 5B, 6, 7B
+Step 0 (health check) is mandatory — don’t build on a broken base. Step 1 (pnpm dev) and Step 3 (stability bugs) are the two things that matter most
+for someone cloning fresh. Step 7A (README) is what they read before cloning — make it good. Step 10 (handoff) closes the project properly.
+The checkpoint error at end of Phase 5 is unknown — Step 0 finds out if it caused any real damage. If the DB is corrupted, fix that first above all else.
+This is the last phase. Build it like someone will see it tomorrow.

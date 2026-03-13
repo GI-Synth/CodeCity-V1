@@ -42,6 +42,20 @@ const SEASON_BGS = {
   winter: "#151515",
 };
 
+const SEASON_OVERLAY: Record<string, string> = {
+  summer: "rgba(123, 198, 126, 0.04)",
+  spring: "rgba(168, 216, 168, 0.03)",
+  autumn: "rgba(212, 145, 90, 0.05)",
+  winter: "rgba(139, 184, 212, 0.08)",
+};
+
+const SEASON_PARTICLES: Record<string, { emoji: string; count: number }> = {
+  winter: { emoji: "❄", count: 12 },
+  autumn: { emoji: "🍂", count: 8 },
+  spring: { emoji: "🌸", count: 6 },
+  summer: { emoji: "", count: 0 },
+};
+
 const AGENT_TASK_ICONS: Record<string, string> = {
   analyze_bug: "🔥",
   generate_tests: "🔬",
@@ -107,6 +121,7 @@ export function CityMap({
   const [zoom, setZoom] = useState(1);
   const [center, setCenter] = useState({ x: bounds.cx, y: bounds.cy });
   const [hoveredBuilding, setHoveredBuilding] = useState<Building | null>(null);
+  const hideTooltipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showMinimap, setShowMinimap] = useState(true);
 
   useEffect(() => {
@@ -248,6 +263,7 @@ export function CityMap({
 
       <svg
         ref={svgRef}
+        data-city-map=""
         className={`w-full h-full ${isDragging.current ? "cursor-grabbing" : "cursor-grab"}`}
         viewBox={viewBox}
         preserveAspectRatio="none"
@@ -359,8 +375,13 @@ export function CityMap({
                     key={building.id}
                     transform={`translate(${building.x}, ${building.y})`}
                     onClick={() => !isDragging.current && onSelectBuilding(building.id)}
-                    onMouseEnter={() => setHoveredBuilding(building)}
-                    onMouseLeave={() => setHoveredBuilding(null)}
+                    onMouseEnter={() => {
+                      if (hideTooltipTimer.current) clearTimeout(hideTooltipTimer.current);
+                      setHoveredBuilding(building);
+                    }}
+                    onMouseLeave={() => {
+                      hideTooltipTimer.current = setTimeout(() => setHoveredBuilding(null), 200);
+                    }}
                     className="cursor-pointer"
                     style={{ transition: "opacity 0.3s" }}
                     opacity={opacity}
@@ -431,9 +452,40 @@ export function CityMap({
 
                     {/* Event icons */}
                     <g transform={`translate(${building.width / 2}, ${building.height / 2})`} className="pointer-events-none">
-                      {building.activeEvent === 'fire' && <text x="-12" y="8" fontSize="22" className="animate-bounce">🔥</text>}
-                      {building.activeEvent === 'sparkle' && <text x="-12" y="8" fontSize="22" className="animate-pulse">✨</text>}
-                      {building.activeEvent === 'alarm' && <text x="-12" y="8" fontSize="22" className="animate-pulse">🚨</text>}
+                      {building.activeEvent === 'fire' && (
+                        <g transform="translate(-10,-18)">
+                          <ellipse cx="10" cy="12" rx="7" ry="9" fill="#ff4400">
+                            <animate attributeName="ry" values="9;12;8;11;9" dur="0.5s" repeatCount="indefinite" />
+                            <animate attributeName="cy" values="12;9;13;10;12" dur="0.5s" repeatCount="indefinite" />
+                          </ellipse>
+                          <ellipse cx="10" cy="8" rx="4" ry="6" fill="#ff9900">
+                            <animate attributeName="ry" values="6;8;5;7;6" dur="0.4s" repeatCount="indefinite" />
+                          </ellipse>
+                          <ellipse cx="10" cy="5" rx="2" ry="3" fill="#ffee00">
+                            <animate attributeName="ry" values="3;4;2;3" dur="0.3s" repeatCount="indefinite" />
+                          </ellipse>
+                        </g>
+                      )}
+                      {building.activeEvent === 'sparkle' && (
+                        <g>
+                          {[0, 60, 120, 180, 240, 300].map(angle => (
+                            <line
+                              key={angle}
+                              x1="0" y1="0"
+                              x2={Math.cos(angle * Math.PI / 180) * 10}
+                              y2={Math.sin(angle * Math.PI / 180) * 10}
+                              stroke="#00fff7"
+                              strokeWidth="1.5"
+                            >
+                              <animate attributeName="opacity" values="1;0;1" dur={`${0.5 + angle / 300}s`} repeatCount="indefinite" />
+                            </line>
+                          ))}
+                          <circle cx="0" cy="0" r="3" fill="#ffffff">
+                            <animate attributeName="r" values="3;4;3" dur="0.6s" repeatCount="indefinite" />
+                          </circle>
+                        </g>
+                      )}
+                      {building.activeEvent === 'alarm' && <text x="-12" y="8" fontSize="22"><animate attributeName="opacity" values="1;0;1" dur="0.5s" repeatCount="indefinite" />🚨</text>}
                       {building.activeEvent === 'flood' && <text x="-12" y="8" fontSize="22">🌊</text>}
                       {building.activeEvent === 'smoke' && <text x="-12" y="8" fontSize="22">💨</text>}
                       {!building.activeEvent && building.status === 'error' && <text x="-12" y="8" fontSize="22">❌</text>}
@@ -459,6 +511,42 @@ export function CityMap({
             </g>
           );
         })}
+
+        {/* Season overlay tint */}
+        {layout.season && SEASON_OVERLAY[layout.season] && (
+          <rect
+            x={center.x - viewW / 2}
+            y={center.y - viewH / 2}
+            width={viewW}
+            height={viewH}
+            fill={SEASON_OVERLAY[layout.season]}
+            className="pointer-events-none"
+          />
+        )}
+
+        {/* Season particles */}
+        {layout.season && SEASON_PARTICLES[layout.season]?.count > 0 && !isLowLod && (
+          <g className="pointer-events-none">
+            {Array.from({ length: SEASON_PARTICLES[layout.season].count }).map((_, i) => {
+              const px = (center.x - viewW / 2) + ((i * 137.5) % 1) * viewW + (i / SEASON_PARTICLES[layout.season].count) * viewW;
+              const py = (center.y - viewH / 2) + ((i * 89.7) % 1) * viewH;
+              const dur = 3 + (i % 4);
+              return (
+                <text key={i} x={px} y={py} fontSize={viewW * 0.015} textAnchor="middle" opacity="0.5">
+                  {SEASON_PARTICLES[layout.season].emoji}
+                  <animateTransform
+                    attributeName="transform"
+                    type="translate"
+                    values={`0,0; ${i % 2 === 0 ? 5 : -5},${viewH * 0.05}; 0,${viewH * 0.1}`}
+                    dur={`${dur}s`}
+                    repeatCount="indefinite"
+                  />
+                  <animate attributeName="opacity" values="0.5;0.2;0" dur={`${dur}s`} repeatCount="indefinite" />
+                </text>
+              );
+            })}
+          </g>
+        )}
 
         {/* Agents */}
         <AnimatePresence>

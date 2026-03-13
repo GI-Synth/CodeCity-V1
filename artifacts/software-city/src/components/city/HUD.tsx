@@ -1,6 +1,7 @@
 import { CityHealth, LiveMetrics } from "@workspace/api-client-react";
-import { Activity, ShieldAlert, Cpu, Database, Thermometer, CloudSnow, Sun, Leaf, Wifi, WifiOff } from "lucide-react";
+import { Activity, ShieldAlert, Cpu, Database, Thermometer, CloudSnow, Sun, Leaf, Wifi, WifiOff, TrendingUp, TrendingDown, Minus } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useEffect, useRef, useState } from "react";
 
 interface HUDProps {
   health?: CityHealth;
@@ -10,6 +11,22 @@ interface HUDProps {
 }
 
 export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps) {
+  const prevScore = useRef<number | null>(null);
+  const [trend, setTrend] = useState<"up" | "down" | "flat">("flat");
+
+  useEffect(() => {
+    if (!health) return;
+    if (prevScore.current === null) {
+      prevScore.current = health.score;
+      return;
+    }
+    const diff = health.score - prevScore.current;
+    if (diff >= 2) setTrend("up");
+    else if (diff <= -2) setTrend("down");
+    else setTrend("flat");
+    prevScore.current = health.score;
+  }, [health?.score]);
+
   if (!health || !metrics) return null;
 
   const getSeasonIcon = (season: string) => {
@@ -37,6 +54,9 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
               {health.score}
             </span>
             <span className="text-muted-foreground text-sm">/100</span>
+            {trend === "up" && <TrendingUp size={14} className="text-success" />}
+            {trend === "down" && <TrendingDown size={14} className="text-destructive" />}
+            {trend === "flat" && <Minus size={14} className="text-muted-foreground" />}
           </div>
         </div>
 

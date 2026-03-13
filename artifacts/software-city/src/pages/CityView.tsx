@@ -9,7 +9,7 @@ import { GuidedTour, useTour } from "@/components/GuidedTour";
 import { ShortcutsPanel } from "@/components/ShortcutsPanel";
 import { useGetCityLayout, useGetCityHealth, useGetLiveMetrics, useListAgents } from "@workspace/api-client-react";
 import type { Agent } from "@workspace/api-client-react";
-import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check, Keyboard, MapPin } from "lucide-react";
+import { Loader2, Cpu, MemoryStick, Activity, Zap, Brain, Download, Share2, Check, Keyboard, MapPin, FileText, ChevronDown, ImageDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { Button } from "@/components/ui/button";
@@ -133,6 +133,8 @@ export function CityView() {
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [visibleCount, setVisibleCount] = useState<number | undefined>(undefined);
   const [totalCount, setTotalCount] = useState<number | undefined>(undefined);
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportRef = useRef<HTMLDivElement>(null);
 
   const { data: layout, isLoading: layoutLoading } = useGetCityLayout({ query: { refetchInterval: 10000 } });
   const { data: health, refetch: refetchHealth } = useGetCityHealth({ query: { refetchInterval: 10000 } });
@@ -232,12 +234,58 @@ export function CityView() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [shortcutsOpen, showTour, endTour, startTour, setLocation]);
 
-  const handleExport = () => {
+  const handleExportJSON = () => {
     const link = document.createElement("a");
     link.href = "/api/city/snapshot";
-    link.download = `software-city-snapshot-${Date.now()}.json`;
+    link.download = `software-city-${Date.now()}.json`;
     link.click();
+    setExportOpen(false);
   };
+
+  const handleExportSVG = () => {
+    const svg = document.querySelector("[data-city-map]") as SVGSVGElement | null;
+    if (!svg) return;
+    const serializer = new XMLSerializer();
+    const svgStr = serializer.serializeToString(svg);
+    const blob = new Blob([svgStr], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `software-city-map-${Date.now()}.svg`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  };
+
+  const handleExportReport = async () => {
+    setExportOpen(false);
+    try {
+      const res = await fetch("/api/city/report", { method: "POST" });
+      const data = await res.json() as { report?: string };
+      if (!data.report) throw new Error("No report");
+      const blob = new Blob([data.report], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `software-city-report-${Date.now()}.md`;
+      link.click();
+      URL.revokeObjectURL(url);
+      toast({ title: "Report exported!", description: "Markdown report downloaded." });
+    } catch {
+      toast({ title: "Export failed", variant: "destructive" });
+    }
+  };
+
+  useEffect(() => {
+    if (!exportOpen) return;
+    const handle = (e: MouseEvent) => {
+      if (exportRef.current && !exportRef.current.contains(e.target as Node)) {
+        setExportOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [exportOpen]);
 
   if (layoutLoading) {
     return (
@@ -280,9 +328,38 @@ export function CityView() {
           />
 
           <div className="absolute top-4 right-4 z-20 flex gap-2" data-tour="share-btn">
-            <Button variant="outline" size="sm" onClick={handleExport} className="h-8 text-xs font-mono border-primary/30">
-              <Download size={12} className="mr-1.5" /> Export
-            </Button>
+            <div ref={exportRef} className="relative">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setExportOpen(v => !v)}
+                className="h-8 text-xs font-mono border-primary/30"
+              >
+                <Download size={12} className="mr-1.5" /> Export <ChevronDown size={10} className="ml-1" />
+              </Button>
+              {exportOpen && (
+                <div className="absolute right-0 top-9 z-50 w-44 rounded-md border border-primary/30 bg-background/95 backdrop-blur shadow-neon overflow-hidden">
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-xs font-mono hover:bg-primary/10 text-left"
+                    onClick={handleExportJSON}
+                  >
+                    <Download size={12} /> JSON Snapshot
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-xs font-mono hover:bg-primary/10 text-left"
+                    onClick={handleExportSVG}
+                  >
+                    <ImageDown size={12} /> SVG Map
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-xs font-mono hover:bg-primary/10 text-left"
+                    onClick={handleExportReport}
+                  >
+                    <FileText size={12} /> Markdown Report
+                  </button>
+                </div>
+              )}
+            </div>
             <Button
               variant="outline"
               size="sm"

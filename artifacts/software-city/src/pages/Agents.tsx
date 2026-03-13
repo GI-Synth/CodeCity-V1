@@ -21,7 +21,7 @@ export function Agents() {
   const agents = data?.agents || [];
   const [pausingAll, setPausingAll] = useState(false);
 
-  const anyActive = agents.some(a => (a.status as string) !== "paused" && (a.status as string) !== "retired");
+  const anyActive = agents.some(a => a.status !== "paused" && a.status !== "retired");
 
   const handlePauseAll = async () => {
     setPausingAll(true);
@@ -85,7 +85,7 @@ function AgentCard({ agent, onRefetch }: { agent: Agent; onRefetch: () => void }
   const [pausing, setPausing] = useState(false);
   const config = ROLE_CONFIG[agent.role as keyof typeof ROLE_CONFIG] || ROLE_CONFIG.qa_inspector;
   const Icon = config.icon;
-  const isPaused = (agent.status as string) === "paused";
+  const isPaused = agent.status === "paused";
 
   const handleTogglePause = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -150,7 +150,7 @@ function AgentCard({ agent, onRefetch }: { agent: Agent; onRefetch: () => void }
           <div className="text-[10px] text-muted-foreground font-mono uppercase">Status</div>
           <div className={cn(
             "text-xs font-mono font-bold mt-1",
-            (agent.status as string) === 'paused' ? "text-yellow-400" :
+            agent.status === 'paused' ? "text-yellow-400" :
             agent.status === 'idle' ? "text-muted-foreground" :
             agent.status === 'escalating' ? "text-warning" : "text-success"
           )}>
@@ -171,7 +171,7 @@ function AgentCard({ agent, onRefetch }: { agent: Agent; onRefetch: () => void }
         variant="outline"
         size="sm"
         onClick={handleTogglePause}
-        disabled={pausing || (agent.status as string) === "retired"}
+        disabled={pausing || agent.status === "retired"}
         className={cn(
           "w-full h-7 text-[11px] font-mono gap-1.5",
           isPaused ? "border-green-400/30 text-green-400 hover:bg-green-400/10" : "border-yellow-400/30 text-yellow-400 hover:bg-yellow-400/10"

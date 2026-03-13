@@ -2,7 +2,11 @@ import express, { type Express } from "express";
 import cors from "cors";
 import morgan from "morgan";
 import rateLimit from "express-rate-limit";
+import path from "path";
+import { fileURLToPath } from "url";
 import router from "./routes";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app: Express = express();
 
@@ -32,5 +36,13 @@ app.use("/api/repo/load", heavyLimiter);
 app.use("/api/city/at-commit", heavyLimiter);
 
 app.use("/api", router);
+
+if (process.env.NODE_ENV === "production") {
+  const publicDir = path.resolve(__dirname, "../../software-city/dist");
+  app.use(express.static(publicDir));
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(publicDir, "index.html"));
+  });
+}
 
 export default app;

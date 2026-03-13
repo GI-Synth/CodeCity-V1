@@ -1,8 +1,24 @@
 # Software City
 
+> **Phase 6 Complete** — Public launch-ready. One-command start, Docker, stability fixes, visual polish, export features, full documentation.
+
 ## Overview
 
 **Software City** — A living, breathing visualization of any code repository as an explorable pixel-art city. AI NPC agents patrol the codebase, find bugs (shown as fires/alarms on buildings), and escalate hard problems to external AI when needed. Everything they learn is saved to a persistent knowledge base so the city gets smarter over time.
+
+### Phase 6 Additions
+- `pnpm dev` starts both API + frontend with concurrently
+- Docker support (Dockerfile + docker-compose.yml)
+- WS message batching (50ms queue, npc_move dedup)
+- Duplicate agent task prevention (activeTargets set)
+- Clean shutdown via clearAllAgentIntervals()
+- Code analysis LRU cache (djb2 hash, 500 entries)
+- Export dropdown: JSON / SVG / Markdown report
+- POST /api/city/report generates Markdown city summary
+- Fire/sparkle SVG SMIL animations
+- Season tint overlay + SMIL particles
+- Health trend arrow in HUD
+- Full README.md, DEMO.md, CONTRIBUTING.md, .env.template
 
 ## Stack
 
@@ -147,13 +163,20 @@ Analyzed repository cache — stores the generated city layout JSON.
 | GET | `/api/assets/hero` | SVG hero city skyline image |
 | GET | `/api/assets/logo` | SVG logo image |
 | GET | `/api/ollama/status` | Ollama availability + model list |
+| GET | `/api/settings` | Get all settings key-value pairs |
+| PUT | `/api/settings` | Update a setting `{ key, value }` |
+| DELETE | `/api/settings` | Reset all settings to defaults |
+| GET | `/api/metrics/history?hours=N` | Time-series metric snapshots (default 24h, max 168h) |
 
 ## Frontend Pages
 
 1. **Landing** (`/`) — Hero with GitHub URL input and demo button
 2. **City View** (`/city`) — Interactive 2D city map with canvas rendering, HUD, agent dots, building inspector
-3. **Agents Dashboard** (`/agents`) — NPC agent cards with status, dialogue, stats
-4. **Knowledge Base** (`/knowledge`) — Learned AI patterns table + stats
+3. **Agents Dashboard** (`/agents`) — NPC agent cards with status, dialogue, stats + pause/resume/verdict controls
+4. **Knowledge Base** (`/knowledge`) — Learned AI patterns table + stats, import/export, search
+5. **Leaderboard** (`/leaderboard`) — Agent ranking by accuracy and bugs found
+6. **Live Metrics** (`/metrics`) — SVG line charts (health score, bugs, agents over time), stat cards, city breakdown bars
+7. **Settings** (`/settings`) — AI configuration, agent behavior, analysis, appearance, and danger zone (clear KB, reset)
 
 ## Key Files
 

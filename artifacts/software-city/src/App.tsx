@@ -10,6 +10,8 @@ import { Agents } from "@/pages/Agents";
 import { KnowledgeBase } from "@/pages/KnowledgeBase";
 import { SharedCity } from "@/pages/SharedCity";
 import { Leaderboard } from "@/pages/Leaderboard";
+import { Metrics } from "@/pages/Metrics";
+import { Settings } from "@/pages/Settings";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -28,6 +30,8 @@ function Router() {
       <Route path="/agents" component={Agents} />
       <Route path="/knowledge" component={KnowledgeBase} />
       <Route path="/leaderboard" component={Leaderboard} />
+      <Route path="/metrics" component={Metrics} />
+      <Route path="/settings" component={Settings} />
       <Route path="/shared/:token" component={SharedCity} />
       <Route component={NotFound} />
     </Switch>

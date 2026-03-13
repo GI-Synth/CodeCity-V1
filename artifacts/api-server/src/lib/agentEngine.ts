@@ -54,6 +54,17 @@ interface AgentState {
 const agentStates = new Map<string, AgentState>();
 let currentLayout: CityLayout | null = null;
 
+const activeTargets = new Set<string>();
+const stoppedAgents = new Set<string>();
+
+export function clearAllAgentIntervals(): void {
+  stoppedAgents.clear();
+  for (const id of agentStates.keys()) {
+    stoppedAgents.add(id);
+  }
+  console.log(`[AgentLoop] Stopped ${stoppedAgents.size} agent loop(s)`);
+}
+
 function roleBonusScore(role: string, building: Building): number {
   if (role === "qa_inspector" && building.fileType === "function") return 3;
   if (role === "qa_inspector" && building.fileType === "class") return 2;
@@ -66,14 +77,15 @@ function roleBonusScore(role: string, building: Building): number {
 
 function chooseTarget(agentRole: string, visited: Set<string>, layout: CityLayout): Building | null {
   const allBuildings = layout.districts.flatMap(d => d.buildings);
-  const candidates = allBuildings.filter(b => !visited.has(b.id));
+  const candidates = allBuildings.filter(b => !visited.has(b.id) && !activeTargets.has(b.id));
 
-  if (candidates.length === 0) return allBuildings[Math.floor(Math.random() * allBuildings.length)] ?? null;
+  const pool = candidates.length > 0 ? candidates : allBuildings.filter(b => !activeTargets.has(b.id));
+  if (pool.length === 0) return allBuildings[Math.floor(Math.random() * allBuildings.length)] ?? null;
 
-  let best: Building = candidates[0];
+  let best: Building = pool[0];
   let bestScore = -1;
 
-  for (const b of candidates) {
+  for (const b of pool) {
     const depCount = layout.roads.filter(r => r.fromBuilding === b.id || r.toBuilding === b.id).length;
     const score = b.complexity * (depCount + 1) + roleBonusScore(agentRole, b);
     if (score > bestScore) { bestScore = score; best = b; }
@@ -112,154 +124,160 @@ async function runAgentCycle(agentId: string): Promise<void> {
   const target = chooseTarget(agentRow.role, state.visitedBuildings, currentLayout);
   if (!target) return;
 
-  state.visitedBuildings.add(target.id);
-  if (state.visitedBuildings.size > 20) {
-    const first = state.visitedBuildings.values().next().value;
-    if (first) state.visitedBuildings.delete(first);
-  }
+  activeTargets.add(target.id);
 
-  wsServer.broadcastNPCMove(agentId, target.id, target.x + target.width / 2, target.y + target.height / 2);
+  try {
+    state.visitedBuildings.add(target.id);
+    if (state.visitedBuildings.size > 20) {
+      const first = state.visitedBuildings.values().next().value;
+      if (first) state.visitedBuildings.delete(first);
+    }
 
-  await db.update(agentsTable).set({
-    currentBuilding: target.id,
-    currentTask: "moving",
-    status: "working",
-    x: target.x + target.width / 2,
-    y: target.y + target.height / 2,
-  }).where(eq(agentsTable.id, agentId));
+    wsServer.broadcastNPCMove(agentId, target.id, target.x + target.width / 2, target.y + target.height / 2);
 
-  await new Promise(r => setTimeout(r, 1500));
+    await db.update(agentsTable).set({
+      currentBuilding: target.id,
+      currentTask: "moving",
+      status: "working",
+      x: target.x + target.width / 2,
+      y: target.y + target.height / 2,
+    }).where(eq(agentsTable.id, agentId));
 
-  state.status = "testing";
-  const { system, prompt } = buildTestGenerationPrompt(target.name, target.filePath, target.language);
+    await new Promise(r => setTimeout(r, 1500));
 
-  let tests: Array<{ name: string; input: unknown; expected: unknown }> = [];
-  let localSucceeded = false;
-  const attempts: string[] = [];
+    state.status = "testing";
+    const { system, prompt } = buildTestGenerationPrompt(target.name, target.filePath, target.language);
 
-  const ollamaAvailable = await ollamaClient.isAvailable();
-  if (ollamaAvailable) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      emitThought(agentId, `Analyzing ${target.name}… attempt ${attempt + 1}/3`);
-      try {
-        const result = await ollamaClient.generate({
-          model: "deepseek-coder-v2:16b",
-          system,
-          prompt,
-          temperature: 0.4 + attempt * 0.1,
-          maxTokens: 1000,
-        });
-        const parsed = parseTestJSON(result);
-        if (parsed.length > 0 && !parsed.every(t => t.input === null)) {
-          tests = parsed;
-          localSucceeded = true;
-          attempts.push(`Attempt ${attempt + 1}: generated ${parsed.length} tests`);
-          break;
-        } else {
-          attempts.push(`Attempt ${attempt + 1}: trivial or empty result`);
-          emitThought(agentId, "Tests too trivial. Trying different approach…");
+    let tests: Array<{ name: string; input: unknown; expected: unknown }> = [];
+    let localSucceeded = false;
+    const attempts: string[] = [];
+
+    const ollamaAvailable = await ollamaClient.isAvailable();
+    if (ollamaAvailable) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        emitThought(agentId, `Analyzing ${target.name}… attempt ${attempt + 1}/3`);
+        try {
+          const result = await ollamaClient.generate({
+            model: "deepseek-coder-v2:16b",
+            system,
+            prompt,
+            temperature: 0.4 + attempt * 0.1,
+            maxTokens: 1000,
+          });
+          const parsed = parseTestJSON(result);
+          if (parsed.length > 0 && !parsed.every(t => t.input === null)) {
+            tests = parsed;
+            localSucceeded = true;
+            attempts.push(`Attempt ${attempt + 1}: generated ${parsed.length} tests`);
+            break;
+          } else {
+            attempts.push(`Attempt ${attempt + 1}: trivial or empty result`);
+            emitThought(agentId, "Tests too trivial. Trying different approach…");
+          }
+        } catch (e) {
+          attempts.push(`Attempt ${attempt + 1}: ${e instanceof Error ? e.message : "failed"}`);
         }
-      } catch (e) {
-        attempts.push(`Attempt ${attempt + 1}: ${e instanceof Error ? e.message : "failed"}`);
       }
     }
-  }
 
-  let bugsFound = 0;
-  let escalated = false;
-  let kbHit = false;
+    let bugsFound = 0;
+    let escalated = false;
+    let kbHit = false;
 
-  if (localSucceeded && tests.length > 0) {
-    await db.update(agentsTable).set({ currentTask: "testing" }).where(eq(agentsTable.id, agentId));
+    if (localSucceeded && tests.length > 0) {
+      await db.update(agentsTable).set({ currentTask: "testing" }).where(eq(agentsTable.id, agentId));
 
-    bugsFound = Math.min(tests.length, Math.floor(target.complexity / 8));
-    for (let i = 0; i < bugsFound; i++) {
-      const severity = target.complexity > 20 ? "critical" : "warning";
-      wsServer.broadcastBugFound(target.id, severity, `${agentRow.name} found a bug in ${target.name}: test case "${tests[i]?.name ?? "edge case"}" failed`);
-    }
-
-    if (bugsFound > 0) {
-      emitThought(agentId, `Found ${bugsFound} issue(s) in ${target.name}!`, 5000);
-      state.recentFindings.push(`Found ${bugsFound} bug(s) in ${target.name}`);
-      if (state.recentFindings.length > 5) state.recentFindings.shift();
-    }
-  } else {
-    state.status = "escalating";
-    escalated = true;
-
-    await db.update(agentsTable).set({ currentTask: "escalating" }).where(eq(agentsTable.id, agentId));
-    wsServer.broadcastEscalation(agentId, target.id, false, "pending");
-    emitThought(agentId, "This is beyond me. Consulting senior AI…", 5000);
-
-    try {
-      const result = await escalate({
-        question: `What bugs might exist in ${target.name} (${target.language} file with complexity ${target.complexity})?`,
-        codeSnippet: `File: ${target.filePath}\nLanguage: ${target.language}\nLOC: ${target.linesOfCode}\nComplexity: ${target.complexity}`,
-        language: target.language,
-        failedAttempts: attempts,
-      });
-
-      wsServer.broadcastEscalation(agentId, target.id, result.source === "knowledge_base", result.source);
-      kbHit = result.source === "knowledge_base";
-
-      if (kbHit) {
-        emitThought(agentId, "Found a similar case in memory! Applying…", 5000);
+      bugsFound = Math.min(tests.length, Math.floor(target.complexity / 8));
+      for (let i = 0; i < bugsFound; i++) {
+        const severity = target.complexity > 20 ? "critical" : "warning";
+        wsServer.broadcastBugFound(target.id, severity, `${agentRow.name} found a bug in ${target.name}: test case "${tests[i]?.name ?? "edge case"}" failed`);
       }
 
-      if (result.confidence > 0.5) {
-        bugsFound = result.action_items.length > 0 ? 1 : 0;
-        state.recentFindings.push(`Escalated for ${target.name}: ${result.answer.slice(0, 80)}`);
+      if (bugsFound > 0) {
+        emitThought(agentId, `Found ${bugsFound} issue(s) in ${target.name}!`, 5000);
+        state.recentFindings.push(`Found ${bugsFound} bug(s) in ${target.name}`);
+        if (state.recentFindings.length > 5) state.recentFindings.shift();
       }
-    } catch { }
+    } else {
+      state.status = "escalating";
+      escalated = true;
+
+      await db.update(agentsTable).set({ currentTask: "escalating" }).where(eq(agentsTable.id, agentId));
+      wsServer.broadcastEscalation(agentId, target.id, false, "pending");
+      emitThought(agentId, "This is beyond me. Consulting senior AI…", 5000);
+
+      try {
+        const result = await escalate({
+          question: `What bugs might exist in ${target.name} (${target.language} file with complexity ${target.complexity})?`,
+          codeSnippet: `File: ${target.filePath}\nLanguage: ${target.language}\nLOC: ${target.linesOfCode}\nComplexity: ${target.complexity}`,
+          language: target.language,
+          failedAttempts: attempts,
+        });
+
+        wsServer.broadcastEscalation(agentId, target.id, result.source === "knowledge_base", result.source);
+        kbHit = result.source === "knowledge_base";
+
+        if (kbHit) {
+          emitThought(agentId, "Found a similar case in memory! Applying…", 5000);
+        }
+
+        if (result.confidence > 0.5) {
+          bugsFound = result.action_items.length > 0 ? 1 : 0;
+          state.recentFindings.push(`Escalated for ${target.name}: ${result.answer.slice(0, 80)}`);
+        }
+      } catch { }
+    }
+
+    emitThought(agentId, "Filing report at the tower.");
+
+    const newTotalTasks = agentRow.totalTasksCompleted + 1;
+    const newBugsTotal = agentRow.bugsFound + bugsFound;
+    const newTruePositives = agentRow.truePositives + (bugsFound > 0 ? bugsFound : 0);
+    const newEscalationCount = agentRow.escalationCount + (escalated ? 1 : 0);
+    const newKbHits = agentRow.kbHits + (kbHit ? 1 : 0);
+    const newRank = computeRank(newTotalTasks, agentRow.accuracy, newTruePositives);
+
+    await db.update(agentsTable).set({
+      currentTask: "reporting",
+      bugsFound: newBugsTotal,
+      testsGenerated: agentRow.testsGenerated + tests.length,
+      escalations: agentRow.escalations + (escalated ? 1 : 0),
+      escalationCount: newEscalationCount,
+      kbHits: newKbHits,
+      truePositives: newTruePositives,
+      totalTasksCompleted: newTotalTasks,
+      rank: newRank,
+      status: "reporting",
+      x: 50,
+      y: 50,
+    }).where(eq(agentsTable.id, agentId));
+
+    wsServer.broadcastNPCMove(agentId, "tower", 50, 50);
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      type: "task_complete",
+      agentId,
+      agentName: agentRow.name,
+      buildingId: target.id,
+      buildingName: target.name,
+      message: `${agentRow.name} completed ${tests.length} tests on ${target.name}${bugsFound > 0 ? `, found ${bugsFound} bug(s)` : ""}`,
+      severity: bugsFound > 0 ? "warning" : "info",
+    });
+
+    wsServer.broadcastEventLog("TASK_COMPLETE", `${agentRow.name} analyzed ${target.name}`, bugsFound > 0 ? "warning" : "info");
+
+    if (newBugsTotal >= agentRow.level * 10) {
+      const newLevel = agentRow.level + 1;
+      await db.update(agentsTable).set({ level: newLevel }).where(eq(agentsTable.id, agentId));
+      wsServer.broadcastEventLog("AGENT_PROMOTED", `${agentRow.name} promoted to Level ${newLevel}!`, "info");
+    }
+
+    await db.update(agentsTable).set({ currentTask: null, status: "idle" }).where(eq(agentsTable.id, agentId));
+    state.status = "idle";
+  } finally {
+    activeTargets.delete(target.id);
   }
-
-  emitThought(agentId, "Filing report at the tower.");
-
-  const newTotalTasks = agentRow.totalTasksCompleted + 1;
-  const newBugsTotal = agentRow.bugsFound + bugsFound;
-  const newTruePositives = agentRow.truePositives + (bugsFound > 0 ? bugsFound : 0);
-  const newEscalationCount = agentRow.escalationCount + (escalated ? 1 : 0);
-  const newKbHits = agentRow.kbHits + (kbHit ? 1 : 0);
-  const newRank = computeRank(newTotalTasks, agentRow.accuracy, newTruePositives);
-
-  await db.update(agentsTable).set({
-    currentTask: "reporting",
-    bugsFound: newBugsTotal,
-    testsGenerated: agentRow.testsGenerated + tests.length,
-    escalations: agentRow.escalations + (escalated ? 1 : 0),
-    escalationCount: newEscalationCount,
-    kbHits: newKbHits,
-    truePositives: newTruePositives,
-    totalTasksCompleted: newTotalTasks,
-    rank: newRank,
-    status: "reporting",
-    x: 50,
-    y: 50,
-  }).where(eq(agentsTable.id, agentId));
-
-  wsServer.broadcastNPCMove(agentId, "tower", 50, 50);
-
-  await db.insert(eventsTable).values({
-    id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-    type: "task_complete",
-    agentId,
-    agentName: agentRow.name,
-    buildingId: target.id,
-    buildingName: target.name,
-    message: `${agentRow.name} completed ${tests.length} tests on ${target.name}${bugsFound > 0 ? `, found ${bugsFound} bug(s)` : ""}`,
-    severity: bugsFound > 0 ? "warning" : "info",
-  });
-
-  wsServer.broadcastEventLog("TASK_COMPLETE", `${agentRow.name} analyzed ${target.name}`, bugsFound > 0 ? "warning" : "info");
-
-  if (newBugsTotal >= agentRow.level * 10) {
-    const newLevel = agentRow.level + 1;
-    await db.update(agentsTable).set({ level: newLevel }).where(eq(agentsTable.id, agentId));
-    wsServer.broadcastEventLog("AGENT_PROMOTED", `${agentRow.name} promoted to Level ${newLevel}!`, "info");
-  }
-
-  await db.update(agentsTable).set({ currentTask: null, status: "idle" }).where(eq(agentsTable.id, agentId));
-  state.status = "idle";
 }
 
 export async function startAgentLoop(): Promise<void> {
@@ -292,11 +310,13 @@ export async function startAgentLoop(): Promise<void> {
   const scheduleAgent = async (agentId: string, delay: number) => {
     await new Promise(r => setTimeout(r, delay));
     const loop = async () => {
+      if (stoppedAgents.has(agentId)) return;
       try {
         await runAgentCycle(agentId);
       } catch (e) {
         console.warn(`[AgentLoop] Agent ${agentId} cycle error:`, e);
       }
+      if (stoppedAgents.has(agentId)) return;
       const rows = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId)).catch(() => []);
       const interval = rows.length > 0 ? Math.max(4000, 8000 - (rows[0].level - 1) * 1000) : 8000;
       setTimeout(loop, interval);
@@ -314,7 +334,7 @@ export async function startAgentLoop(): Promise<void> {
       const latest = await db.select().from(agentsTable);
       const running = new Set(agentStates.keys());
       for (const a of latest) {
-        if (!running.has(a.id)) {
+        if (!running.has(a.id) && !stoppedAgents.has(a.id)) {
           scheduleAgent(a.id, 1000);
           agentStates.set(a.id, { id: a.id, status: "idle", visitedBuildings: new Set(), recentFindings: [] });
         }

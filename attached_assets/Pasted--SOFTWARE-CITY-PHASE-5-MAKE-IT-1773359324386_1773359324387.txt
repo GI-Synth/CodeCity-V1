@@ -1,0 +1,390 @@
+═══════════════════════════════════════════════════════════════════
+SOFTWARE CITY — PHASE 5: MAKE IT IMPRESSIVE Live metrics. Settings panel. Spec sync. Final polish. After this phase: demo it to
+anyone, any time.
+═══════════════════════════════════════════════════════════════════
+Read PROGRESS.md and PHASE4_HANDOFF.md before doing anything else.
+CURRENT STATE — what Phase 4 completed: ✓ SQLite (@libsql/client) — zero external dependencies ✓ Landing redesigned with hero
++ how-it-works + guided tour ✓ GuidedTour.tsx — 4-step spotlight, localStorage, auto-shows ✓ ShortcutsPanel.tsx — ? key, all
+shortcuts documented ✓ CityMap viewport culling + LOD zoom tiers ✓ PATCH /agents/:id/pause, /pause-all, /:id/verdict ✓ KB import
+(POST /knowledge/import) + server-side search ✓ Zero TypeScript errors across all packages
+KNOWN GAPS TO FIX FIRST (before new features):
+1. OpenAPI spec (lib/api-spec/openapi.yaml) missing: AgentStatus enum values: paused, retired PATCH /agents/:id/pause endpoint
+PATCH /agents/pause-all endpoint PATCH /agents/:id/verdict endpoint POST /knowledge/import endpoint GET /knowledge/search
+endpoint GET /repos route DELETE /repos/:slug route GET /shared/:token route Fix the spec, then regenerate lib/api-zod types so
+the frontend stops using as string casts.
+2. lib/api-zod generated types are stale — regenerate after fixing the OpenAPI spec.
+3. Tooltip flicker bug (from Phase 4 handoff notes): Building tooltip disappears when cursor moves toward inspector. Add 200ms
+delay before hiding (clearTimeout on mouseenter).
+DO NOT rebuild what works. Fix the gaps first, then add features. pnpm run typecheck after every step. Zero errors required.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — OPENAPI SPEC SYNC + TYPE REGENERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Update lib/api-spec/openapi.yaml completely. This file is the source of truth for all API contracts. Every route the backend currently
+serves must be documented here.
+AGENT STATUS ENUM — update everywhere AgentStatus appears: enum: [idle, working, escalating, paused, retired]
+NEW ENDPOINTS TO ADD TO SPEC:
+PATCH /api/agents/pause-all: summary: Pause or resume all non-retired agents requestBody: { action: “pause” | “resume” } response
+200: { affected: number, action: string }
+PATCH /api/agents/{agentId}/pause: summary: Toggle pause state for a single agent response 200: Agent schema
+PATCH /api/agents/{agentId}/verdict: summary: Mark last finding as real bug or false positive requestBody: { verdict: “true_positive” |
+“false_positive” } response 200: { agentId, verdict, truePositives, falsePositives, accuracy }
+POST /api/knowledge/import: summary: Import knowledge entries from exported JSON requestBody: array of KnowledgeEntry OR {
+entries: KnowledgeEntry[] } response 200: { imported: number, skipped: number, total: number }
+GET /api/knowledge/search: summary: Server-side full-text search parameters: q (string), limit (integer, default 20) response 200: {
+results: KnowledgeEntry[], total: number }
+GET /api/repos: summary: List all loaded repositories response 200: array of RepoSummary schema
+DELETE /api/repos/{slug}: summary: Delete a repository and all its data response 200: { deleted: boolean, slug: string }
+POST /api/repos/{slug}/activate: summary: Set a repository as the active city response 200: RepoSummary
+GET /api/shared/{token}: summary: Get a shared city snapshot response 200: SharedSnapshot schema response 404: { error: string }
+POST /api/city/share: summary: Create a shareable snapshot of the current city response 200: { url: string, token: string }
+GET /api/city/diff: summary: Get git diff between two commits parameters: path (string, optional), from (string), to (string) response
+200: { rawDiff: string, stats: { additions, deletions, files } }
+GET /api/city/snapshot: summary: Download current city as JSON response 200: CitySnapshot schema (application/json, attachment)
+NEW SCHEMAS TO ADD: RepoSummary: { id, slug, repoName, repoUrl, fileCount, districtCount, healthScore, season, isActive,
+loadedAt, analysisTime } SharedSnapshot: { token, repoName, layout, healthScore, season, agentCount, bugsFound, sharedAt,
+viewCount } CitySnapshot: { districts, buildings, agents, events, healthScore, season, exportedAt, repoName } VerdictResponse: {
+agentId, verdict, truePositives, falsePositives, accuracy, rank }
+After updating openapi.yaml, regenerate lib/api-zod: The lib/api-zod package should have a generate script. If it uses openapitypescript or similar: run it now. If types are hand-written in api.schemas.ts: update them manually to match the new spec — remove all
+as string casts by adding “paused” | “retired” to the AgentStatus type.
+Run pnpm run typecheck. Remove all remaining as string casts in the frontend that were working around missing types.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — LIVE METRICS DASHBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create a real-time metrics dashboard page at /metrics.
+── 2A. BACKEND METRICS COLLECTION ──────────────────────────────────
+Update GET /api/city/metrics to return richer data: { timestamp: string, health: { score: number, // 0-100 season: string, trend: “up”|
+“down”|“stable”, // vs last reading delta: number // change in score since last reading }, coverage: { overall: number, // 0-1 across all
+buildings byDistrict: { name: string, coverage: number }[], testedFiles: number, untestedFiles: number, }, agents: { active: number,
+paused: number, totalTasks: number, tasksPerMinute: number, // rolling 60s average escalationsToday: number, kbHitsToday: number,
+}, bugs: { total: number, critical: number, // errors that crash bySeverity: { critical: N, high: N, medium: N, low: N }, byDistrict: { name:
+string, count: number }[], resolvedToday: number, // verdicted as false_positive }, knowledge: { entries: number, hitRate: number, // KB
+hits / total escalation attempts savedCost: number, // hitRate * entries * 0.005 topLanguages: { language: string, count: number }[] },
+performance: { avgAnalysisMs: number, // avg time to analyze a file avgTestRunMs: number, // avg test execution time wsClients:
+number, } }
+Store a rolling history of metrics readings: Create metric_snapshots table in lib/db/src/schema/metrics.ts: { id, timestamp, healthScore,
+coverageOverall, activeAgents, totalBugs, kbHitRate, tasksCompleted } Write a new snapshot every 30 seconds (setInterval in
+index.ts) Keep last 1000 snapshots (delete older ones after insert)
+Add GET /api/metrics/history?hours=24 route: Returns snapshots from the last N hours Used for time-series charts on the dashboard
+── 2B. METRICS DASHBOARD PAGE ──────────────────────────────────────
+Create src/pages/Metrics.tsx
+Layout: 2-column grid on desktop, 1-column on mobile
+ROW 1 — HEALTH OVER TIME (full width): Line chart: health score over last 24 hours X-axis: time labels (every 2 hours) Y-axis: 0-100
+Color: gradient from red (0) to green (100) Mark season transitions with vertical dashed lines Use SVG path — no chart library needed
+Formula for smooth line: SVG cubic bezier through data points
+ROW 2 — FOUR STAT CARDS: Card 1: Coverage % with trend arrow (↑ or ↓ vs 1 hour ago) Card 2: Bugs found today (with severity
+breakdown bar) Card 3: KB hit rate % with “ $X.XX saved” subtext Card 4: Tasks/minute (rolling 60s) with agent count
+ROW 3 — TWO CHARTS SIDE BY SIDE: Left: Coverage by district (horizontal bar chart, SVG) Each bar: district name + coverage % +
+color (red/yellow/green) Sorted by coverage ascending (worst first) Right: Bugs by district (horizontal bar chart, SVG) Each bar: district
+name + bug count Sorted by count descending (worst first)
+ROW 4 — RECENT ACTIVITY LOG (full width): Last 20 events from /api/events Auto-updates every 5s Color-coded: BUG=red,
+PASS=green, ESCALATION=orange, PROMOTE=cyan Each row: timestamp, event type badge, message, district/building
+Add to AppLayout.tsx sidebar nav: “Metrics” link → /metrics Update App.tsx with new route.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — SETTINGS PANEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create a settings panel accessible from the sidebar. All settings persist in the database (not just localStorage).
+── 3A. BACKEND SETTINGS STORAGE ────────────────────────────────────
+Add lib/db/src/schema/settings.ts: { key: text primaryKey, value: text, updatedAt: text }
+Add GET /api/settings route: Returns all settings as { key: value } object
+Add PUT /api/settings route: Body: { key: string, value: string | number | boolean } Upserts the setting Returns updated settings object
+Default settings (seed on first run if table is empty): escalation_provider: “groq” // groq | anthropic | none escalation_enabled: true
+agent_loop_interval_ms: 8000 // how fast agents run max_concurrent_agents: 8 kb_similarity_threshold: 0.65 // 0.5-0.9
+test_timeout_ms: 15000 theme: “dark” // dark | light tour_complete: false file_ignore_patterns: “node_modules,.git,dist,build”
+max_file_size_kb: 500 // skip files larger than this
+── 3B. SETTINGS PAGE ───────────────────────────────────────────────
+Create src/pages/Settings.tsx
+Layout: sidebar nav on left, content on right (same as VS Code settings)
+SECTIONS:
+AI CONFIGURATION: Escalation Provider: radio buttons [Groq] [Anthropic] [Disabled] Show API key status: ✓ Set / ✗ Not set (read
+from /api/ollama/status) KB Similarity Threshold: slider 0.50–0.90, step 0.05 Label: “Higher = stricter matching, fewer cache hits” Test
+Timeout: number input (5000–60000ms) Agent Speed: slider (slow=12000ms / normal=8000ms / fast=4000ms)
+ANALYSIS: Max File Size: slider 100–1000 KB Ignore Patterns: text area, comma-separated glob patterns Max Concurrent Agents:
+slider 1–8
+APPEARANCE: Theme: [Dark] [Light] toggle (already works via CSS vars) Reset Tour: button “Show guided tour again” → clears
+localStorage
+DANGER ZONE: Clear Knowledge Base: button with confirmation dialog “This will delete all X learned patterns. This cannot be
+undone.” Clear All Data: button with confirmation “This will delete all repos, agents, bugs, and settings.” After confirm: DELETE all
+tables then re-seed defaults
+Each setting change: PUT /api/settings immediately (no save button). Show a subtle “Saved” flash on each field after successful PUT.
+Add to AppLayout.tsx sidebar: “Settings” link → /settings (gear icon ) Update App.tsx with new route.
+── 3C. SETTINGS APPLIED AT RUNTIME ─────────────────────────────────
+Wire settings into the backend systems:
+In agentEngine.ts: On startup: read agent_loop_interval_ms from DB settings When setting changes (PUT /api/settings): if key is
+agent_loop_interval_ms, clear and restart all agent intervals with new timing Same for max_concurrent_agents: update semaphore
+limit
+In escalationEngine.ts: Read escalation_provider and escalation_enabled on every escalation call If escalation_enabled=false: skip all
+external AI, use best local attempt Use escalation_provider to pick which API to call first
+In codeAnalyzer.ts: Read max_file_size_kb: skip files larger than this Read file_ignore_patterns: skip matching files
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — DOCKER + ONE-COMMAND DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Create Dockerfile at repo root. The goal: docker compose up → fully working app at localhost:8080.
+── 4A. DOCKERFILE ──────────────────────────────────────────────────
+FROM node:20-slim AS base RUN npm install -g pnpm@9 WORKDIR /app
+Copy workspace manifests first (layer cache)
+COPY package.json pnpm-workspace.yaml .npmrc ./ COPY artifacts/api-server/package.json ./artifacts/api-server/ COPY
+artifacts/software-city/package.json ./artifacts/software-city/ COPY lib/db/package.json ./lib/db/ COPY lib/api-client-react/package.json
+./lib/api-client-react/ COPY lib/api-zod/package.json ./lib/api-zod/ COPY lib/api-spec/package.json ./lib/api-spec/ COPY
+scripts/package.json ./scripts/
+RUN pnpm install –frozen-lockfile
+FROM base AS builder COPY . .
+Build dependency libs first
+RUN pnpm –filter @workspace/db run build 2>/dev/null || true RUN pnpm –filter @workspace/api-zod run build 2>/dev/null || true RUN
+pnpm –filter @workspace/api-client-react run build 2>/dev/null || true
+Build the apps
+RUN pnpm –filter @workspace/api-server run build RUN pnpm –filter @workspace/software-city run build
+FROM node:20-slim AS runner RUN npm install -g pnpm@9 WORKDIR /app
+Only copy what’s needed to run
+COPY –from=builder /app/artifacts/api-server/dist ./dist/ COPY –from=builder /app/artifacts/software-city/dist ./public/ COPY –
+from=builder /app/node_modules ./node_modules/ COPY –from=builder /app/artifacts/api-server/node_modules
+./artifacts/api-server/node_modules/
+RUN mkdir -p data
+ENV NODE_ENV=production ENV PORT=8080 ENV DB_PATH=/app/data/city.db
+EXPOSE 8080
+CMD [“node”, “dist/index.js”]
+── 4B. PRODUCTION STATIC SERVING ───────────────────────────────────
+Update artifacts/api-server/src/app.ts: At the END of all route registrations, add:
+import path from ‘path’ import { fileURLToPath } from ‘url’
+if (process.env.NODE_ENV === ‘production’) { const __dirname = path.dirname(fileURLToPath(import.meta.url)) const publicDir =
+path.join(__dirname, ‘../../public’) app.use(express.static(publicDir)) // SPA fallback — serve index.html for all non-API routes
+app.get(’*’, (req, res) => { // Don’t catch API routes if (req.path.startsWith(’/api/’) || req.path.startsWith(’/ws’)) return
+res.sendFile(path.join(publicDir, ‘index.html’)) }) }
+── 4C. DOCKER COMPOSE ──────────────────────────────────────────────
+Create docker-compose.yml:
+version: ‘3.8’ services: software-city: build: . ports: - “8080:8080” volumes: - ./data:/app/data environment: NODE_ENV: production
+PORT: “8080” DB_PATH: /app/data/city.db ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-} GROQ_API_KEY: ${GROQ_API_KEY:-}
+OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434} extra_hosts: - “host.docker.internal:host-gateway” restart:
+unless-stopped healthcheck: test: [“CMD”, “curl”, “-f”, “http://localhost:8080/api/health”] interval: 30s timeout: 10s retries: 3
+── 4D. .dockerignore ───────────────────────────────────────────────
+Create .dockerignore: node_modules /node_modules data/.db .env .git *.md coverage .nyc_output dist */dist
+── 4E. BUILD SCRIPT IN package.json ────────────────────────────────
+Add to root package.json scripts: “docker:build”: “docker build -t software-city .”, “docker:up”: “docker compose up”, “docker:down”:
+“docker compose down”, “dev”: “concurrently "pnpm –filter @workspace/api-server run dev" "pnpm –filter @workspace/software-city
+run dev"”
+Install concurrently at root: pnpm add -D concurrently -w
+Now pnpm dev starts both services with one command.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — EXPORT + SHARE POLISH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 5A. SVG CITY EXPORT ─────────────────────────────────────────────
+The existing export downloads JSON. Add SVG export too.
+In CityView.tsx Export button: Change from single button to a dropdown: [Export ▾] ↳ Download JSON (existing) ↳ Download SVG
+(new) ↳ Copy Share Link (existing share button, moved here)
+For SVG export: Grab the <svg> element from the DOM: document.querySelector(‘svg.city-map’) Serialize: new
+XMLSerializer().serializeToString(svgElement) Add XML declaration + namespace Create blob and download as “software-city-
+[repoName]-[date].svg” The SVG already has all buildings, roads, districts — it’s self-contained
+── 5B. SHARE PAGE IMPROVEMENTS ─────────────────────────────────────
+Update src/pages/SharedCity.tsx: Show a proper header with repo info: name, load date, file count Below city SVG: show stats grid
+(health, season, agents run, bugs found) “Load this repo” button: if it’s a GitHub repo, pre-fill the URL on Landing.tsx and navigate
+there Social meta tags via document.title and meta description: title: “Software City — [repoName]” description: “[repoName] city:
+[health]% health, [bugs] bugs found” View count: “Viewed [N] times since [date]”
+── 5C. REPORT GENERATION ───────────────────────────────────────────
+Add POST /api/city/report route: Generates a Markdown report of the current city state
+Report format: # Software City Report — [repoName] Generated: [date]
+## Health Score: [N]/100 — [season]
+[brief description based on season]
+## Coverage Summary
+| District | Files | Coverage | Bugs |
+|----------|-------|----------|------|
+| /src/api | 12 | 67% | 3 |
+...
+## Top Issues
+1. **[filename]** — [error message] (line [N])
+2. ...
+## Agent Activity
+[N] agents ran [M] test suites
+[K] escalations to external AI ([X] from knowledge base cache)
+Estimated AI cost: $[N]
+## Recommendations
+- [list of highest-complexity untested files]
+- [list of buildings with active bugs]
+Returns { report: string } — markdown text
+Add “Download Report” to the export dropdown in CityView.tsx: Fetches the markdown report, downloads as “[repoName]-report.md”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — TOOLTIP FIX + CITY MAP FINAL POLISH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 6A. TOOLTIP FLICKER FIX ─────────────────────────────────────────
+In CityMap.tsx: Replace instant tooltip hide with debounced hide:
+const tooltipHideTimer = useRef<ReturnType<typeof setTimeout>>()
+onMouseEnter (building): clearTimeout(tooltipHideTimer.current) setTooltip({ building, x, y })
+onMouseLeave (building): tooltipHideTimer.current = setTimeout(() => setTooltip(null), 200)
+Also: when BuildingInspector opens (building is selected): Keep tooltip visible and positioned — it becomes the “active” tooltip Only
+hide it when a different building is hovered or inspector closes
+── 6B. DISTRICT CLICK TO ZOOM ──────────────────────────────────────
+In CityMap.tsx, when clicking a district label: Compute bounding box of all buildings in that district Animate pan+zoom to center that
+district with 10% padding Use a 400ms eased transition (requestAnimationFrame loop or CSS transition) Show district name briefly in
+HUD: “ Viewing: /src/api”
+── 6C. BUILDING RIGHT-CLICK MENU ───────────────────────────────────
+In CityMap.tsx, add onContextMenu to building rects: Prevent default (e.preventDefault()) Show a small context menu at cursor
+position: [ Inspect] → open BuildingInspector [ Assign Agent] → opens agent picker dropdown [ Copy Path] → copies file path
+to clipboard [ View on GitHub] → opens github.com/…blob/HEAD/[path] (disabled if not a GitHub repo) Menu dismisses on click
+outside or Escape
+Implement as a simple absolute-positioned div in CityView.tsx (not CityMap — let the event bubble up via a callback)
+── 6D. RECENTER BUTTON ─────────────────────────────────────────────
+Add ⊕ button to CityMap zoom controls (already has +/−): On click: compute bounding box of ALL buildings Animate to fit-all view
+(same as initial load) This is the “reset view” button users need when they get lost
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — ANIMATION + VISUAL POLISH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 7A. AGENT PATH FOLLOWING ────────────────────────────────────────
+Agents currently teleport between buildings. Make them follow roads.
+In CityMap.tsx: Store agent positions as { x, y } in state (not just target position) On npc_move WebSocket message: Find road path
+from current position to target: Simple approach: linear interpolation if no road Better approach: find nearest road start point, travel
+along road x coordinates, then travel to building entrance Animate position over duration = distance / 80 (px per second) Use
+requestAnimationFrame for smooth movement Agent dot moves smoothly instead of jumping
+Simple road-following: Each road has start and end {x,y} For agent moving A→B: find if any road connects A’s district to B’s If yes:
+agent travels to road start, along the road, then to B If no (same district): travel directly
+── 7B. BUILDING FIRE ANIMATION ─────────────────────────────────────
+When a building has status=“fire”: Add animated SVG flames above the building rect Simple: 2-3 small rects that shift up/down on
+alternating timers Color: alternating #ff4400 and #ffaa00 Use CSS animation (not JS) for performance: @keyframes flame { 0% { y: 0 }
+50% { y: -3px } 100% { y: 0 } }
+When status=“excellent” (coverage ≥ 0.9, 0 bugs): Add small sparkle particles around building 4 tiny circles that orbit the building
+corner slowly
+These are SVG-only animations — no canvas, no JS timers.
+── 7C. SEASON VISUAL OVERLAY ───────────────────────────────────────
+The season badge exists in HUD. Make it affect the city visually.
+In CityMap.tsx, add a season tint layer: An SVG <rect> covering the full viewBox with very low opacity: summer: fill=”#7bc67e”
+opacity=“0.04” ← warm green tint spring: fill=”#a8d8a8” opacity=“0.03” ← light green autumn: fill=”#d4915a” opacity=“0.05” ← warm
+orange winter: fill=”#8bb8d4” opacity=“0.07” ← cool blue
+For winter: add a slow-drift particle layer (20 white dots, SVG animateMotion) For autumn: add 15 small falling-leaf shapes (SVG
+animateMotion diagonal) All particle animations use SVG SMIL — no JS, no canvas.
+── 7D. HUD HEALTH TREND INDICATOR ──────────────────────────────────
+In HUD.tsx, next to the health score: Show trend arrow based on last two metrics readings: ↑ green if improving (> +2 in last 5 min) ↓
+red if declining (< -2 in last 5 min) → grey if stable Fetch this from /api/city/metrics health.trend field (Step 2)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — PERFORMANCE + STABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 8A. PREVENT DUPLICATE AGENT TASKS ───────────────────────────────
+Current bug: two agents can pick the same building target.
+In agentEngine.ts: Add a Set<string>: activeTargets = new Set() In chooseTarget(): skip buildings whose ID is in activeTargets When
+agent starts a task: activeTargets.add(buildingId) When agent finishes: activeTargets.delete(buildingId) Thread-safe because Node.js is
+single-threaded
+── 8B. ANALYSIS RESULT CACHING ─────────────────────────────────────
+Analyzing the same file twice is wasteful. Add a simple in-memory cache to codeAnalyzer.ts:
+const analysisCache = new Map<string, { result: FileMetrics, hash: string }>()
+Before analyzing: compute hash of file content (simple djb2 or fnv1a) If cache has this hash: return cached result After analyzing: store
+in cache
+Cache size limit: 500 entries (LRU eviction — delete oldest when full) This is especially useful for the file watcher (most files
+unchanged)
+── 8C. WEBSOCKET MESSAGE BATCHING ──────────────────────────────────
+When many agents are active, WS messages flood the client. Batch rapid messages into groups.
+In wsServer.ts: Add a message queue: pendingMessages: WSMessage[] = [] Add a flush interval: setInterval(flushMessages, 50) ←
+20fps max
+Instead of broadcasting immediately: broadcastNPCMove(), broadcastBugFound(), etc. push to pendingMessages
+flushMessages(): If pendingMessages is empty: return Group messages by type: npc_moves can be batched into one array Send: {
+type: “batch”, payload: { npc_moves: […], bugs: […], … } } Clear pendingMessages
+Update useWebSocket.ts to handle “batch” message type: Unpack and process each message in the batch
+── 8D. MEMORY LEAK PREVENTION ──────────────────────────────────────
+In agentEngine.ts: Agent intervals: store all interval IDs in a Map<agentId, NodeJS.Timeout> On agent retire/delete: clearInterval for
+that agent’s ID On server shutdown (SIGTERM handler): clearInterval for ALL agent IDs
+In wsServer.ts: On client disconnect: remove from clients Set immediately Periodically (every 30s): ping all clients, remove nonresponsive ones: Send { type: “ping” } Client should respond with { type: “pong” } Remove clients that don’t pong within 5s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — FINAL README + CONTRIBUTING + DEMO VIDEO SCRIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── 9A. README FINAL VERSION ────────────────────────────────────────
+Overwrite README.md completely. This is what GitHub shows first.
+ Software City
+Transform any code repository into a living, explorable city. AI agents walk through your code, find bugs, and grow smarter.
+[Screenshot or GIF here — add placeholder text: <!-- screenshot -->]
+What is this?
+Software City renders your codebase as a pixel-art city:
+Each folder is a district
+Each file is a building (height = lines of code)
+AI agents walk the city testing your code
+Bugs appear as fires. Fix them and the city heals.
+Code health drives the city’s season — bad code = winter.
+Quick Start (30 seconds)
+Clone and run
+git clone https://github.com/you/software-city
+cd software-city
+pnpm install
+pnpm dev
+# Open http://localhost:5173
+No database setup. No API keys required. SQLite runs automatically.
+Optional: Enable AI agents
+# Install Ollama for local AI (free)
+# https://ollama.com/download
+ollama pull deepseek-coder-v2:16b
+# Or use Groq (free tier, no local GPU needed)
+echo "GROQ_API_KEY=your_key" >> .env
+Docker (one command)
+docker compose up
+# Open http://localhost:8080
+Features
+Feature Status
+GitHub repo visualization
+Local folder watching
+Real AST analysis (TS/JS/Python/Go/Rust)
+Live AI agents (Ollama)
+Cloud AI escalation (Groq/Claude)
+Learning knowledge base
+Agent reputation system
+Git history time-lapse
+Shareable city URLs
+Metrics dashboard
+Docker deploy
+Architecture
+[brief section on the 3-layer stack]
+Contributing
+See CONTRIBUTING.md
+License
+MIT
+── 9B. DEMO SCRIPT (DEMO.md) ────────────────────────────────────────
+Create DEMO.md — a script for showing this to someone live:
+Software City — Live Demo Script
+Time: ~5 minutes
+Step 1 — Open the app (30s)
+“This is Software City. Let me load a real GitHub repo.” Enter: https://github.com/expressjs/express Click: Analyze Repository “Watch
+the city generate from the actual codebase.”
+Step 2 — Walk the city (60s)
+“Every folder is a district. Every file is a building.” “Taller buildings have more lines of code.” Click a tall building → Inspector opens
+“This is [filename]. It has [LOC] lines and [complexity] complexity.”
+Step 3 — Spawn agents (60s)
+Click: Spawn Agent → QA Inspector “Watch the agent start working immediately.” [wait for thought bubble to appear] “The agent is
+reading the file and generating tests.” [wait for bug or test result] “It found [result]. Let me ask it about that.” Click the agent → chat
+panel opens Type: “What’s the most important thing to fix in this file?”
+Step 4 — Show the learning (30s)
+Navigate to /knowledge “Every answer the agent gets from the AI is saved here.” “The next time it sees a similar problem, it answers
+from memory.” “This one’s been used [N] times. It’s never called the API for it.”
+Step 5 — Git history (60s)
+Press T → timeline opens “Let’s go back to [6 months ago].” Drag slider → city transforms Press ▶ → time-lapse plays “Watch the
+codebase grow. Districts appear as the team adds features.”
+Step 6 — Share (30s)
+Click: Export → Copy Share Link “This link shows anyone a frozen snapshot of this city.” “They can see the exact state of the codebase
+right now.”
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — FINAL VERIFICATION + PHASE 5 HANDOFF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run ALL of these checks. Report honest results in PHASE5_HANDOFF.md.
+CHECK 1 — OpenAPI spec complete: Every route in routes/index.ts has a matching entry in openapi.yaml AgentStatus enum includes:
+idle, working, escalating, paused, retired Zero as string casts remain in frontend TypeScript
+CHECK 2 — Metrics dashboard: /metrics page loads without error Health chart shows line graph (not empty) Coverage by district
+shows real values (not all 0%) Auto-refreshes — chart updates while agents are running
+CHECK 3 — Settings page: /settings loads without error Change agent speed → agents visibly run faster/slower Disable escalation →
+no external AI calls made Clear KB → /knowledge/entries returns empty array
+CHECK 4 — Docker: docker build . completes without error (< 5 minutes) docker compose up starts successfully http://localhost:8080
+serves both API and frontend Demo mode works inside container Data persists after docker compose down && docker compose up
+CHECK 5 — pnpm dev works: From fresh clone: pnpm install && pnpm dev Both services start with one command No DATABASE_URL
+needed App is usable in under 30 seconds from fresh clone
+CHECK 6 — Export dropdown: JSON download works (existing) SVG download works (new) — opens in browser correctly Report
+download works — valid Markdown Share link copies to clipboard
+CHECK 7 — Animations: Fire buildings show animated flames (not just a static emoji) Season overlay visible on city map (subtle tint)
+NPC agents move along roads (not teleport) Building sparkles on excellent coverage buildings
+CHECK 8 — Stability (5 minute run): Spawn 4 agents, let them run for 5 minutes No server crash, no memory spike > 200MB No
+duplicate tasks on same building Knowledge base grows (more entries than at start)
+CHECK 9 — Mobile: 375px width: landing page readable, no overflow City view: inspector slides up from bottom Pinch zoom works on
+touch devices
+CHECK 10 — TypeScript + build: pnpm run typecheck → zero errors (all packages) pnpm run build → succeeds docker build . →
+succeeds
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRIORITY IF RUNNING SHORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MUST DO: Steps 1, 4, 9A, 10 (spec sync, Docker, README, handoff) SHOULD DO: Steps 2, 3, 6 (metrics, settings, map polish) NICE
+TO HAVE: Steps 5, 7, 8 (export, animations, perf)
+The three things that make this impressive to show anyone:
+1. pnpm dev just works from fresh clone (Step 4 + no DB needed)
+2. The demo script (Step 9B) — practice it once, it’s 5 minutes
+3. The metrics dashboard (Step 2) — live charts sell the vision
+Generate PHASE5_HANDOFF.md when done. Same format as all previous handoffs. Be honest about what passed and what didn’t.
+This is the last planned phase — the handoff should answer: “Can someone clone this repo and be impressed in 5 minutes?” If the
+answer is yes: you’re done. If not: document exactly what’s still in the way.

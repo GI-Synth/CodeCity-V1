@@ -1,8 +1,9 @@
 import http from "http";
 import app from "./app";
 import { wsServer } from "./lib/wsServer";
-import { startAgentLoop } from "./lib/agentEngine";
+import { startAgentLoop, clearAllAgentIntervals } from "./lib/agentEngine";
 import { validateEnv } from "./lib/envValidator";
+import { writeMetricSnapshot } from "./routes/metrics";
 
 const rawPort = process.env["PORT"];
 
@@ -26,11 +27,14 @@ async function startServer(): Promise<void> {
   server.listen(port, () => {
     console.log(`Server listening on port ${port}`);
     startAgentLoop();
+    setInterval(() => { writeMetricSnapshot().catch(() => {}); }, 30_000);
+    setTimeout(() => { writeMetricSnapshot().catch(() => {}); }, 5_000);
   });
 }
 
 function shutdown(signal: string): void {
   console.log(`\nSoftware City shutting down cleanly (${signal})`);
+  clearAllAgentIntervals();
   wsServer.closeAll();
   server.close(() => {
     console.log("HTTP server closed. Goodbye.");

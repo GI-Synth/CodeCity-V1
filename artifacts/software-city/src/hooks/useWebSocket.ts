@@ -12,6 +12,10 @@ export function useWebSocket(enabled = true) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const handleMessage = useCallback((msg: WSMessage) => {
+    setLastMessage(msg);
+  }, []);
+
   const connect = useCallback(() => {
     if (!enabled) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -29,7 +33,18 @@ export function useWebSocket(enabled = true) {
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data) as WSMessage;
-          setLastMessage(msg);
+          if (msg.type === "batch" && Array.isArray(msg.payload)) {
+            const msgs = msg.payload as WSMessage[];
+            msgs.forEach((m, i) => {
+              if (i === 0) {
+                handleMessage(m);
+              } else {
+                setTimeout(() => handleMessage(m), i);
+              }
+            });
+          } else {
+            handleMessage(msg);
+          }
         } catch { }
       };
 
@@ -45,7 +60,7 @@ export function useWebSocket(enabled = true) {
         ws.close();
       };
     } catch { }
-  }, [enabled]);
+  }, [enabled, handleMessage]);
 
   useEffect(() => {
     connect();

@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { Activity, Building2, Bot, BookOpen, ChevronRight, Terminal, Menu, X, Trophy } from "lucide-react";
+import { Activity, Building2, Bot, BookOpen, ChevronRight, Terminal, Menu, X, Trophy, BarChart3, Settings } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useGetEventStream } from "@workspace/api-client-react";
@@ -11,6 +11,8 @@ const NAV_ITEMS = [
   { href: "/agents", icon: Bot, label: "Agents Dashboard" },
   { href: "/knowledge", icon: BookOpen, label: "Knowledge Base" },
   { href: "/leaderboard", icon: Trophy, label: "Leaderboard" },
+  { href: "/metrics", icon: BarChart3, label: "Live Metrics" },
+  { href: "/settings", icon: Settings, label: "Settings" },
 ];
 
 interface LocalEvent {

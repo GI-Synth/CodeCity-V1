@@ -224,6 +224,8 @@ export const AgentStatus = {
   escalating: "escalating",
   reporting: "reporting",
   waiting: "waiting",
+  paused: "paused",
+  retired: "retired",
 } as const;
 
 export interface Agent {
