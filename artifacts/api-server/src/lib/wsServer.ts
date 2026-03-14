@@ -174,6 +174,21 @@ class WSServerManager {
     });
   }
 
+  broadcastAlchemistResult(payload: {
+    id: number | null;
+    command: string;
+    status: string;
+    exitCode: number | null;
+    durationMs: number;
+    reason?: string | null;
+  }): void {
+    this.enqueue({
+      type: "alchemist_result",
+      payload,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   closeAll(): void {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);

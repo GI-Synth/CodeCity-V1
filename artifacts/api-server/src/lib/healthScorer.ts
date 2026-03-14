@@ -1,6 +1,26 @@
 import type { Building, CityLayout } from "./types";
 
-export function computeHealthScore(buildings: Building[]): { score: number; season: string } {
+export interface ExecutionHealthSummary {
+  totalRuns: number;
+  success: number;
+  failed: number;
+  blocked: number;
+  timeout: number;
+}
+
+function computeExecutionScore(summary?: ExecutionHealthSummary): number {
+  if (!summary || summary.totalRuns <= 0) return 0.5;
+
+  const total = Math.max(1, summary.totalRuns);
+  const weightedSuccess = summary.success;
+  const weightedFailure = (summary.failed + summary.timeout) * 1.0;
+  const weightedBlocked = summary.blocked * 0.5;
+
+  const normalized = (weightedSuccess - weightedFailure - weightedBlocked) / total;
+  return Math.max(0, Math.min(1, 0.5 + (normalized * 0.5)));
+}
+
+export function computeHealthScore(buildings: Building[], executionSummary?: ExecutionHealthSummary): { score: number; season: string } {
   if (buildings.length === 0) return { score: 50, season: "autumn" };
 
   const testFiles = buildings.filter(b => b.fileType === "test");
@@ -22,12 +42,14 @@ export function computeHealthScore(buildings: Building[]): { score: number; seas
   const avgComplexity = buildings.reduce((s, b) => s + b.complexity, 0) / (buildings.length || 1);
   const complexityScore = Math.max(0, Math.min(1, 1 - avgComplexity / 30));
   const testFileRatio = Math.min(1, testFiles.length / (buildings.length || 1));
+  const executionScore = computeExecutionScore(executionSummary);
 
   const healthScore =
-    testCoverageScore * 0.40 +
-    cleanRatio * 0.30 +
+    testCoverageScore * 0.35 +
+    cleanRatio * 0.25 +
     complexityScore * 0.20 +
-    testFileRatio * 0.10;
+    testFileRatio * 0.10 +
+    executionScore * 0.10;
 
   const score = Math.round(healthScore * 100);
 

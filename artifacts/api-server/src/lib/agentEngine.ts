@@ -2,11 +2,20 @@ import { type NpcAgent } from "./types";
 import { db } from "@workspace/db";
 import { agentsTable, eventsTable } from "@workspace/db/schema";
 import { wsServer } from "./wsServer";
-import { ollamaClient } from "./ollamaClient";
-import { buildTestGenerationPrompt } from "./ollamaPrompts";
-import { escalate } from "./escalationEngine";
 import type { CityLayout, Building } from "./types";
 import { eq } from "drizzle-orm";
+import { analyzeBuildingForAgent, type SmartAnalysisResult } from "./smartAgentWorkflow";
+import {
+  getTopLanguageFromPersonalKb,
+  mapRoleToPersona,
+  parsePersonalKb,
+  personaEmoji,
+} from "./smartAgents";
+import {
+  classifyAndPersistBugFinding,
+  recordDiscardedFindingEvent,
+  recordObservationEvent,
+} from "./findingQuality";
 
 function computeRank(totalTasks: number, accuracy: number, truePositives: number): string {
   if (accuracy >= 0.90 && totalTasks >= 100 && truePositives >= 10) return "principal";
@@ -25,6 +34,7 @@ const AGENT_NAMES: Record<string, string[]> = {
   load_tester: ["Max Overload", "Storm Surge", "Traffic Terry", "Pressure Pete", "Load Lord"],
   edge_explorer: ["Edge Eddie", "Boundary Bob", "Null Ninja", "Corner Case Carl", "Extreme Ellie"],
   ui_navigator: ["Click Clicker", "Browser Bot", "UI Uma", "Nav Nemesis", "Page Pilot"],
+  scribe: ["Test Scribe", "Patch Quill", "Spec Smith", "Coverage Clerk", "Suite Weaver"],
 };
 
 const AGENT_COLORS: Record<string, string> = {
@@ -33,6 +43,7 @@ const AGENT_COLORS: Record<string, string> = {
   load_tester: "#ffe44a",
   edge_explorer: "#4aff8c",
   ui_navigator: "#c44aff",
+  scribe: "#6be675",
 };
 
 const IDLE_DIALOGUES: Record<string, string[]> = {
@@ -41,6 +52,7 @@ const IDLE_DIALOGUES: Record<string, string[]> = {
   load_tester: ["Simulating 1000 concurrent users...", "Watching for memory leaks under load...", "Stress testing database pool..."],
   edge_explorer: ["Testing null and undefined inputs...", "Exploring boundary conditions...", "Finding race conditions..."],
   ui_navigator: ["Navigating user flows...", "Checking mobile responsiveness...", "Automating user journeys..."],
+  scribe: ["Drafting targeted tests...", "Turning findings into reproducible specs...", "Writing guards for fragile paths..."],
 };
 
 interface AgentState {
@@ -66,20 +78,70 @@ export function clearAllAgentIntervals(): void {
 }
 
 function roleBonusScore(role: string, building: Building): number {
-  if (role === "qa_inspector" && building.fileType === "function") return 3;
-  if (role === "qa_inspector" && building.fileType === "class") return 2;
-  if (role === "api_fuzzer" && building.fileType === "api") return 5;
-  if (role === "edge_explorer" && building.complexity > 15) return 4;
-  if (role === "load_tester" && building.fileType === "api") return 3;
-  if (role === "ui_navigator" && building.fileType === "entry") return 3;
+  const persona = mapRoleToPersona(role);
+
+  if (persona === "inspector" && building.fileType === "function") return 3;
+  if (persona === "inspector" && building.fileType === "class") return 2;
+  if (persona === "guardian" && building.fileType === "api") return 5;
+  if (persona === "architect" && building.complexity > 15) return 4;
+  if (persona === "optimizer" && building.fileType === "api") return 3;
+  if (persona === "alchemist" && building.fileType === "entry") return 2;
+  if (persona === "scribe" && (!building.hasTests || building.testCoverage < 0.2)) return 6;
   return 0;
 }
 
-function chooseTarget(agentRole: string, visited: Set<string>, layout: CityLayout): Building | null {
+function applySpecialtyConstraint(
+  agentRow: typeof agentsTable.$inferSelect,
+  candidates: Building[],
+): Building[] {
+  if ((agentRow.specialtyScore ?? 0) <= 0.7) return candidates;
+
+  const persona = mapRoleToPersona(agentRow.role);
+  if (persona === "inspector") {
+    const entries = parsePersonalKb(agentRow.personalKB);
+    const topLanguage = getTopLanguageFromPersonalKb(entries);
+    if (!topLanguage) return candidates;
+
+    const filtered = candidates.filter(b => b.language.trim().toLowerCase() === topLanguage);
+    if (filtered.length > 0) {
+      console.log(`[SpecialtyTarget] ${agentRow.name} constrained to language=${topLanguage}`);
+      return filtered;
+    }
+    return candidates;
+  }
+
+  if (persona === "guardian") {
+    const filtered = candidates.filter(b => {
+      const lowerPath = b.filePath.toLowerCase();
+      return lowerPath.includes("auth") || lowerPath.includes("security") || lowerPath.includes("token") || lowerPath.includes("permission");
+    });
+
+    if (filtered.length > 0) {
+      console.log(`[SpecialtyTarget] ${agentRow.name} constrained to security-adjacent paths`);
+      return filtered;
+    }
+    return candidates;
+  }
+
+  if (persona === "optimizer") {
+    const filtered = candidates.filter(b => b.complexity > 15);
+    if (filtered.length > 0) {
+      console.log(`[SpecialtyTarget] ${agentRow.name} constrained to complexity>15 files`);
+      return filtered;
+    }
+    return candidates;
+  }
+
+  return candidates;
+}
+
+function chooseTarget(agentRow: typeof agentsTable.$inferSelect, visited: Set<string>, layout: CityLayout): Building | null {
   const allBuildings = layout.districts.flatMap(d => d.buildings);
   const candidates = allBuildings.filter(b => !visited.has(b.id) && !activeTargets.has(b.id));
 
-  const pool = candidates.length > 0 ? candidates : allBuildings.filter(b => !activeTargets.has(b.id));
+  const basePool = candidates.length > 0 ? candidates : allBuildings.filter(b => !activeTargets.has(b.id));
+  const pool = applySpecialtyConstraint(agentRow, basePool);
+
   if (pool.length === 0) return allBuildings[Math.floor(Math.random() * allBuildings.length)] ?? null;
 
   let best: Building = pool[0];
@@ -87,46 +149,126 @@ function chooseTarget(agentRole: string, visited: Set<string>, layout: CityLayou
 
   for (const b of pool) {
     const depCount = layout.roads.filter(r => r.fromBuilding === b.id || r.toBuilding === b.id).length;
-    const score = b.complexity * (depCount + 1) + roleBonusScore(agentRole, b);
+    const score = b.complexity * (depCount + 1) + roleBonusScore(agentRow.role, b);
     if (score > bestScore) { bestScore = score; best = b; }
   }
 
   return best;
 }
 
-function parseTestJSON(raw: string): Array<{ name: string; input: unknown; expected: unknown }> {
+function parseStringArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
   try {
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (!match) return [];
-    const arr = JSON.parse(match[0]) as Array<{ name: string; input: unknown; expected: unknown }>;
-    if (!Array.isArray(arr)) return [];
-    return arr.filter(t => t.name && (t.input !== null || t.expected !== null));
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is string => typeof value === "string").map(value => value.trim()).filter(Boolean);
   } catch {
     return [];
+  }
+}
+
+function pushUnique(items: string[], value: string, max = 120): string[] {
+  const next = items.filter(item => item !== value);
+  next.push(value);
+  return next.slice(-max);
+}
+
+function formatPersonaLabel(persona: string): string {
+  if (!persona) return "Specialist";
+  return `${persona.charAt(0).toUpperCase()}${persona.slice(1)}`;
+}
+
+async function consultAgent(params: {
+  requestingAgent: typeof agentsTable.$inferSelect;
+  targetRole: "guardian" | "optimizer" | "architect" | "inspector" | "scribe" | "alchemist";
+  filePath: string;
+  building: Building;
+  context: string;
+}): Promise<SmartAnalysisResult | null> {
+  const idleAgents: Array<typeof agentsTable.$inferSelect> = await db
+    .select()
+    .from(agentsTable)
+    .where(eq(agentsTable.status, "idle"));
+
+  const consultant = idleAgents.find(candidate => (
+    candidate.id !== params.requestingAgent.id
+    && mapRoleToPersona(candidate.role) === params.targetRole
+  ));
+
+  if (!consultant) {
+    console.log(`[Consultation] No idle ${params.targetRole} available for ${params.requestingAgent.name}`);
+    return null;
+  }
+
+  const requesterPersona = mapRoleToPersona(params.requestingAgent.role);
+  const consultantPersona = mapRoleToPersona(consultant.role);
+
+  const requesterEmoji = personaEmoji(requesterPersona);
+  const consultantEmoji = personaEmoji(consultantPersona);
+
+  const consultationLog = `${requesterEmoji} ${formatPersonaLabel(requesterPersona)} consulted ${consultantEmoji} ${formatPersonaLabel(consultantPersona)} on ${params.filePath}`;
+  console.log(`[Consultation] ${consultationLog}`);
+
+  await db.update(agentsTable).set({
+    status: "working",
+    currentBuilding: params.building.id,
+    currentTask: "consulting",
+  }).where(eq(agentsTable.id, consultant.id));
+
+  try {
+    const result = await analyzeBuildingForAgent({
+      agentRow: consultant,
+      building: params.building,
+      context: params.context,
+      consultedBy: params.requestingAgent.id,
+    });
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-consult-${Math.random().toString(36).slice(2, 5)}`,
+      type: "escalation",
+      agentId: consultant.id,
+      agentName: consultant.name,
+      buildingId: params.building.id,
+      buildingName: params.building.name,
+      message: consultationLog,
+      severity: "info",
+    }).catch(() => {});
+
+    wsServer.broadcastEventLog("CONSULTATION", consultationLog, "info");
+    return result;
+  } finally {
+    await db.update(agentsTable).set({
+      status: "idle",
+      currentTask: null,
+      currentBuilding: null,
+    }).where(eq(agentsTable.id, consultant.id));
   }
 }
 
 async function runAgentCycle(agentId: string): Promise<void> {
   if (!currentLayout) return;
 
-  const rows = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
-  if (rows.length === 0) return;
-  const agentRow = rows[0];
-
-  let state = agentStates.get(agentId);
-  if (!state) {
-    state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: [] };
-    agentStates.set(agentId, state);
-  }
-
-  state.status = "moving";
-  emitThought(agentId, "Scanning for high-complexity targets…");
-  const target = chooseTarget(agentRow.role, state.visitedBuildings, currentLayout);
-  if (!target) return;
-
-  activeTargets.add(target.id);
-
+  let target: Building | null = null;
   try {
+    const rows = await db.select().from(agentsTable).where(eq(agentsTable.id, agentId));
+    if (rows.length === 0) return;
+    const agentRow = rows[0];
+    if (agentRow.status === "paused" || agentRow.status === "retired") return;
+
+    let state = agentStates.get(agentId);
+    if (!state) {
+      state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: [] };
+      agentStates.set(agentId, state);
+    }
+
+    state.status = "moving";
+    emitThought(agentId, "Scanning for high-value specialist targets...");
+    target = chooseTarget(agentRow, state.visitedBuildings, currentLayout);
+    if (!target) return;
+    let observations = parseStringArray(agentRow.observations);
+
+    activeTargets.add(target.id);
+
     state.visitedBuildings.add(target.id);
     if (state.visitedBuildings.size > 20) {
       const first = state.visitedBuildings.values().next().value;
@@ -143,89 +285,109 @@ async function runAgentCycle(agentId: string): Promise<void> {
       y: target.y + target.height / 2,
     }).where(eq(agentsTable.id, agentId));
 
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 1200));
 
     state.status = "testing";
-    const { system, prompt } = buildTestGenerationPrompt(target.name, target.filePath, target.language);
+    await db.update(agentsTable).set({ currentTask: "analyzing" }).where(eq(agentsTable.id, agentId));
+    emitThought(agentId, `Running ${mapRoleToPersona(agentRow.role)} analysis on ${target.name}...`);
 
-    let tests: Array<{ name: string; input: unknown; expected: unknown }> = [];
-    let localSucceeded = false;
-    const attempts: string[] = [];
+    const primaryResult = await analyzeBuildingForAgent({
+      agentRow,
+      building: target,
+      context: `Autonomous cycle for ${agentRow.name}`,
+    });
 
-    const ollamaAvailable = await ollamaClient.isAvailable();
-    if (ollamaAvailable) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        emitThought(agentId, `Analyzing ${target.name}… attempt ${attempt + 1}/3`);
-        try {
-          const result = await ollamaClient.generate({
-            model: "deepseek-coder-v2:16b",
-            system,
-            prompt,
-            temperature: 0.4 + attempt * 0.1,
-            maxTokens: 1000,
-          });
-          const parsed = parseTestJSON(result);
-          if (parsed.length > 0 && !parsed.every(t => t.input === null)) {
-            tests = parsed;
-            localSucceeded = true;
-            attempts.push(`Attempt ${attempt + 1}: generated ${parsed.length} tests`);
-            break;
-          } else {
-            attempts.push(`Attempt ${attempt + 1}: trivial or empty result`);
-            emitThought(agentId, "Tests too trivial. Trying different approach…");
-          }
-        } catch (e) {
-          attempts.push(`Attempt ${attempt + 1}: ${e instanceof Error ? e.message : "failed"}`);
+    let bugsFound = primaryResult.bugsFound;
+    let testsGenerated = primaryResult.testsGenerated;
+    const escalated = primaryResult.escalated;
+    const kbHit = primaryResult.fromKnowledgeBase;
+
+    if (primaryResult.classification === "bug") {
+      if (primaryResult.findingText && primaryResult.issueType && primaryResult.codeReference) {
+        const persisted = await classifyAndPersistBugFinding({
+          agentId,
+          agentName: agentRow.name,
+          buildingId: target.id,
+          buildingName: target.name,
+          filePath: target.filePath,
+          findingText: primaryResult.findingText,
+          issueType: primaryResult.issueType,
+          confidence: primaryResult.finalConfidence,
+          codeReference: primaryResult.codeReference,
+        });
+
+        bugsFound = persisted.status === "new" ? 1 : 0;
+        state.recentFindings.push(`${target.filePath}: ${(primaryResult.findingText ?? "bug finding").slice(0, 120)}`);
+
+        if (bugsFound > 0) {
+          emitThought(agentId, `High-confidence issue found in ${target.name}.`, 4500);
+          wsServer.broadcastBugFound(
+            target.id,
+            persisted.severity === "CRITICAL" ? "critical" : "warning",
+            `${agentRow.name} reported ${persisted.severity} issue in ${target.name}: ${primaryResult.codeReference}`,
+          );
         }
+      } else {
+        bugsFound = 0;
       }
     }
 
-    let bugsFound = 0;
-    let escalated = false;
-    let kbHit = false;
+    if (primaryResult.classification === "observation" && primaryResult.findingText) {
+      observations = pushUnique(observations, primaryResult.findingText);
+      await recordObservationEvent({
+        agentId,
+        agentName: agentRow.name,
+        buildingId: target.id,
+        buildingName: target.name,
+        filePath: target.filePath,
+        observation: primaryResult.findingText,
+        confidence: primaryResult.finalConfidence,
+        eventType: primaryResult.qualityReason === "low_confidence"
+          ? "finding_low_confidence"
+          : "finding_observation",
+      });
+    }
 
-    if (localSucceeded && tests.length > 0) {
-      await db.update(agentsTable).set({ currentTask: "testing" }).where(eq(agentsTable.id, agentId));
+    if (primaryResult.classification === "discarded" && primaryResult.findingText) {
+      await recordDiscardedFindingEvent({
+        agentId,
+        agentName: agentRow.name,
+        buildingId: target.id,
+        buildingName: target.name,
+        filePath: target.filePath,
+        findingText: primaryResult.findingText,
+        reason: primaryResult.qualityReason ?? "discarded",
+        confidence: primaryResult.finalConfidence,
+        eventType: primaryResult.qualityReason === "generic"
+          ? "finding_discarded_generic"
+          : "finding_discarded",
+      });
+    }
 
-      bugsFound = Math.min(tests.length, Math.floor(target.complexity / 8));
-      for (let i = 0; i < bugsFound; i++) {
-        const severity = target.complexity > 20 ? "critical" : "warning";
-        wsServer.broadcastBugFound(target.id, severity, `${agentRow.name} found a bug in ${target.name}: test case "${tests[i]?.name ?? "edge case"}" failed`);
+    if (primaryResult.classification === "test_target") {
+      testsGenerated += 1;
+      observations = pushUnique(observations, primaryResult.summary);
+    }
+
+    const persona = mapRoleToPersona(agentRow.role);
+    if (persona === "inspector" && primaryResult.classification === "bug" && primaryResult.isSecurityAdjacent) {
+      emitThought(agentId, "Security-adjacent finding detected. Consulting Guardian...", 4500);
+      const consultation = await consultAgent({
+        requestingAgent: agentRow,
+        targetRole: "guardian",
+        filePath: target.filePath,
+        building: target,
+        context: `Inspector finding: ${primaryResult.findingText ?? "security-adjacent issue"}`,
+      });
+
+      if (consultation?.classification === "bug") {
+        bugsFound += consultation.bugsFound;
+        wsServer.broadcastEventLog(
+          "CONSULTATION_CONFIRMED",
+          `${agentRow.name} and Guardian confirmed a security issue in ${target.filePath}`,
+          "warning",
+        );
       }
-
-      if (bugsFound > 0) {
-        emitThought(agentId, `Found ${bugsFound} issue(s) in ${target.name}!`, 5000);
-        state.recentFindings.push(`Found ${bugsFound} bug(s) in ${target.name}`);
-        if (state.recentFindings.length > 5) state.recentFindings.shift();
-      }
-    } else {
-      state.status = "escalating";
-      escalated = true;
-
-      await db.update(agentsTable).set({ currentTask: "escalating" }).where(eq(agentsTable.id, agentId));
-      wsServer.broadcastEscalation(agentId, target.id, false, "pending");
-      emitThought(agentId, "This is beyond me. Consulting senior AI…", 5000);
-
-      try {
-        const result = await escalate({
-          question: `What bugs might exist in ${target.name} (${target.language} file with complexity ${target.complexity})?`,
-          codeSnippet: `File: ${target.filePath}\nLanguage: ${target.language}\nLOC: ${target.linesOfCode}\nComplexity: ${target.complexity}`,
-          language: target.language,
-          failedAttempts: attempts,
-        });
-
-        wsServer.broadcastEscalation(agentId, target.id, result.source === "knowledge_base", result.source);
-        kbHit = result.source === "knowledge_base";
-
-        if (kbHit) {
-          emitThought(agentId, "Found a similar case in memory! Applying…", 5000);
-        }
-
-        if (result.confidence > 0.5) {
-          bugsFound = result.action_items.length > 0 ? 1 : 0;
-          state.recentFindings.push(`Escalated for ${target.name}: ${result.answer.slice(0, 80)}`);
-        }
-      } catch { }
     }
 
     emitThought(agentId, "Filing report at the tower.");
@@ -234,19 +396,29 @@ async function runAgentCycle(agentId: string): Promise<void> {
     const newBugsTotal = agentRow.bugsFound + bugsFound;
     const newTruePositives = agentRow.truePositives + (bugsFound > 0 ? bugsFound : 0);
     const newEscalationCount = agentRow.escalationCount + (escalated ? 1 : 0);
-    const newKbHits = agentRow.kbHits + (kbHit ? 1 : 0);
+    const newKbHits = (agentRow.kbHits ?? 0) + (kbHit ? 1 : 0);
     const newRank = computeRank(newTotalTasks, agentRow.accuracy, newTruePositives);
+    const specialtyAdjustment = primaryResult.classification === "bug"
+      ? 0.04
+      : primaryResult.classification === "observation"
+        ? 0.01
+        : primaryResult.classification === "discarded"
+          ? -0.01
+          : 0.02;
+    const nextSpecialtyScore = Math.max(0, Math.min(1, (agentRow.specialtyScore ?? 0) + specialtyAdjustment));
 
     await db.update(agentsTable).set({
       currentTask: "reporting",
       bugsFound: newBugsTotal,
-      testsGenerated: agentRow.testsGenerated + tests.length,
+      testsGenerated: agentRow.testsGenerated + testsGenerated,
       escalations: agentRow.escalations + (escalated ? 1 : 0),
       escalationCount: newEscalationCount,
       kbHits: newKbHits,
+      observations: JSON.stringify(observations),
       truePositives: newTruePositives,
       totalTasksCompleted: newTotalTasks,
       rank: newRank,
+      specialtyScore: nextSpecialtyScore,
       status: "reporting",
       x: 50,
       y: 50,
@@ -261,7 +433,7 @@ async function runAgentCycle(agentId: string): Promise<void> {
       agentName: agentRow.name,
       buildingId: target.id,
       buildingName: target.name,
-      message: `${agentRow.name} completed ${tests.length} tests on ${target.name}${bugsFound > 0 ? `, found ${bugsFound} bug(s)` : ""}`,
+      message: `${agentRow.name} completed ${target.name} analysis (${primaryResult.classification})${bugsFound > 0 ? `, found ${bugsFound} bug(s)` : ""}`,
       severity: bugsFound > 0 ? "warning" : "info",
     });
 
@@ -275,9 +447,10 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
     await db.update(agentsTable).set({ currentTask: null, status: "idle" }).where(eq(agentsTable.id, agentId));
     state.status = "idle";
-  } finally {
-    activeTargets.delete(target.id);
+  } catch (err) {
+    console.error('[AgentCycle] error:', err);
   }
+  if (target && target.id) activeTargets.delete(target.id);
 }
 
 export async function startAgentLoop(): Promise<void> {
@@ -294,10 +467,7 @@ export async function startAgentLoop(): Promise<void> {
       if (repos.length > 0 && repos[0].layoutData) {
         currentLayout = JSON.parse(repos[0].layoutData);
       } else {
-        const { generateDemoRepo } = await import("./githubFetcher");
-        const { buildCityLayout } = await import("./cityAnalyzer");
-        const { files, repoName } = generateDemoRepo();
-        currentLayout = buildCityLayout(files, repoName);
+        currentLayout = null;
       }
     } catch (e) {
       console.warn("[AgentLoop] Failed to load layout:", e);
@@ -379,26 +549,33 @@ export function getAgentDialogue(agent: NpcAgent): string {
 }
 
 export function simulateAgentTask(
-  agent: NpcAgent,
+  _agent: NpcAgent,
   taskType: string,
   buildingName: string,
-  _context: string,
+  context: string,
 ): { result: string; actionItems: string[]; bugsFound: number; escalated: boolean; fromKnowledgeBase: boolean } {
-  const bugsFound = Math.random() < 0.35 ? Math.floor(Math.random() * 3) + 1 : 0;
-  const escalated = agent.escalations < 5 && Math.random() < 0.06;
-  const fromKnowledgeBase = !escalated && Math.random() < 0.3;
+  const normalizedTask = String(taskType || "analyze_bug");
+  const safeContext = context?.trim() || `building:${buildingName}`;
 
   const results: Record<string, string> = {
-    generate_tests: `Generated ${Math.floor(Math.random() * 8) + 3} test cases for ${buildingName}. Found ${bugsFound} potential issues.`,
-    analyze_bug: `Analyzed ${buildingName}. ${bugsFound > 0 ? `Found ${bugsFound} bugs in error handling paths.` : "No critical bugs found."}`,
-    fuzz_api: `Fuzzed ${buildingName} with 500 random payloads. ${bugsFound > 0 ? `${bugsFound} endpoints vulnerable.` : "All endpoints handled edge inputs gracefully."}`,
-    load_test: `Load tested ${buildingName} with 100-2000 concurrent requests. ${bugsFound > 0 ? "Memory leak detected under load." : "Performance stable."}`,
-    explore_edge_cases: `Explored ${Math.floor(Math.random() * 20 + 10)} edge cases in ${buildingName}. ${bugsFound > 0 ? `${bugsFound} caused unexpected behavior.` : "All handled correctly."}`,
+    generate_tests: `Prepared a test-generation request for ${buildingName}. No test execution has occurred yet.`,
+    analyze_bug: `Prepared a static inspection request for ${buildingName}. No verified bug finding has been emitted.`,
+    fuzz_api: `Prepared an API fuzzing request for ${buildingName}. No runtime fuzz execution has occurred yet.`,
+    load_test: `Prepared a load-test request for ${buildingName}. No live traffic simulation has run yet.`,
+    explore_edge_cases: `Prepared an edge-case exploration request for ${buildingName}. No executable checks have run yet.`,
   };
 
-  const actionItems = bugsFound > 0
-    ? [`Add null checks in ${buildingName}`, "Increase test coverage for error paths", "Review async error handling"].slice(0, bugsFound + 1)
-    : ["Consider adding more edge case tests", "Document the current behavior"];
+  const actionItems = [
+    `Review context: ${safeContext}`,
+    "Use the Run Tests action for verifiable pass/fail results",
+    "Treat this task result as a queued analysis note, not a confirmed bug",
+  ];
 
-  return { result: results[taskType] ?? `Completed ${taskType} on ${buildingName}.`, actionItems, bugsFound, escalated, fromKnowledgeBase };
+  return {
+    result: results[normalizedTask] ?? `Prepared ${normalizedTask} request for ${buildingName}.`,
+    actionItems,
+    bugsFound: 0,
+    escalated: false,
+    fromKnowledgeBase: false,
+  };
 }

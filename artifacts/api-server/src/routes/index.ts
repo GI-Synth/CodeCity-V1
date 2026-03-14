@@ -1,4 +1,5 @@
 import { Router, type IRouter } from "express";
+
 import healthRouter from "./health";
 import repoRouter from "./repo";
 import cityRouter from "./city";
@@ -12,8 +13,11 @@ import sharedRouter from "./shared";
 import settingsRouter from "./settings";
 import metricsRouter from "./metrics";
 import reportRouter from "./report";
+import orchestratorRouter from "./orchestrator";
+import alchemistRouter from "./alchemist";
 
 const router: IRouter = Router();
+
 
 router.use(healthRouter);
 router.use("/repo", repoRouter);
@@ -30,5 +34,7 @@ router.use("/shared", sharedRouter);
 router.use("/settings", settingsRouter);
 router.use("/metrics", metricsRouter);
 router.use("/city", reportRouter);
+router.use("/orchestrator", orchestratorRouter);
+router.use("/alchemist", alchemistRouter);
 
 export default router;

@@ -14,6 +14,7 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   ollama_primary_model: "deepseek-coder-v2:16b",
   groq_model: "llama-3.3-70b-versatile",
   mayor_name: "Mayor",
+  mayor_memory: "[]",
   openrouter_model: "openrouter/codellama-70b",
   anthropic_model: "claude-sonnet-4-6",
   orchestrator_model: "rule-based",

@@ -18,6 +18,8 @@ export interface Building {
   linesOfCode: number;
   dependencies: string[];
   activeEvent?: "fire" | "flood" | "smoke" | "alarm" | "sparkle" | "collapse" | null;
+  bugCount?: number;
+  lastAnalyzed?: string;
 }
 
 export interface District {
@@ -54,7 +56,7 @@ export interface CityLayout {
 export interface NpcAgent {
   id: string;
   name: string;
-  role: "qa_inspector" | "api_fuzzer" | "load_tester" | "edge_explorer" | "ui_navigator";
+  role: "qa_inspector" | "api_fuzzer" | "load_tester" | "edge_explorer" | "ui_navigator" | "scribe";
   status: "idle" | "working" | "escalating" | "reporting" | "waiting";
   currentBuilding: string | null;
   currentTask: string | null;

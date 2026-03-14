@@ -6,11 +6,8 @@ import { eq, sql } from "drizzle-orm";
 const router: IRouter = Router();
 
 async function ensureDefaults() {
-  const existing = await db.select().from(settingsTable).limit(1);
-  if (existing.length === 0) {
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      await db.insert(settingsTable).values({ key, value }).onConflictDoNothing();
-    }
+  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+    await db.insert(settingsTable).values({ key, value }).onConflictDoNothing();
   }
 }
 

@@ -1,12 +1,12 @@
 import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
-import { useLoadRepo, useLoadDemoRepo } from "@workspace/api-client-react";
+import { useLoadRepo } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-  Github, Play, Terminal, ChevronDown, ChevronUp,
+  Github, Terminal, ChevronDown, ChevronUp,
   KeyRound, ExternalLink, FolderOpen, Eye, Save, X, Clock, Zap,
-  Building2, Bot, Search, Flame,
+  Building2, Bot, Search,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
@@ -14,7 +14,6 @@ import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 
 const LS_REPO = "sc_saved_repo_url";
-const LS_TOKEN = "sc_saved_github_token";
 const LS_LOCAL = "sc_saved_local_path";
 
 interface RepoListItem {
@@ -22,10 +21,17 @@ interface RepoListItem {
   slug: string;
   repoName: string;
   repoUrl: string;
+  githubTokenHint?: string | null;
+  hasTokenOnFile?: boolean;
   healthScore: number;
   season: string;
   isActive: boolean;
   loadedAt: string;
+}
+
+interface GithubTokenStatus {
+  tokenOnFile: boolean;
+  tokenHint: string | null;
 }
 
 const SEASON_ICONS: Record<string, string> = {
@@ -63,8 +69,8 @@ const HOW_IT_WORKS = [
   {
     icon: Bot,
     step: "03",
-    title: "Agents Patrol",
-    body: "Autonomous AI agents patrol your city around the clock. When they find a bug, a fire breaks out. Fixes heal the building. Learnings are saved to a shared knowledge base.",
+    title: "Run Verifiable Checks",
+    body: "Use agent tools and test execution to inspect files. The app surfaces stored results and event logs from real actions instead of synthetic city drama.",
     color: "text-orange-400",
     bg: "bg-orange-400/10",
     border: "border-orange-400/30",
@@ -76,14 +82,17 @@ export function Landing() {
   const { toast } = useToast();
 
   const [repoUrl, setRepoUrl] = useState(() => localStorage.getItem(LS_REPO) ?? "");
-  const [githubToken, setGithubToken] = useState(() => localStorage.getItem(LS_TOKEN) ?? "");
-  const [showAdvanced, setShowAdvanced] = useState(() => !!localStorage.getItem(LS_TOKEN));
+  const [githubToken, setGithubToken] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showTokenInput, setShowTokenInput] = useState(false);
+  const [rememberGithubToken, setRememberGithubToken] = useState(true);
   const [localPath, setLocalPath] = useState(() => localStorage.getItem(LS_LOCAL) ?? "");
   const [watchStatus, setWatchStatus] = useState<"idle" | "watching">("idle");
   const [savedIndicator, setSavedIndicator] = useState(false);
+  const [tokenSavedIndicator, setTokenSavedIndicator] = useState(false);
   const [showHowItWorks, setShowHowItWorks] = useState(false);
 
-  const hasSaved = !!(localStorage.getItem(LS_REPO) || localStorage.getItem(LS_TOKEN));
+  const hasSaved = !!(localStorage.getItem(LS_REPO) || localStorage.getItem(LS_LOCAL));
 
   const { data: repoListData, refetch: refetchRepos } = useQuery<{ repos: RepoListItem[] }>({
     queryKey: ["repo-list"],
@@ -92,67 +101,100 @@ export function Landing() {
 
   const recentRepos = repoListData?.repos ?? [];
 
-  const persist = (url: string, token: string, local: string) => {
+  const { data: tokenStatus, refetch: refetchTokenStatus } = useQuery<GithubTokenStatus>({
+    queryKey: ["github-token-status"],
+    queryFn: async () => {
+      const response = await fetch("/api/repo/token-status");
+      if (!response.ok) throw new Error("Failed to fetch GitHub token status");
+      return response.json() as Promise<GithubTokenStatus>;
+    },
+  });
+
+  const tokenOnFile = Boolean(tokenStatus?.tokenOnFile);
+  const shouldShowTokenInput = showTokenInput || !tokenOnFile;
+
+  const persist = (url: string, local: string) => {
     if (url) localStorage.setItem(LS_REPO, url);
     else localStorage.removeItem(LS_REPO);
-    if (token) localStorage.setItem(LS_TOKEN, token);
-    else localStorage.removeItem(LS_TOKEN);
     if (local) localStorage.setItem(LS_LOCAL, local);
     else localStorage.removeItem(LS_LOCAL);
   };
 
   const handleForget = () => {
     localStorage.removeItem(LS_REPO);
-    localStorage.removeItem(LS_TOKEN);
     localStorage.removeItem(LS_LOCAL);
     setRepoUrl("");
     setGithubToken("");
     setLocalPath("");
-    toast({ title: "Saved credentials cleared" });
+    setShowTokenInput(false);
+    toast({ title: "Saved browser fields cleared" });
   };
 
   const loadMutation = useLoadRepo({
     mutation: {
-      onSuccess: () => {
-        persist(repoUrl, githubToken, localPath);
+      onSuccess: (data: any) => {
+        persist(repoUrl, localPath);
         setSavedIndicator(true);
         setTimeout(() => setSavedIndicator(false), 2500);
+
+        if (data?.tokenSaved) {
+          setTokenSavedIndicator(true);
+          setTimeout(() => setTokenSavedIndicator(false), 2500);
+        }
+
+        setGithubToken("");
+        setShowTokenInput(false);
         refetchRepos();
+        refetchTokenStatus();
         setLocation("/city");
       },
-      onError: (err: any) => toast({
-        title: "Failed to load repository",
-        description: err.message || "Could not fetch repo. Check the URL and token.",
-        variant: "destructive",
-      }),
-    },
-  });
+      onError: async (err: any) => {
+        if (githubToken.trim() && rememberGithubToken) {
+          const statusResult = await refetchTokenStatus();
+          if (statusResult.data?.tokenOnFile) {
+            setTokenSavedIndicator(true);
+            setTimeout(() => setTokenSavedIndicator(false), 2500);
+            setGithubToken("");
+            setShowTokenInput(false);
+          }
+        }
 
-  const demoMutation = useLoadDemoRepo({
-    mutation: {
-      onSuccess: () => setLocation("/city"),
-      onError: () => toast({ title: "Error", description: "Failed to load demo", variant: "destructive" }),
+        toast({
+          title: "Failed to load repository",
+          description: err.message || "Could not fetch repo. Check the URL and token.",
+          variant: "destructive",
+        });
+      },
     },
   });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!repoUrl) return;
+
+    const token = githubToken.trim();
+    const payload: Record<string, unknown> = {
+      repoUrl,
+      rememberGithubToken,
+    };
+    if (token) payload.githubToken = token;
+
     loadMutation.mutate({
-      data: {
-        repoUrl,
-        ...(githubToken ? { githubToken } : {}),
-      },
+      data: payload as any,
     });
   };
 
   const handleQuickLoad = (repo: RepoListItem) => {
     setRepoUrl(repo.repoUrl ?? "");
+    const token = githubToken.trim();
+    const payload: Record<string, unknown> = {
+      repoUrl: repo.repoUrl ?? "",
+      rememberGithubToken,
+    };
+    if (token) payload.githubToken = token;
+
     loadMutation.mutate({
-      data: {
-        repoUrl: repo.repoUrl ?? "",
-        ...(githubToken ? { githubToken } : {}),
-      },
+      data: payload as any,
     });
   };
 
@@ -165,7 +207,7 @@ export function Landing() {
         body: JSON.stringify({ localPath }),
       });
       if (!res.ok) throw new Error("Watch failed");
-      persist(repoUrl, githubToken, localPath);
+      persist(repoUrl, localPath);
       setWatchStatus("watching");
       toast({ title: "Watching local folder", description: localPath });
       setLocation("/city");
@@ -319,6 +361,11 @@ export function Landing() {
                         <span className={healthColor(repo.healthScore ?? 0)}>
                           {repo.healthScore ?? 0}%
                         </span>
+                        {repo.hasTokenOnFile && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400 border border-green-500/30 uppercase tracking-widest">
+                            token on file
+                          </span>
+                        )}
                         {repo.isActive && (
                           <span className="px-1.5 py-0.5 rounded text-[9px] bg-primary/20 text-primary border border-primary/30 uppercase tracking-widest">
                             active
@@ -381,8 +428,11 @@ export function Landing() {
 
                 <p className="text-[11px] font-mono text-muted-foreground/50 flex items-center gap-1.5">
                   <Save size={10} />
-                  Repo URL and token are automatically saved in your browser for next time.
+                  Repo URL and local watch path are saved in your browser for next time.
                 </p>
+                {tokenSavedIndicator && (
+                  <p className="text-[11px] font-mono text-green-400">Token saved ✓</p>
+                )}
               </div>
 
               <div>
@@ -393,9 +443,9 @@ export function Landing() {
                 >
                   {showAdvanced ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                   {showAdvanced ? "Hide" : "Private repo?"} — GitHub token
-                  {localStorage.getItem(LS_TOKEN) && (
+                  {tokenOnFile && (
                     <span className="ml-1 px-1.5 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400 border border-green-500/30 font-mono uppercase tracking-widest">
-                      saved
+                      Token on file ✓
                     </span>
                   )}
                 </button>
@@ -410,33 +460,62 @@ export function Landing() {
                       className="overflow-hidden"
                     >
                       <div className="mt-3 p-4 rounded-lg border border-primary/20 bg-black/30 space-y-3">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-mono text-primary/80 uppercase tracking-widest flex items-center gap-2">
-                            <KeyRound size={12} /> GitHub Personal Access Token
-                          </label>
-                          <div className="relative group">
-                            <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={16} />
-                            <Input
-                              type="password"
-                              placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                              value={githubToken}
-                              onChange={(e) => setGithubToken(e.target.value)}
-                              className="pl-9 h-10 bg-black/50 border-primary/20 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/40"
-                            />
-                            {githubToken && (
-                              <button
-                                type="button"
-                                onClick={() => setGithubToken("")}
-                                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-red-400 transition-colors"
-                                title="Clear token"
-                              >
-                                <X size={13} />
-                              </button>
-                            )}
+                        {!shouldShowTokenInput ? (
+                          <div className="flex items-center justify-between gap-3 rounded border border-green-500/30 bg-green-500/10 px-3 py-2">
+                            <div className="text-xs font-mono text-green-400">
+                              Token on file ✓
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setShowTokenInput(true)}
+                              className="text-[11px] font-mono text-primary hover:text-primary/80 underline"
+                            >
+                              Update
+                            </button>
                           </div>
-                        </div>
+                        ) : (
+                          <>
+                            <div className="space-y-1.5">
+                              <label className="text-xs font-mono text-primary/80 uppercase tracking-widest flex items-center gap-2">
+                                <KeyRound size={12} /> GitHub Personal Access Token
+                              </label>
+                              <div className="relative group">
+                                <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground group-focus-within:text-primary transition-colors" size={16} />
+                                <Input
+                                  type="password"
+                                  placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                                  value={githubToken}
+                                  onChange={(e) => setGithubToken(e.target.value)}
+                                  className="pl-9 h-10 bg-black/50 border-primary/20 focus-visible:ring-primary font-mono text-sm text-white placeholder:text-muted-foreground/40"
+                                />
+                                {githubToken && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setGithubToken("")}
+                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-red-400 transition-colors"
+                                    title="Clear token"
+                                  >
+                                    <X size={13} />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            <label className="flex items-center gap-2 text-xs font-mono text-muted-foreground">
+                              <input
+                                type="checkbox"
+                                checked={rememberGithubToken}
+                                onChange={(e) => setRememberGithubToken(e.target.checked)}
+                                className="h-3.5 w-3.5 rounded border border-primary/40 bg-black/40"
+                              />
+                              Remember this token
+                            </label>
+
+                          </>
+                        )}
+
                         <div className="text-[11px] font-mono text-muted-foreground/70 space-y-1 leading-relaxed">
-                          <p>Your token is stored only in your browser's local storage — never sent anywhere except your own server.</p>
+                          <p>Your token is encrypted and saved by your own server. It is never shown back in full after saving.</p>
                           <p>
                             <a
                               href="https://github.com/settings/tokens/new?scopes=repo&description=SoftwareCity"
@@ -453,23 +532,6 @@ export function Landing() {
                   )}
                 </AnimatePresence>
               </div>
-
-              <div className="relative flex items-center py-1">
-                <div className="flex-grow border-t border-border/50"></div>
-                <span className="flex-shrink-0 mx-4 text-muted-foreground font-mono text-xs uppercase">or</span>
-                <div className="flex-grow border-t border-border/50"></div>
-              </div>
-
-              <Button
-                type="button"
-                variant="outline"
-                className="w-full h-12 group hover:bg-primary/5 border-primary/30"
-                onClick={() => demoMutation.mutate()}
-                disabled={demoMutation.isPending}
-              >
-                <Play size={16} className="mr-2 text-primary group-hover:text-primary animate-pulse" />
-                <span className="text-foreground">Run Demo Simulation</span>
-              </Button>
 
               <div className="relative flex items-center py-1">
                 <div className="flex-grow border-t border-border/50"></div>
@@ -508,8 +570,7 @@ export function Landing() {
           </div>
 
           <div className="mt-8 flex justify-center gap-8 text-xs font-mono text-muted-foreground/60">
-            <div className="flex items-center gap-2"><Flame size={12} className="text-orange-400" /> Bugs as fires</div>
-            <div className="flex items-center gap-2"><Bot size={12} className="text-primary" /> AI agent patrols</div>
+            <div className="flex items-center gap-2"><Bot size={12} className="text-primary" /> Agent-assisted inspection</div>
             <div className="flex items-center gap-2"><Building2 size={12} className="text-green-400" /> 1 file = 1 building</div>
           </div>
         </motion.div>

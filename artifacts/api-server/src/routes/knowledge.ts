@@ -1,79 +1,40 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
-import { knowledgeTable } from "@workspace/db/schema";
-import { desc, asc, count, sql, eq, like, or } from "drizzle-orm";
+import { knowledgeTable, eventsTable } from "@workspace/db/schema";
+import { desc, asc, count, sql, eq, like, or, inArray } from "drizzle-orm";
+import { getKbSessionStats } from "../lib/sessionStats";
+import { getVectorCacheSize } from "../lib/vectorSearch";
+import { isEmbeddingModelLoaded } from "../lib/embeddings";
 
 const router: IRouter = Router();
 
-async function seedKnowledgeBase() {
-  const existing = await db.select({ count: count() }).from(knowledgeTable);
-  if (existing[0].count > 0) return;
+const LEGACY_SEED_CONTEXT_HASHES = ["abc123", "def456", "ghi789", "jkl012", "mno345"];
+let cleanedLegacySeedKnowledge = false;
 
-  const entries = [
-    {
-      problemType: "test_generation", language: "typescript", framework: "express",
-      patternTags: JSON.stringify(["null_check", "async"]), fileType: "api",
-      question: "How do I test async API endpoints with proper error handling?",
-      contextHash: "abc123",
-      codeSnippet: "async function handler(req, res) { const data = await db.find(req.params.id); }",
-      answer: "Use Jest with supertest for API testing. Wrap async handlers in try-catch. Test both success and error paths. Mock the database layer.",
-      actionItems: JSON.stringify(["Add try-catch to handler", "Test 404 case", "Mock db.find", "Add timeout tests"]),
-      confidence: "high", provider: "claude", useCount: 5, wasUseful: 1, producedBugs: 3, qualityScore: 0.75,
-    },
-    {
-      problemType: "bug_analysis", language: "javascript", framework: "unknown",
-      patternTags: JSON.stringify(["race_condition", "async"]), fileType: "source",
-      question: "Why does my Promise chain produce inconsistent results?",
-      contextHash: "def456",
-      codeSnippet: "let result; setTimeout(() => { result = fetch(); }, 100); console.log(result);",
-      answer: "Classic async race condition. The setTimeout callback runs after console.log. Use async/await or ensure result is read inside the callback.",
-      actionItems: JSON.stringify(["Convert to async/await", "Move console.log inside callback", "Add Promise.all for parallel calls"]),
-      confidence: "high", provider: "claude", useCount: 12, wasUseful: 1, producedBugs: 8, qualityScore: 0.88,
-    },
-    {
-      problemType: "test_generation", language: "python", framework: "fastapi",
-      patternTags: JSON.stringify(["edge_case", "type_error"]), fileType: "api",
-      question: "How to test FastAPI endpoints with authentication?",
-      contextHash: "ghi789",
-      codeSnippet: "@app.get('/users/{id}') async def get_user(id: int, token: str = Depends(get_token)):",
-      answer: "Use TestClient from FastAPI. Override dependencies with app.dependency_overrides. Test with valid and invalid tokens. Test with non-existent IDs.",
-      actionItems: JSON.stringify(["Use TestClient", "Override auth dependency", "Test 401 and 403 responses", "Test with boundary IDs"]),
-      confidence: "high", provider: "groq", useCount: 7, wasUseful: 1, producedBugs: 4, qualityScore: 0.72,
-    },
-    {
-      problemType: "architecture", language: "typescript", framework: "express",
-      patternTags: JSON.stringify(["memory_leak", "api_abuse"]), fileType: "api",
-      question: "How do I detect memory leaks in Express middleware?",
-      contextHash: "jkl012",
-      codeSnippet: "app.use((req, res, next) => { const data = heavyObject(); next(); });",
-      answer: "Memory leaks in middleware often occur from closures holding references. Use node --inspect to profile. Look for unclosed streams, event listener accumulation, and cache that never clears.",
-      actionItems: JSON.stringify(["Profile with --inspect", "Check event listeners", "Add cache size limits", "Use weak references"]),
-      confidence: "medium", provider: "claude", useCount: 3, wasUseful: 1, producedBugs: 2, qualityScore: 0.55,
-    },
-    {
-      problemType: "test_generation", language: "python", framework: "pytest",
-      patternTags: JSON.stringify(["sql_injection", "auth"]), fileType: "database",
-      question: "How to test SQL injection vulnerabilities in Python?",
-      contextHash: "mno345",
-      codeSnippet: "def get_user(username): return db.execute(f'SELECT * FROM users WHERE name={username}')",
-      answer: "Never use f-strings for SQL! Use parameterized queries. Test with: single quotes, semicolons, UNION SELECT payloads, and NULL bytes. Use sqlmap for automated testing.",
-      actionItems: JSON.stringify(["Replace f-string with parameterized query", "Test with ' OR 1=1 --", "Test with UNION SELECT NULL--", "Use sqlmap on staging"]),
-      confidence: "high", provider: "claude", useCount: 9, wasUseful: 1, producedBugs: 6, qualityScore: 0.83,
-    },
-  ];
+async function purgeLegacySeedKnowledgeEntries(): Promise<void> {
+  if (cleanedLegacySeedKnowledge) return;
 
-  for (const entry of entries) {
-    await db.insert(knowledgeTable).values(entry as any);
-  }
+  await db.delete(knowledgeTable).where(
+    inArray(knowledgeTable.contextHash, LEGACY_SEED_CONTEXT_HASHES)
+  );
+
+  cleanedLegacySeedKnowledge = true;
 }
 
 router.get("/stats", async (_req, res) => {
   try {
-    await seedKnowledgeBase();
+    await purgeLegacySeedKnowledgeEntries();
+
     const rows = await db.select({
       count: count(),
       totalHits: sql<number>`sum(${knowledgeTable.useCount})`,
+      totalProducedBugs: sql<number>`sum(${knowledgeTable.producedBugs})`,
     }).from(knowledgeTable);
+
+    const eventRows = await db.select({
+      total: count(),
+      escalations: sql<number>`sum(case when ${eventsTable.type} = 'escalation' then 1 else 0 end)`,
+    }).from(eventsTable);
 
     const topProblems = await db
       .select({ type: knowledgeTable.problemType, count: count() })
@@ -83,11 +44,14 @@ router.get("/stats", async (_req, res) => {
 
     const totalEntries = rows[0]?.count ?? 0;
     const totalCacheHits = Number(rows[0]?.totalHits ?? 0);
+    const totalProducedBugs = Number(rows[0]?.totalProducedBugs ?? 0);
+    const totalEvents = Number(eventRows[0]?.total ?? 0);
+    const escalationEvents = Number(eventRows[0]?.escalations ?? 0);
 
     res.json({
       totalEntries, totalCacheHits,
-      avgBugsPerEntry: totalEntries > 0 ? (totalCacheHits * 0.05) : 0,
-      escalationRate: totalEntries > 10 ? 0.02 : 0.06,
+      avgBugsPerEntry: totalEntries > 0 ? totalProducedBugs / totalEntries : 0,
+      escalationRate: totalEvents > 0 ? escalationEvents / totalEvents : 0,
       topProblems: topProblems.map(p => ({ type: p.type, count: p.count })),
     });
   } catch (error) {
@@ -96,9 +60,18 @@ router.get("/stats", async (_req, res) => {
   }
 });
 
+router.get("/session-stats", (_req, res) => {
+  const stats = getKbSessionStats();
+  res.json({
+    ...stats,
+    vectorCacheSize: getVectorCacheSize(),
+    modelLoaded: isEmbeddingModelLoaded(),
+  });
+});
+
 router.get("/entries", async (req, res) => {
   try {
-    await seedKnowledgeBase();
+    await purgeLegacySeedKnowledgeEntries();
 
     const sortParam = typeof req.query["sort"] === "string" ? req.query["sort"] : "quality";
     const page = Math.max(1, parseInt(typeof req.query["page"] === "string" ? req.query["page"] : "1"));
@@ -136,6 +109,8 @@ router.get("/entries", async (req, res) => {
 
 router.get("/search", async (req, res) => {
   try {
+    await purgeLegacySeedKnowledgeEntries();
+
     const q = typeof req.query["q"] === "string" ? req.query["q"].trim() : "";
     const limit = Math.min(50, parseInt(typeof req.query["limit"] === "string" ? req.query["limit"] : "20"));
 
@@ -247,6 +222,8 @@ router.delete("/:id", async (req, res): Promise<void> => {
 
 router.get("/export", async (_req, res) => {
   try {
+    await purgeLegacySeedKnowledgeEntries();
+
     const entries = await db.select().from(knowledgeTable).orderBy(desc(knowledgeTable.qualityScore));
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Content-Disposition", `attachment; filename="knowledge-base-${Date.now()}.json"`);

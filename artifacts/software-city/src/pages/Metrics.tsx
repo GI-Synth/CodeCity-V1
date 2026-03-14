@@ -46,6 +46,18 @@ interface CityHealth {
   testFileRatio: number;
 }
 
+interface KnowledgeSessionStats {
+  kbHits: number;
+  kbMisses: number;
+  kbHitRate: number;
+  totalEscalations: number;
+  vectorHits: number;
+  keywordHits: number;
+  avgSimilarity: number;
+  vectorCacheSize: number;
+  modelLoaded: boolean;
+}
+
 function StatCard({
   label,
   value,
@@ -194,6 +206,16 @@ export function Metrics() {
     refetchInterval: 15_000,
   });
 
+  const { data: knowledgeSessionStats } = useQuery<KnowledgeSessionStats>({
+    queryKey: ["knowledgeSessionStats"],
+    queryFn: async () => {
+      const res = await fetch("/api/knowledge/session-stats");
+      if (!res.ok) throw new Error("Failed to fetch knowledge session stats");
+      return res.json() as Promise<KnowledgeSessionStats>;
+    },
+    refetchInterval: 10_000,
+  });
+
   const snapshots = history?.snapshots ?? [];
   const healthChartData = snapshots.map(s => ({ time: s.timestamp, value: s.healthScore }));
   const agentsChartData = snapshots.map(s => ({ time: s.timestamp, value: s.activeAgents }));
@@ -208,6 +230,11 @@ export function Metrics() {
   const memMb = live?.memoryUsage ?? lastSnap?.memoryMb ?? 0;
   const kbHits = live?.knowledgeBaseHits ?? 0;
   const escalations = live?.escalations ?? lastSnap?.escalationsToday ?? 0;
+  const vectorCacheSize = knowledgeSessionStats?.vectorCacheSize ?? 0;
+  const vectorHits = knowledgeSessionStats?.vectorHits ?? 0;
+  const keywordHits = knowledgeSessionStats?.keywordHits ?? 0;
+  const avgSimilarityPercent = ((knowledgeSessionStats?.avgSimilarity ?? 0) * 100).toFixed(1);
+  const modelLoaded = knowledgeSessionStats?.modelLoaded ?? false;
 
   const season = health?.season ?? "summer";
   const seasonEmoji = season === "winter" ? "❄️" : season === "fall" ? "🍂" : season === "spring" ? "🌱" : "☀️";
@@ -369,6 +396,32 @@ export function Metrics() {
               ) : (
                 <div className="text-muted-foreground text-sm font-mono">Loading city health…</div>
               )}
+            </div>
+          </div>
+
+          <div className="glass-panel rounded-xl border border-border/50 p-5 space-y-3">
+            <h2 className="text-sm font-mono font-bold text-primary uppercase tracking-wider">Knowledge Search</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm font-mono">
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">Vector search</div>
+                <div className="mt-1 text-foreground">{vectorCacheSize} entries indexed</div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">Model status</div>
+                <div className={cn("mt-1", modelLoaded ? "text-green-400" : "text-orange-400")}>
+                  {modelLoaded ? "Loaded" : "Loading"}
+                </div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3 md:col-span-2">
+                <div className="text-muted-foreground">Semantic hits</div>
+                <div className="mt-1 text-foreground">
+                  Semantic hits: {vectorHits} | Keyword hits: {keywordHits}
+                </div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3 md:col-span-2">
+                <div className="text-muted-foreground">Avg similarity</div>
+                <div className="mt-1 text-foreground">{avgSimilarityPercent}%</div>
+              </div>
             </div>
           </div>
         </div>

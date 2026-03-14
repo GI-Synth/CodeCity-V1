@@ -1,21 +1,239 @@
 import { db } from "@workspace/db";
-import { knowledgeTable } from "@workspace/db/schema";
-import { eq } from "drizzle-orm";
+import { DEFAULT_SETTINGS, knowledgeTable, settingsTable } from "@workspace/db/schema";
+import { eq, inArray } from "drizzle-orm";
 import { buildEscalationPrompt, buildDialoguePrompt } from "./ollamaPrompts";
 import { ollamaClient } from "./ollamaClient";
+import { anonymizeForKB, anonymizeCodeForAI } from "./anonymize";
+import { recordEscalationAttempt, recordKbHit, recordKbMiss, recordKbSave } from "./sessionStats";
+import { addToCache, hybridSearch } from "./vectorSearch";
+import { embed } from "./embeddings";
+import {
+  buildRolePrompt,
+  mapRoleToPersona,
+  parseRoleResponse,
+  type AgentPersona,
+  type BugStyleFinding,
+  type ScribeRecommendation,
+} from "./smartAgents";
+
+function logEscalation(step: string, details: string): void {
+  console.log(`[Escalation] ${step} ${details}`);
+}
+
+function preview(text: string, max = 220): string {
+  return text.replace(/\s+/g, " ").slice(0, max);
+}
+
+interface EscalationModelSettings {
+  ollamaFastModel: string;
+  ollamaPrimaryModel: string;
+  groqModel: string;
+  openrouterModel: string;
+  anthropicModel: string;
+  orchestratorModel: string;
+}
+
+const ESCALATION_MODEL_KEYS = [
+  "ollama_fast_model",
+  "ollama_primary_model",
+  "groq_model",
+  "openrouter_model",
+  "anthropic_model",
+  "orchestrator_model",
+] as const;
+
+const ESCALATION_MODEL_DEFAULTS: EscalationModelSettings = {
+  ollamaFastModel: DEFAULT_SETTINGS["ollama_fast_model"],
+  ollamaPrimaryModel: DEFAULT_SETTINGS["ollama_primary_model"],
+  groqModel: DEFAULT_SETTINGS["groq_model"],
+  openrouterModel: DEFAULT_SETTINGS["openrouter_model"],
+  anthropicModel: DEFAULT_SETTINGS["anthropic_model"],
+  orchestratorModel: DEFAULT_SETTINGS["orchestrator_model"],
+};
+
+function normalizeGroqModel(model: string): string {
+  // Groq retired some 3.1 variants; map legacy defaults to an available modern equivalent.
+  if (model === "llama-3.1-70b-versatile") return "llama-3.3-70b-versatile";
+  return model;
+}
+
+async function readEscalationModelSettings(): Promise<EscalationModelSettings> {
+  try {
+    const rows = await db
+      .select({ key: settingsTable.key, value: settingsTable.value })
+      .from(settingsTable)
+      .where(inArray(settingsTable.key, [...ESCALATION_MODEL_KEYS]));
+
+    const map = new Map<string, string>();
+    for (const row of rows) map.set(row.key, row.value);
+
+    return {
+      ollamaFastModel: map.get("ollama_fast_model") ?? ESCALATION_MODEL_DEFAULTS.ollamaFastModel,
+      ollamaPrimaryModel: map.get("ollama_primary_model") ?? ESCALATION_MODEL_DEFAULTS.ollamaPrimaryModel,
+      groqModel: normalizeGroqModel(map.get("groq_model") ?? ESCALATION_MODEL_DEFAULTS.groqModel),
+      openrouterModel: map.get("openrouter_model") ?? ESCALATION_MODEL_DEFAULTS.openrouterModel,
+      anthropicModel: map.get("anthropic_model") ?? ESCALATION_MODEL_DEFAULTS.anthropicModel,
+      orchestratorModel: map.get("orchestrator_model") ?? ESCALATION_MODEL_DEFAULTS.orchestratorModel,
+    };
+  } catch {
+    return {
+      ...ESCALATION_MODEL_DEFAULTS,
+      groqModel: normalizeGroqModel(ESCALATION_MODEL_DEFAULTS.groqModel),
+    };
+  }
+}
+// --- OpenRouter client ---
+async function callOpenRouter(req: EscalationRequest, attempts: string[], model: string): Promise<EscalationResult | null> {
+  const key = process.env["OPENROUTER_API_KEY"];
+  if (!key) {
+    logEscalation("openrouter.skip", "reason=missing_key");
+    return null;
+  }
+
+  // Anonymize question/code for privacy
+  const question = anonymizeForKB(req.question);
+  const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
+  const { system, prompt } = buildEscalationPrompt(question, codeSnippet, attempts);
+
+  try {
+    logEscalation("openrouter.request", `model=${model} language=${req.language}`);
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 600,
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      logEscalation("openrouter.response", `status=${res.status} body="${preview(body, 260)}"`);
+      return null;
+    }
+    const data = await res.json() as { choices?: Array<{ message: { content: string } }> };
+    const content = data.choices?.[0]?.message?.content ?? "";
+    const parsed = parseJsonResponse(content);
+    if (!parsed) {
+      logEscalation("openrouter.parse", "status=failed");
+      return null;
+    }
+    logEscalation("openrouter.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
+    return { ...parsed, source: "openrouter" };
+  } catch {
+    logEscalation("openrouter.error", "status=exception");
+    return null;
+  }
+}
 
 export interface EscalationRequest {
   question: string;
   codeSnippet: string;
   language: string;
   failedAttempts?: string[];
+  agentRole?: string;
+  filePath?: string;
+  consultationContext?: string;
 }
 
 export interface EscalationResult {
   answer: string;
   confidence: number;
   action_items: string[];
-  source: "knowledge_base" | "ollama" | "groq" | "anthropic" | "fallback";
+  source: "knowledge_base" | "ollama" | "groq" | "anthropic" | "openrouter" | "fallback";
+  searchType?: "vector" | "keyword";
+  finding?: string | null;
+  lineReference?: string | null;
+  severity?: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+  functionName?: string | null;
+  cveReference?: string | null;
+  estimatedPerformanceImpact?: string | null;
+  couplingImports?: string[];
+  testType?: "unit" | "integration" | "e2e";
+  priority?: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+}
+
+export type FindingSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+
+function normalizeSeverityToken(raw: string): FindingSeverity | null {
+  const token = raw.trim().toUpperCase();
+  if (token === "CRITICAL" || token === "HIGH" || token === "MEDIUM" || token === "LOW") return token;
+  return null;
+}
+
+function classifyFindingSeverityByKeywords(finding: string): FindingSeverity {
+  const lower = finding.toLowerCase();
+
+  if (/(security|injection|auth|data\s+loss|crash|vulnerability|exploit)/.test(lower)) return "CRITICAL";
+  if (/(undefined|null|throw|exception|panic)/.test(lower)) return "HIGH";
+  if (/(performance|slow|memory|loop|latency|n\+1)/.test(lower)) return "MEDIUM";
+  return "LOW";
+}
+
+export async function classifyFindingSeverity(params: {
+  finding: string;
+  filePath: string;
+}): Promise<FindingSeverity> {
+  const fallback = classifyFindingSeverityByKeywords(`${params.finding} ${params.filePath}`);
+  const key = process.env["GROQ_API_KEY"];
+  if (!key) {
+    logEscalation("severity.fallback", "reason=missing_groq_key");
+    return fallback;
+  }
+
+  try {
+    const models = await readEscalationModelSettings();
+    const prompt = [
+      "Classify this finding severity: CRITICAL/HIGH/MEDIUM/LOW.",
+      `Finding: ${params.finding}`,
+      `File: ${params.filePath}`,
+      "Return only one word.",
+    ].join("\n");
+
+    logEscalation("severity.groq.request", `model=${models.groqModel} file=${params.filePath}`);
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: models.groqModel,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 8,
+        temperature: 0,
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      logEscalation("severity.groq.response", `status=${res.status} body="${preview(body, 200)}"`);
+      return fallback;
+    }
+
+    const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const content = (data.choices?.[0]?.message?.content ?? "").trim();
+    const firstWord = content.split(/\s+/)[0] ?? "";
+
+    const severity = normalizeSeverityToken(firstWord) ?? normalizeSeverityToken(content);
+    if (!severity) {
+      logEscalation("severity.groq.parse", `status=failed raw="${preview(content, 80)}"`);
+      return fallback;
+    }
+
+    logEscalation("severity.groq.success", `severity=${severity}`);
+    return severity;
+  } catch {
+    logEscalation("severity.fallback", "reason=request_failed");
+    return fallback;
+  }
 }
 
 function wordSimilarity(a: string, b: string): number {
@@ -27,33 +245,51 @@ function wordSimilarity(a: string, b: string): number {
   return matches / Math.max(wordsA.size, wordsB.size);
 }
 
+function parseActionItems(raw: string | null): string[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function searchKnowledgeBase(req: EscalationRequest): Promise<EscalationResult | null> {
   try {
-    const entries = await db.select().from(knowledgeTable)
-      .where(eq(knowledgeTable.language, req.language))
-      .limit(50);
-
-    let best: (typeof entries)[0] | null = null;
-    let bestSim = 0;
-
-    for (const entry of entries) {
-      const sim = wordSimilarity(req.question, entry.question ?? "");
-      if (sim > bestSim) { bestSim = sim; best = entry; }
+    logEscalation("kb.search", `language=${req.language} question="${preview(req.question, 120)}"`);
+    const results = await hybridSearch(req.question, 3, { language: req.language });
+    if (results.length === 0) {
+      logEscalation("kb.miss", "bestSimilarity=0.00");
+      return null;
     }
 
-    if (best && bestSim >= 0.65) {
+    const best = results[0];
+    if (best.similarity >= 0.65) {
       await db.update(knowledgeTable)
-        .set({ useCount: (best.useCount ?? 0) + 1 })
-        .where(eq(knowledgeTable.id, best.id));
+        .set({ useCount: (best.entry.useCount ?? 0) + 1 })
+        .where(eq(knowledgeTable.id, best.entry.id));
 
-      const confidenceNum = parseFloat(best.confidence ?? "0.7");
+      recordKbHit(best.source, best.similarity);
+
+      console.log(
+        `[KB] Hit via ${best.source} search ` +
+        `(similarity: ${(best.similarity * 100).toFixed(1)}%): ` +
+        `${best.entry.question.slice(0, 60)}`,
+      );
+
+      logEscalation("kb.hit", `entryId=${best.entry.id} similarity=${best.similarity.toFixed(2)} source=${best.source}`);
       return {
-        answer: best.answer ?? "",
-        confidence: isNaN(confidenceNum) ? 0.7 : confidenceNum,
-        action_items: best.actionItems ? (() => { try { return JSON.parse(best.actionItems!); } catch { return []; } })() : [],
+        answer: best.entry.answer ?? "",
+        confidence: best.similarity,
+        action_items: parseActionItems(best.entry.actionItems),
         source: "knowledge_base",
+        searchType: best.source,
       };
     }
+
+    logEscalation("kb.miss", `bestSimilarity=${best.similarity.toFixed(2)}`);
   } catch { }
   return null;
 }
@@ -73,13 +309,32 @@ function parseJsonResponse(text: string): { answer: string; confidence: number; 
   return null;
 }
 
-async function callGroq(req: EscalationRequest, attempts: string[]): Promise<EscalationResult | null> {
+async function callGroq(req: EscalationRequest, attempts: string[], model: string): Promise<EscalationResult | null> {
   const key = process.env["GROQ_API_KEY"];
-  if (!key) return null;
+  if (!key) {
+    logEscalation("groq.skip", "reason=missing_key");
+    return null;
+  }
 
-  const { system, prompt } = buildEscalationPrompt(req.question, req.codeSnippet, attempts);
+  // Anonymize question/code for privacy
+  const question = anonymizeForKB(req.question);
+  const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
+  const persona: AgentPersona | null = req.agentRole ? mapRoleToPersona(req.agentRole) : null;
+  const rolePrompt = persona && persona !== "alchemist"
+    ? buildRolePrompt({
+      persona,
+      language: req.language,
+      filePath: req.filePath ?? "unknown.ts",
+      codeSnippet,
+      context: req.consultationContext,
+    })
+    : null;
+  const { system, prompt } = rolePrompt
+    ? rolePrompt
+    : buildEscalationPrompt(question, codeSnippet, attempts);
 
   try {
+    logEscalation("groq.request", `model=${model} language=${req.language} keyPresent=true`);
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -87,7 +342,7 @@ async function callGroq(req: EscalationRequest, attempts: string[]): Promise<Esc
         "Authorization": `Bearer ${key}`,
       },
       body: JSON.stringify({
-        model: "llama-3.1-70b-versatile",
+        model,
         messages: [
           { role: "system", content: system },
           { role: "user", content: prompt },
@@ -96,24 +351,81 @@ async function callGroq(req: EscalationRequest, attempts: string[]): Promise<Esc
       }),
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      logEscalation("groq.response", `status=${res.status} body="${preview(body, 260)}"`);
+      return null;
+    }
     const data = await res.json() as { choices?: Array<{ message: { content: string } }> };
     const content = data.choices?.[0]?.message?.content ?? "";
+    if (rolePrompt && persona && persona !== "alchemist") {
+      const structured = parseRoleResponse(persona, content);
+      if (structured) {
+        if (persona === "scribe") {
+          const scribe = structured as ScribeRecommendation;
+          const answer = `Prioritize tests for ${scribe.functionName}: ${scribe.reason}`;
+          logEscalation("groq.success", `role=${persona} confidence=${scribe.confidence.toFixed(2)} response="${preview(answer)}"`);
+          return {
+            answer,
+            confidence: scribe.confidence,
+            action_items: [`Write a ${scribe.testType} test for ${scribe.functionName}`, scribe.reason],
+            source: "groq",
+            functionName: scribe.functionName,
+            testType: scribe.testType,
+            priority: scribe.priority,
+            finding: null,
+          };
+        }
+
+        const finding = structured as BugStyleFinding;
+        const answer = finding.finding ?? "No concrete bug found.";
+        logEscalation("groq.success", `role=${persona} confidence=${finding.confidence.toFixed(2)} response="${preview(answer)}"`);
+        return {
+          answer,
+          confidence: finding.confidence,
+          action_items: [
+            finding.finding ? `Investigate ${finding.functionName ?? "the referenced function"}` : "No verified issue found",
+            finding.lineReference ?? "No line reference provided",
+          ],
+          source: "groq",
+          finding: finding.finding,
+          lineReference: finding.lineReference,
+          severity: finding.severity,
+          functionName: finding.functionName,
+          cveReference: finding.cveReference ?? null,
+          estimatedPerformanceImpact: finding.estimatedPerformanceImpact ?? null,
+          couplingImports: finding.couplingImports ?? [],
+        };
+      }
+    }
+
     const parsed = parseJsonResponse(content);
-    if (!parsed) return null;
+    if (!parsed) {
+      logEscalation("groq.parse", "status=failed");
+      return null;
+    }
+    logEscalation("groq.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "groq" };
   } catch {
+    logEscalation("groq.error", "status=exception");
     return null;
   }
 }
 
-async function callAnthropic(req: EscalationRequest, attempts: string[]): Promise<EscalationResult | null> {
+async function callAnthropic(req: EscalationRequest, attempts: string[], model: string): Promise<EscalationResult | null> {
   const key = process.env["ANTHROPIC_API_KEY"];
-  if (!key) return null;
+  if (!key) {
+    logEscalation("anthropic.skip", "reason=missing_key");
+    return null;
+  }
 
-  const { system, prompt } = buildEscalationPrompt(req.question, req.codeSnippet, attempts);
+  // Anonymize question/code for privacy
+  const question = anonymizeForKB(req.question);
+  const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
+  const { system, prompt } = buildEscalationPrompt(question, codeSnippet, attempts);
 
   try {
+    logEscalation("anthropic.request", `model=${model} language=${req.language}`);
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -122,32 +434,48 @@ async function callAnthropic(req: EscalationRequest, attempts: string[]): Promis
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model,
         system,
         messages: [{ role: "user", content: prompt }],
         max_tokens: 600,
       }),
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      logEscalation("anthropic.response", `status=${res.status} body="${preview(body, 260)}"`);
+      return null;
+    }
     const data = await res.json() as { content?: Array<{ text: string }> };
     const content = data.content?.[0]?.text ?? "";
     const parsed = parseJsonResponse(content);
-    if (!parsed) return null;
+    if (!parsed) {
+      logEscalation("anthropic.parse", "status=failed");
+      return null;
+    }
+    logEscalation("anthropic.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "anthropic" };
   } catch {
+    logEscalation("anthropic.error", "status=exception");
     return null;
   }
 }
 
-async function callOllama(req: EscalationRequest, attempts: string[]): Promise<EscalationResult | null> {
+async function callOllama(req: EscalationRequest, attempts: string[], model: string): Promise<EscalationResult | null> {
   try {
     const available = await ollamaClient.isAvailable();
-    if (!available) return null;
+    if (!available) {
+      logEscalation("ollama.skip", "reason=unavailable");
+      return null;
+    }
 
-    const { system, prompt } = buildEscalationPrompt(req.question, req.codeSnippet, attempts);
+    // Anonymize question/code for privacy
+    const question = anonymizeForKB(req.question);
+    const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
+    const { system, prompt } = buildEscalationPrompt(question, codeSnippet, attempts);
+    logEscalation("ollama.request", `model=${model} language=${req.language}`);
     const text = await ollamaClient.generate({
-      model: "deepseek-coder-v2:16b",
+      model,
       system,
       prompt,
       temperature: 0.3,
@@ -155,9 +483,14 @@ async function callOllama(req: EscalationRequest, attempts: string[]): Promise<E
     });
 
     const parsed = parseJsonResponse(text);
-    if (!parsed) return null;
+    if (!parsed) {
+      logEscalation("ollama.parse", "status=failed");
+      return null;
+    }
+    logEscalation("ollama.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "ollama" };
   } catch {
+    logEscalation("ollama.error", "status=exception");
     return null;
   }
 }
@@ -191,48 +524,139 @@ async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationRes
       await db.update(knowledgeTable)
         .set({ useCount: newUseCount, answer: result.answer.slice(0, 2000), confidence: newConfidence, lastUsed: new Date().toISOString(), qualityScore: qs })
         .where(eq(knowledgeTable.id, bestMatch.id));
+
+      // Backfill a vector immediately if this reused row predates embeddings.
+      if (!bestMatch.embedding) {
+        try {
+          const text = `${bestMatch.question} ${result.answer}`.slice(0, 512);
+          const vector = await embed(text);
+          await db.update(knowledgeTable)
+            .set({ embedding: JSON.stringify(vector) })
+            .where(eq(knowledgeTable.id, bestMatch.id));
+
+          const updatedEntry = {
+            ...bestMatch,
+            answer: result.answer.slice(0, 2000),
+            confidence: newConfidence,
+            useCount: newUseCount,
+            qualityScore: qs,
+            embedding: JSON.stringify(vector),
+            lastUsed: new Date().toISOString(),
+          };
+          addToCache(bestMatch.id, vector, updatedEntry);
+        } catch (error) {
+          console.warn("[Embeddings] Failed to backfill reused KB entry:", error);
+        }
+      }
+
+      recordKbSave();
       return;
     }
 
     const qs = computeQualityScore(1, String(result.confidence), 0);
-    await db.insert(knowledgeTable).values({
+    const inserted = await db.insert(knowledgeTable).values({
       problemType: "test_generation",
       language: req.language,
       question: req.question.slice(0, 500),
       answer: result.answer.slice(0, 2000),
       confidence: String(result.confidence),
       provider: result.source,
+      domain: "general",
       actionItems: JSON.stringify(result.action_items),
       useCount: 1,
       producedBugs: 0,
       qualityScore: qs,
-    });
+    }).returning({ id: knowledgeTable.id });
+
+    const insertedId = inserted[0]?.id;
+    if (insertedId) {
+      try {
+        const text = `${req.question} ${result.answer}`.slice(0, 512);
+        const vector = await embed(text);
+
+        await db.update(knowledgeTable)
+          .set({ embedding: JSON.stringify(vector) })
+          .where(eq(knowledgeTable.id, insertedId));
+
+        const [createdEntry] = await db.select().from(knowledgeTable).where(eq(knowledgeTable.id, insertedId)).limit(1);
+        if (createdEntry) {
+          addToCache(insertedId, vector, createdEntry);
+          console.log("[KB] New entry embedded and cached");
+        }
+      } catch (error) {
+        console.warn("[Embeddings] Failed to embed new KB entry:", error);
+      }
+    }
+
+    recordKbSave();
   } catch { }
 }
 
 export async function escalate(req: EscalationRequest): Promise<EscalationResult> {
+  recordEscalationAttempt();
+  logEscalation("start", `language=${req.language} question="${preview(req.question, 140)}"`);
   const attempts = req.failedAttempts ?? [];
+  const models = await readEscalationModelSettings();
+  const persona = req.agentRole ? mapRoleToPersona(req.agentRole) : null;
 
-  const kb = await searchKnowledgeBase(req);
-  if (kb) return kb;
-
-  const groq = await callGroq(req, attempts);
-  if (groq) {
-    await saveToKnowledgeBase(req, groq);
-    return groq;
+  if (persona === "alchemist") {
+    logEscalation("skip", "role=alchemist reason=command_execution_role");
+    return {
+      answer: "Alchemist role executes commands and reports results. No code-analysis prompt was used.",
+      confidence: 0.95,
+      action_items: ["Run a safe command via /api/alchemist/run", "Summarize stdout/stderr for the city report"],
+      source: "fallback",
+    };
   }
 
-  const anthropic = await callAnthropic(req, attempts);
+  const kb = await searchKnowledgeBase(req);
+  if (kb) {
+    logEscalation("complete", "source=knowledge_base");
+    return kb;
+  }
+  recordKbMiss();
+
+  if (persona) {
+    const groqRoleAware = await callGroq(req, attempts, models.groqModel);
+    if (groqRoleAware) {
+      await saveToKnowledgeBase(req, groqRoleAware);
+      logEscalation("complete", "source=groq role_prompt=true");
+      return groqRoleAware;
+    }
+  }
+
+  // OpenRouter free tier first
+  const openrouter = await callOpenRouter(req, attempts, models.openrouterModel);
+  if (openrouter) {
+    await saveToKnowledgeBase(req, openrouter);
+    logEscalation("complete", "source=openrouter");
+    return openrouter;
+  }
+
+  if (!persona) {
+    const groq = await callGroq(req, attempts, models.groqModel);
+    if (groq) {
+      await saveToKnowledgeBase(req, groq);
+      logEscalation("complete", "source=groq");
+      return groq;
+    }
+  }
+
+  const anthropic = await callAnthropic(req, attempts, models.anthropicModel);
   if (anthropic) {
     await saveToKnowledgeBase(req, anthropic);
+    logEscalation("complete", "source=anthropic");
     return anthropic;
   }
 
-  const ollama = await callOllama(req, attempts);
+  const ollama = await callOllama(req, attempts, models.ollamaPrimaryModel);
   if (ollama) {
     await saveToKnowledgeBase(req, ollama);
+    logEscalation("complete", "source=ollama");
     return ollama;
   }
+
+  logEscalation("complete", "source=fallback");
 
   return {
     answer: `I analyzed ${req.language} code related to: "${req.question.slice(0, 100)}". No external AI available, but based on common patterns: check error handling, add input validation, and ensure test coverage for edge cases.`,
@@ -250,6 +674,7 @@ export async function generateDialogue(params: {
   question: string;
   language: string;
 }): Promise<{ message: string; confidence: number; source: string; offerEscalation: boolean }> {
+  const models = await readEscalationModelSettings();
   const { system, prompt } = buildDialoguePrompt(
     params.npcRole,
     params.buildingFile,
@@ -261,7 +686,7 @@ export async function generateDialogue(params: {
     const available = await ollamaClient.isAvailable();
     if (available) {
       const text = await ollamaClient.generate({
-        model: "deepseek-coder:6.7b",
+        model: models.ollamaFastModel,
         system,
         prompt,
         temperature: 0.3,

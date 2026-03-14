@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Terminal, Shield, ShieldCheck, Flame, Activity, GitCommit, FileCode, MessageSquare, Send, Zap, FlaskConical, X, Bot, ThumbsUp, ThumbsDown, Target } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 interface ChatMessage {
   sender: string;
@@ -11,6 +12,15 @@ interface ChatMessage {
   source?: string;
   confidence?: number;
   offerEscalation?: boolean;
+}
+
+interface GeneratedTestProposal {
+  proposalId: string;
+  sourceFilePath: string;
+  testFilePath: string;
+  testContent: string;
+  language: string;
+  generationMode?: "ai" | "fallback";
 }
 
 const SOURCE_COLORS: Record<string, string> = {
@@ -29,6 +39,17 @@ const SOURCE_LABELS: Record<string, string> = {
   fallback: "FALLBACK",
 };
 
+function readArrayCount(raw: unknown): number {
+  if (Array.isArray(raw)) return raw.length;
+  if (typeof raw !== "string") return 0;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function BuildingInspector({
   building,
   agents,
@@ -43,10 +64,18 @@ export function BuildingInspector({
   const [chatLog, setChatLog] = useState<ChatMessage[]>([]);
   const [pendingEscalation, setPendingEscalation] = useState(false);
   const [verdictPending, setVerdictPending] = useState(false);
+  const [generatingScribeTest, setGeneratingScribeTest] = useState(false);
+  const [approvingScribeTest, setApprovingScribeTest] = useState(false);
+  const [scribeProposalOpen, setScribeProposalOpen] = useState(false);
+  const [scribeProposal, setScribeProposal] = useState<GeneratedTestProposal | null>(null);
+  const [scribeDraftContent, setScribeDraftContent] = useState("");
 
   const firstAgent = agents.length > 0 ? agents[0] : null;
   const workingAgent = agents.find(a => a.status === "working") ?? firstAgent;
   const agentId = workingAgent?.id ?? null;
+  const workingAgentMemory = readArrayCount((workingAgent as any)?.visitedFiles);
+  const workingAgentPatterns = readArrayCount((workingAgent as any)?.personalKB);
+  const workingAgentSpecialty = Math.max(0, Math.min(100, Math.round(Number((workingAgent as any)?.specialtyScore ?? 0) * 100)));
 
   const assignTaskMutation = useAssignAgentTask({
     mutation: {
@@ -85,6 +114,84 @@ export function BuildingInspector({
       agentId,
       data: { taskType: type, buildingId: building.id, context: "Perform analysis on " + building.name },
     });
+  };
+
+  const handleGenerateScribeTest = async () => {
+    if (generatingScribeTest) return;
+    setGeneratingScribeTest(true);
+
+    try {
+      const res = await fetch("/api/orchestrator/generate-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ buildingId: building.id, filePath: building.filePath }),
+      });
+
+      const data = await res.json() as Partial<GeneratedTestProposal> & { error?: string; message?: string };
+      if (!res.ok || !data.proposalId || !data.testFilePath || !data.testContent || !data.language || !data.sourceFilePath) {
+        throw new Error(data.error ?? data.message ?? "Failed to generate test proposal");
+      }
+
+      const proposal: GeneratedTestProposal = {
+        proposalId: data.proposalId,
+        sourceFilePath: data.sourceFilePath,
+        testFilePath: data.testFilePath,
+        testContent: data.testContent,
+        language: data.language,
+        generationMode: data.generationMode,
+      };
+
+      setScribeProposal(proposal);
+      setScribeDraftContent(proposal.testContent);
+      setScribeProposalOpen(true);
+
+      toast({
+        title: "Scribe proposal ready",
+        description: `${proposal.testFilePath} is ready for review and approval.`,
+      });
+    } catch {
+      toast({ title: "Scribe test generation failed", variant: "destructive" });
+    } finally {
+      setGeneratingScribeTest(false);
+    }
+  };
+
+  const clearScribeProposal = () => {
+    setScribeProposalOpen(false);
+    setScribeProposal(null);
+    setScribeDraftContent("");
+  };
+
+  const handleApproveScribeTest = async () => {
+    if (!scribeProposal) return;
+
+    setApprovingScribeTest(true);
+    try {
+      const res = await fetch("/api/orchestrator/approve-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proposalId: scribeProposal.proposalId,
+          testContent: scribeDraftContent,
+          overwrite: true,
+        }),
+      });
+
+      const data = await res.json() as { success?: boolean; error?: string; message?: string; testFilePath?: string };
+      if (!res.ok || !data.success) {
+        throw new Error(data.error ?? data.message ?? "Failed to approve test proposal");
+      }
+
+      toast({
+        title: "Test approved",
+        description: `${data.testFilePath ?? scribeProposal.testFilePath} was written to the local repo.`,
+      });
+      clearScribeProposal();
+    } catch {
+      toast({ title: "Approval failed", description: "Ensure local watch mode is active for file writes.", variant: "destructive" });
+    } finally {
+      setApprovingScribeTest(false);
+    }
   };
 
   const handleTargetBuilding = async () => {
@@ -166,7 +273,8 @@ export function BuildingInspector({
   };
 
   return (
-    <div className="w-96 flex flex-col h-full glass-panel border-l border-primary/30 z-10 shadow-2xl relative animate-in slide-in-from-right">
+    <>
+      <div className="w-96 flex flex-col h-full glass-panel border-l border-primary/30 z-10 shadow-2xl relative animate-in slide-in-from-right">
       <div className="p-4 border-b border-primary/20 bg-primary/5 flex justify-between items-start">
         <div>
           <h2 className="font-mono text-xl font-bold text-primary flex items-center gap-2">
@@ -227,6 +335,9 @@ export function BuildingInspector({
               <Bot size={11} className="text-primary" />
               <span className="text-primary">{workingAgent.name}</span>
               <span>({workingAgent.role.replace("_", " ")}) assigned</span>
+              <span className="text-primary/70">mem {workingAgentMemory}</span>
+              <span className="text-primary/70">patterns {workingAgentPatterns}</span>
+              <span className="text-primary/70">spec {workingAgentSpecialty}%</span>
             </div>
             <button
               onClick={handleTargetBuilding}
@@ -244,16 +355,27 @@ export function BuildingInspector({
             <Button variant="outline" size="sm" onClick={() => handleTask("analyze_bug")} disabled={assignTaskMutation.isPending || !agentId} className="flex flex-col h-14 gap-1">
               <Activity size={14} /> <span className="text-[10px]">Analyze</span>
             </Button>
-            <Button variant="outline" size="sm" onClick={() => handleTask("generate_tests")} disabled={assignTaskMutation.isPending || !agentId} className="flex flex-col h-14 gap-1">
-              <Shield size={14} /> <span className="text-[10px]">Gen Tests</span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { void handleGenerateScribeTest(); }}
+              disabled={generatingScribeTest}
+              className="flex flex-col h-14 gap-1"
+            >
+              <Shield size={14} /> <span className="text-[10px]">Scribe Test</span>
             </Button>
             <Button variant="outline" size="sm" onClick={() => handleTask("fuzz_api")} disabled={assignTaskMutation.isPending || !agentId} className="flex flex-col h-14 gap-1">
               <FlaskConical size={14} /> <span className="text-[10px]">Fuzz</span>
             </Button>
           </div>
-          {assignTaskMutation.isPending && (
+          {(assignTaskMutation.isPending || generatingScribeTest) && (
             <div className="text-xs text-primary font-mono animate-pulse flex items-center gap-2">
-              <Zap size={12} /> Agent dispatched...
+              <Zap size={12} /> {generatingScribeTest ? "Scribe drafting proposal..." : "Agent dispatched..."}
+            </div>
+          )}
+          {scribeProposal && (
+            <div className="text-[10px] font-mono text-primary/80 rounded border border-primary/20 bg-primary/5 px-2 py-1">
+              Draft ready: {scribeProposal.testFilePath}
             </div>
           )}
         </div>
@@ -337,7 +459,56 @@ export function BuildingInspector({
           </form>
         </div>
       </div>
-    </div>
+      </div>
+
+      <Dialog
+        open={scribeProposalOpen}
+        onOpenChange={(open) => {
+          if (!open && !approvingScribeTest) {
+            clearScribeProposal();
+            return;
+          }
+          setScribeProposalOpen(open);
+        }}
+      >
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary">Scribe Test Proposal</DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <div>Source: {scribeProposal?.sourceFilePath ?? "n/a"}</div>
+            <div>Target: {scribeProposal?.testFilePath ?? "n/a"}</div>
+            <div>Mode: {scribeProposal?.generationMode === "fallback" ? "Fallback scaffold" : "AI generated"}</div>
+          </div>
+
+          <textarea
+            value={scribeDraftContent}
+            onChange={(event) => setScribeDraftContent(event.target.value)}
+            className="min-h-[320px] w-full rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+            spellCheck={false}
+          />
+
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={clearScribeProposal}
+              disabled={approvingScribeTest}
+              className="h-8 text-xs font-mono"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => { void handleApproveScribeTest(); }}
+              disabled={approvingScribeTest || !scribeDraftContent.trim()}
+              className="h-8 text-xs font-mono"
+            >
+              {approvingScribeTest ? "Approving..." : "Approve and Write File"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

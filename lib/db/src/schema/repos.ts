@@ -9,6 +9,9 @@ export const reposTable = sqliteTable("repos", {
   repoName: text("repo_name").notNull(),
   branch: text("branch").default("main").notNull(),
   slug: text("slug").unique(),
+  githubTokenHint: text("github_token_hint"),
+  // JSON string containing detected project shape and relevant KB domains.
+  projectFingerprint: text("project_fingerprint"),
   isActive: integer("is_active", { mode: "boolean" }).default(false).notNull(),
   fileCount: integer("file_count").default(0).notNull(),
   districtCount: integer("district_count").default(0).notNull(),

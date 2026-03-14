@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
-import { metricSnapshotsTable, agentsTable, knowledgeTable, eventsTable } from "@workspace/db/schema";
+import { metricSnapshotsTable, agentsTable } from "@workspace/db/schema";
 import { desc, gte, count, sql } from "drizzle-orm";
 
 const router: IRouter = Router();
@@ -31,16 +31,14 @@ router.get("/history", async (req, res) => {
 
 export async function writeMetricSnapshot() {
   try {
-    type AgentRow = { status: string; bugsFound: number; escalations: number; testsGenerated: number };
+    type AgentRow = { status: string; bugsFound: number; escalations: number; testsGenerated: number; kbHits?: number };
     const agents: AgentRow[] = await db.select().from(agentsTable).catch(() => [] as AgentRow[]);
     const activeAgents = agents.filter(a => a.status === "working").length;
     const pausedAgents = agents.filter(a => (a.status as string) === "paused").length;
     const totalBugs = agents.reduce((s, a) => s + a.bugsFound, 0);
     const totalEscalations = agents.reduce((s, a) => s + a.escalations, 0);
     const totalTasks = agents.reduce((s, a) => s + a.testsGenerated, 0);
-
-    const [kbRow] = await db.select({ total: count() }).from(knowledgeTable);
-    const kbTotal = kbRow?.total ?? 0;
+    const totalKbHits = agents.reduce((s, a) => s + (a.kbHits ?? 0), 0);
 
     const cpuUsage = (process.cpuUsage().user / 1000000) % 100;
     const memMb = process.memoryUsage().heapUsed / 1024 / 1024;
@@ -51,7 +49,7 @@ export async function writeMetricSnapshot() {
       activeAgents,
       pausedAgents,
       totalBugs,
-      kbHitRate: kbTotal > 0 ? Math.min(1, totalEscalations / Math.max(kbTotal, 1)) : 0,
+      kbHitRate: totalTasks > 0 ? Math.min(1, totalKbHits / totalTasks) : 0,
       tasksCompleted: totalTasks,
       escalationsToday: totalEscalations,
       cpuUsage: Math.min(100, Math.max(0, cpuUsage)),

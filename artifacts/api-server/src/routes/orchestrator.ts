@@ -3,6 +3,7 @@ import { db } from "@workspace/db";
 import {
   agentsTable,
   eventsTable,
+  executionResultsTable,
   knowledgeTable,
   metricSnapshotsTable,
   reposTable,
@@ -10,9 +11,29 @@ import {
   snapshotsTable,
 } from "@workspace/db/schema";
 import { count, desc, eq, inArray } from "drizzle-orm";
-import { basename, extname } from "node:path";
+import {
+  access as accessFromDisk,
+  mkdir as mkdirOnDisk,
+  readFile as readFileFromDisk,
+  stat as statFromDisk,
+  writeFile as writeFileOnDisk,
+} from "node:fs/promises";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute as isAbsolutePath,
+  join as joinPath,
+  resolve as resolvePath,
+} from "node:path";
+import { fileURLToPath } from "node:url";
+import { fileWatcher } from "../lib/fileWatcher";
+import { computeHealthScore } from "../lib/healthScorer";
+import { cleanupNonSourceKnowledgeAndRecountBugs } from "../lib/knowledgeCleanup";
 import { orchestrator } from "../lib/orchestrator";
+import { resolveGithubTokenFromEnvOrDb } from "../lib/githubTokenStore";
 import { getKbSessionStats, resetKbSessionStats } from "../lib/sessionStats";
+import { wsServer } from "../lib/wsServer";
 import type { Building, CityLayout } from "../lib/types";
 
 const router: IRouter = Router();
@@ -22,8 +43,10 @@ const MAYOR_TASK_EVENT_TYPES = new Set(["bug_found", "test_passed", "escalation"
 const MAYOR_SOURCE_FILE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
 const MAYOR_EXCLUDED_DOC_EXTENSIONS = new Set([".md", ".txt", ".yaml", ".yml", ".mdx"]);
 const MAYOR_FILE_QUERY_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs"]);
+const REPORT_SOURCE_FILE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs"]);
 const URGENCY_SOURCE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
-const URGENCY_DOC_EXTENSIONS = new Set([".md", ".txt", ".yaml", ".yml", ".json"]);
+// Add .html and .htm to exclusion list
+const URGENCY_DOC_EXTENSIONS = new Set([".md", ".txt", ".yaml", ".yml", ".json", ".html", ".htm"]);
 const URGENCY_DOC_NAME_MARKERS = [
   "handoff",
   "contributing",
@@ -35,6 +58,101 @@ const URGENCY_DOC_NAME_MARKERS = [
 ];
 const MAYOR_MAX_SESSION_MESSAGES = 10;
 const MAYOR_MAX_TRACKED_SESSIONS = 200;
+const MAX_REVIEW_FINDINGS = 12;
+const MAYOR_REVIEW_CONTEXT_KEYS = ["mayor_recent_reviews", "mayor_last_review_date", "mayor_last_review_summary"] as const;
+const MAYOR_MEMORY_SETTINGS_KEY = "mayor_memory";
+const MAYOR_MEMORY_MAX_SUMMARIES = 20;
+const MAYOR_MEMORY_PROMPT_LIMIT = 3;
+const MAYOR_MIN_USER_MESSAGES_FOR_SUMMARY = 5;
+const MAYOR_INSIGHT_INTERVAL_MS = 10 * 60 * 1000;
+const MAYOR_CASUAL_MAX_WORDS = 5;
+const MAYOR_INSIGHT_MAX_HISTORY = 24;
+const SNIPPET_CACHE_TTL_MS = 60_000;
+const TEST_PROPOSAL_TTL_MS = 45 * 60 * 1000;
+const MAX_PENDING_TEST_PROPOSALS = 120;
+
+const MAYOR_TECHNICAL_TERMS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".py",
+  ".go",
+  ".rs",
+  "test",
+  "tests",
+  "coverage",
+  "complexity",
+  "bug",
+  "bugs",
+  "api",
+  "database",
+  "db",
+  "agent",
+  "orchestrator",
+  "engine",
+  "route",
+  "endpoint",
+  "stack",
+  "refactor",
+  "deploy",
+  "sql",
+  "exception",
+  "error",
+  "trace",
+] as const;
+
+const snippetCache = new Map<string, { snippetText: string; cachedAtMs: number }>();
+const pendingTestProposals = new Map<string, TestProposal>();
+
+type StoredReportFinding = {
+  findingNumber: number;
+  filePath: string;
+  agentId: string | null;
+  agentName: string;
+  agentRole: string;
+  severityClass: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+  issueType: string;
+  confidencePercent: number;
+  confirmations: number;
+  codeReference: string;
+  findingText: string;
+  codeContext: string;
+};
+
+const latestReportFindings: StoredReportFinding[] = [];
+
+type ImportedReviewSummary = {
+  importedAt: string;
+  verdictsProcessed: number;
+  realBugCount: number;
+  falsePositiveCount: number;
+  agentsUpdated: string[];
+  kbEntriesAdded: number;
+  commonConfirmedPatterns: string[];
+  implementedFixSummary: string;
+};
+
+type TestProposal = {
+  proposalId: string;
+  createdAt: string;
+  sourceFilePath: string;
+  testFilePath: string;
+  testContent: string;
+  language: string;
+  buildingId: string | null;
+  generatedByRole: "scribe";
+};
+
+type ParsedVerdict = {
+  findingNumber: number;
+  verdict: "REAL BUG" | "FALSE POSITIVE";
+};
+
+type ParsedAgentAdjustment = {
+  agentName: string;
+  adjustment: string;
+};
 
 interface CitySnapshot {
   repoName: string;
@@ -52,9 +170,17 @@ type MayorEventRow = {
   message: string;
   severity: string;
   timestamp: string;
+  buildingId?: string | null;
   buildingName: string | null;
   agentName: string | null;
   agentId: string | null;
+  filePath?: string | null;
+  issueType?: string | null;
+  confidence?: number | null;
+  codeReference?: string | null;
+  confirmations?: number | null;
+  findingSeverity?: string | null;
+  findingText?: string | null;
 };
 
 type RecentBugSummary = {
@@ -67,6 +193,7 @@ type RepoContext = {
   snapshot: CitySnapshot;
   repoUrl: string | null;
   branch: string;
+  repoSlug: string | null;
 };
 
 type TestRecommendation = {
@@ -83,7 +210,323 @@ type MayorConversationEntry = {
   content: string;
 };
 
+type MayorMemorySummary = {
+  date: string;
+  topic: string;
+  keyPoints: string[];
+  userMood: string;
+};
+
+type MayorFileAdviceContext = {
+  requestedFile: string;
+  normalizedFilePath: string;
+  complexity: number | null;
+  coveragePercent: number | null;
+  lastAnalyzed: string | null;
+  activeBugCount: number;
+  agentsVisited: string[];
+  findings: string[];
+};
+
+type CasualMayorIntent = "greeting" | "how_are_you" | "what_can_you_do" | "thanks" | "praise";
+
 const mayorSessionConversations = new Map<string, MayorConversationEntry[]>();
+const mayorSessionSummaryFingerprints = new Map<string, string>();
+const mayorInsightDeduped = new Set<string>();
+const mayorInsightHistory: string[] = [];
+
+let mayorMemorySummaries: MayorMemorySummary[] = [];
+let mayorMemoryLoaded = false;
+let mayorMemoryLoadPromise: Promise<void> | null = null;
+let mayorInsightLoopStarted = false;
+let mayorInsightInFlight = false;
+
+function sanitizeMayorMemorySummary(raw: unknown): MayorMemorySummary | null {
+  if (!raw || typeof raw !== "object") return null;
+
+  const record = raw as {
+    date?: unknown;
+    topic?: unknown;
+    keyPoints?: unknown;
+    userMood?: unknown;
+  };
+
+  const date = typeof record.date === "string" && record.date.trim()
+    ? record.date.trim()
+    : new Date().toISOString();
+  const topic = typeof record.topic === "string" && record.topic.trim()
+    ? compactText(record.topic.trim(), 120)
+    : "General engineering check-in";
+  const keyPoints = Array.isArray(record.keyPoints)
+    ? record.keyPoints
+      .filter((item): item is string => typeof item === "string")
+      .map(item => compactText(item, 140))
+      .filter(Boolean)
+      .slice(0, 4)
+    : [];
+  const userMood = typeof record.userMood === "string" && record.userMood.trim()
+    ? compactText(record.userMood.trim(), 40)
+    : "focused";
+
+  return {
+    date,
+    topic,
+    keyPoints: keyPoints.length > 0 ? keyPoints : ["Reviewed current city engineering priorities."],
+    userMood,
+  };
+}
+
+function parseMayorMemoryValue(raw: string | null | undefined): MayorMemorySummary[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .map(item => sanitizeMayorMemorySummary(item))
+      .filter((item): item is MayorMemorySummary => Boolean(item))
+      .slice(-MAYOR_MEMORY_MAX_SUMMARIES);
+  } catch {
+    return [];
+  }
+}
+
+async function ensureMayorMemoryLoaded(): Promise<void> {
+  if (mayorMemoryLoaded) return;
+  if (mayorMemoryLoadPromise) {
+    await mayorMemoryLoadPromise;
+    return;
+  }
+
+  mayorMemoryLoadPromise = (async () => {
+    try {
+      const row = await db
+        .select({ value: settingsTable.value })
+        .from(settingsTable)
+        .where(eq(settingsTable.key, MAYOR_MEMORY_SETTINGS_KEY))
+        .limit(1);
+
+      mayorMemorySummaries = parseMayorMemoryValue(row[0]?.value ?? "[]");
+    } catch {
+      mayorMemorySummaries = [];
+    } finally {
+      mayorMemoryLoaded = true;
+      mayorMemoryLoadPromise = null;
+    }
+  })();
+
+  await mayorMemoryLoadPromise;
+}
+
+async function persistMayorMemory(): Promise<void> {
+  await upsertSettingValue(MAYOR_MEMORY_SETTINGS_KEY, JSON.stringify(mayorMemorySummaries.slice(-MAYOR_MEMORY_MAX_SUMMARIES)));
+}
+
+function extractMentionedFileCandidates(text: string): string[] {
+  const matches = text.match(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g) ?? [];
+  const seen = new Set<string>();
+  const files: string[] = [];
+
+  for (const raw of matches) {
+    const cleaned = raw.replace(/^['"`(]+|[)"'`.,:;!?]+$/g, "").trim();
+    if (!cleaned) continue;
+
+    const normalized = normalizePathForLookup(cleaned);
+    const ext = extname(normalized.toLowerCase());
+    if (!MAYOR_FILE_QUERY_EXTENSIONS.has(ext)) continue;
+
+    const lower = normalized.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    files.push(normalized);
+  }
+
+  return files;
+}
+
+function inferConversationTopic(history: MayorConversationEntry[]): string {
+  const userMessages = history.filter(entry => entry.role === "user").map(entry => entry.content);
+  const files = userMessages.flatMap(message => extractMentionedFileCandidates(message));
+  if (files.length > 0) {
+    return `File guidance: ${basename(files[0])}`;
+  }
+
+  const merged = userMessages.join(" ").toLowerCase();
+  if (merged.includes("focus") || merged.includes("today")) return "Daily engineering focus";
+  if (merged.includes("test")) return "Testing strategy";
+  if (merged.includes("bug") || merged.includes("error")) return "Bug triage";
+  if (merged.includes("health") || merged.includes("coverage")) return "City health review";
+  return "General software architecture coaching";
+}
+
+function inferUserMood(history: MayorConversationEntry[]): string {
+  const userText = history
+    .filter(entry => entry.role === "user")
+    .map(entry => entry.content.toLowerCase())
+    .join(" ");
+
+  if (/(stuck|blocked|urgent|panic|broken|frustrated|overwhelmed)/.test(userText)) return "concerned";
+  if (/(thanks|thank you|great|awesome|love|nice|good job|well done)/.test(userText)) return "positive";
+  if (/(why|how|what should|recommend|explain)/.test(userText)) return "curious";
+  return "focused";
+}
+
+function buildMayorSummaryKeyPoints(history: MayorConversationEntry[]): string[] {
+  const userMessages = history.filter(entry => entry.role === "user").map(entry => entry.content);
+  const lastAssistant = history.filter(entry => entry.role === "assistant").at(-1)?.content ?? "";
+  const keyPoints: string[] = [];
+
+  const files = userMessages.flatMap(message => extractMentionedFileCandidates(message)).slice(0, 2);
+  if (files.length > 0) {
+    keyPoints.push(`Discussed file risk in ${files.map(file => basename(file)).join(", ")}.`);
+  }
+
+  const merged = userMessages.join(" ").toLowerCase();
+  if (merged.includes("focus") || merged.includes("today")) {
+    keyPoints.push("Set a clear priority order for today's engineering work.");
+  }
+  if (merged.includes("test")) {
+    keyPoints.push("Identified where stronger test coverage will reduce risk fastest.");
+  }
+  if (merged.includes("bug") || merged.includes("error")) {
+    keyPoints.push("Reviewed active bug signals and likely root-cause hotspots.");
+  }
+  if (lastAssistant) {
+    const sentence = lastAssistant.match(/[^.!?]+[.!?]/)?.[0] ?? lastAssistant;
+    keyPoints.push(`Last guidance: ${compactText(sentence, 130)}`);
+  }
+
+  if (keyPoints.length === 0) {
+    keyPoints.push("Held a general architecture and quality check-in.");
+  }
+
+  return keyPoints.slice(0, 3);
+}
+
+function buildConversationFingerprint(history: MayorConversationEntry[]): string {
+  return history
+    .slice(-8)
+    .map(entry => `${entry.role}:${normalizeReplyForComparison(entry.content)}`)
+    .join("|");
+}
+
+function isConversationClosingMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return /(thanks|thank you|appreciate it|that's all|thats all|bye|goodbye|see you|talk later)/.test(lower);
+}
+
+async function maybePersistMayorConversationSummary(sessionId: string, history: MayorConversationEntry[], latestUserMessage: string): Promise<void> {
+  if (!isConversationClosingMessage(latestUserMessage)) return;
+
+  const userMessageCount = history.filter(entry => entry.role === "user").length;
+  if (userMessageCount < MAYOR_MIN_USER_MESSAGES_FOR_SUMMARY) return;
+
+  const fingerprint = buildConversationFingerprint(history);
+  if (mayorSessionSummaryFingerprints.get(sessionId) === fingerprint) return;
+
+  await ensureMayorMemoryLoaded();
+
+  mayorMemorySummaries = [
+    ...mayorMemorySummaries,
+    {
+      date: new Date().toISOString(),
+      topic: inferConversationTopic(history),
+      keyPoints: buildMayorSummaryKeyPoints(history),
+      userMood: inferUserMood(history),
+    },
+  ].slice(-MAYOR_MEMORY_MAX_SUMMARIES);
+
+  mayorSessionSummaryFingerprints.set(sessionId, fingerprint);
+  await persistMayorMemory();
+}
+
+function formatMayorMemoryForPrompt(summaries: MayorMemorySummary[]): string {
+  if (summaries.length === 0) return "- none yet";
+
+  return summaries
+    .slice(-MAYOR_MEMORY_PROMPT_LIMIT)
+    .map(summary => {
+      const dateText = summary.date.split("T")[0] ?? summary.date;
+      const keyPointsText = summary.keyPoints.join("; ");
+      return `- ${dateText}: ${summary.topic}. Mood: ${summary.userMood}. Key points: ${compactText(keyPointsText, 220)}`;
+    })
+    .join("\n");
+}
+
+function containsTechnicalTerms(message: string): boolean {
+  const lower = message.toLowerCase();
+  if (/[`{}()[\]<>]/.test(message)) return true;
+  if (extractMentionedFileCandidates(message).length > 0) return true;
+  return MAYOR_TECHNICAL_TERMS.some(term => lower.includes(term));
+}
+
+function detectCasualMayorIntent(message: string): CasualMayorIntent | null {
+  const lower = message.toLowerCase().trim();
+
+  if (/^(hi|hello|hey|yo)$/.test(lower)) return "greeting";
+  if (/(^|\s)(hi|hello|hey)(\s|$)/.test(lower)) return "greeting";
+  if (lower.includes("how are you") || lower === "howre you") return "how_are_you";
+  if (lower.includes("what can you do") || lower === "capabilities") return "what_can_you_do";
+  if (/(^|\s)(thanks|thank you|thx)(\s|$)/.test(lower)) return "thanks";
+  if (lower.includes("good job") || lower.includes("well done") || lower === "nice") return "praise";
+  return null;
+}
+
+function shouldUseCasualMayorTemplate(message: string, intent: CasualMayorIntent | null): intent is CasualMayorIntent {
+  if (!intent) return false;
+  const words = message.trim().split(/\s+/).filter(Boolean).length;
+  return words <= MAYOR_CASUAL_MAX_WORDS && !containsTechnicalTerms(message);
+}
+
+function buildMayorCityFact(snapshot: CitySnapshot, activeAgents: number): string {
+  if (snapshot.fireBuildings.length > 0) {
+    return `${snapshot.fireBuildings.length} building${snapshot.fireBuildings.length === 1 ? " is" : "s are"} still on fire`;
+  }
+  return `city health is ${Math.round(snapshot.healthScore)}/100 with ${activeAgents} agents on duty`;
+}
+
+function buildMayorWatchTarget(snapshot: CitySnapshot, recentBugSummaries: RecentBugSummary[]): string {
+  if (recentBugSummaries.length > 0) {
+    return basename(recentBugSummaries[0].fileName);
+  }
+
+  const highestRiskSource = snapshot.highRiskBuildings.find(isUrgencySourceBuilding);
+  if (highestRiskSource) {
+    return basename(highestRiskSource.filePath);
+  }
+
+  return "high-complexity low-coverage files";
+}
+
+function buildCasualMayorReply(params: {
+  intent: CasualMayorIntent;
+  mayorName: string;
+  snapshot: CitySnapshot;
+  activeAgents: number;
+  recentBugSummaries: RecentBugSummary[];
+}): string {
+  const cityFact = buildMayorCityFact(params.snapshot, params.activeAgents);
+  const watchTarget = buildMayorWatchTarget(params.snapshot, params.recentBugSummaries);
+
+  if (params.intent === "greeting") {
+    return `Hey, I am ${params.mayorName}, your mayor and stubborn old architect. ${cityFact}, and I have already started nudging the riskiest files in the right direction.`;
+  }
+
+  if (params.intent === "how_are_you") {
+    return `I am doing well enough to be useful. ${cityFact}, and I am happier when we trade heroics for steady, boring reliability.`;
+  }
+
+  if (params.intent === "what_can_you_do") {
+    return `I can help you choose what to fix first, explain why a file is risky, and turn noisy telemetry into concrete next steps. If you name a file, I will speak specifically about its complexity, coverage, and what agents already found there. I also keep memory of our prior conversations so I can coach with context instead of repeating myself.`;
+  }
+
+  if (params.intent === "thanks") {
+    return `You are welcome. I will keep watching ${watchTarget} and the active fire queue so we catch trouble before it catches us.`;
+  }
+
+  return `Thank you, I appreciate it. I am proud of the progress, but I still want tighter tests and cleaner boundaries around ${watchTarget}.`;
+}
 
 function normalizeMayorSessionId(raw: unknown): string {
   if (typeof raw !== "string") return "default";
@@ -192,6 +635,7 @@ async function getLatestRepoContext(): Promise<RepoContext> {
       snapshot: toCitySnapshot(null, "No repository loaded"),
       repoUrl: null,
       branch: "main",
+      repoSlug: null,
     };
   }
 
@@ -200,6 +644,7 @@ async function getLatestRepoContext(): Promise<RepoContext> {
     snapshot: toCitySnapshot(layout, source.repoName),
     repoUrl: source.repoUrl,
     branch: source.branch ?? "main",
+    repoSlug: source.slug ?? null,
   };
 }
 
@@ -212,13 +657,13 @@ function parseGithubRepoParts(repoUrl: string): { owner: string; repo: string } 
   };
 }
 
-function githubHeaders(): Record<string, string> {
+async function githubHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
 
-  const token = process.env["GITHUB_TOKEN"] ?? process.env["GH_TOKEN"];
+  const token = await resolveGithubTokenFromEnvOrDb();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   return headers;
 }
@@ -232,7 +677,7 @@ async function fetchGithubFileContent(repoUrl: string | null, branch: string, fi
   const contentUrl = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`;
 
   try {
-    const res = await fetch(contentUrl, { headers: githubHeaders() });
+    const res = await fetch(contentUrl, { headers: await githubHeaders() });
     if (!res.ok) return null;
     const data = await res.json() as { content?: string; encoding?: string };
     if (!data.content) return null;
@@ -245,6 +690,777 @@ async function fetchGithubFileContent(repoUrl: string | null, branch: string, fi
   } catch {
     return null;
   }
+}
+
+function normalizePathForLookup(filePath: string): string {
+  return filePath.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+}
+
+function tokenizeSnippetHint(text: string): string[] {
+  const stopWords = new Set([
+    "the", "and", "with", "that", "from", "this", "have", "into", "were", "been", "there", "what", "when",
+    "where", "which", "about", "after", "before", "agent", "issue", "found", "file", "line", "error", "warning",
+  ]);
+
+  const raw = text.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? [];
+  return Array.from(new Set(raw.map(token => token.toLowerCase()).filter(token => !stopWords.has(token)))).slice(0, 12);
+}
+
+function findSnippetAnchorLine(contentLines: string[], filePath: string, hintText: string): number {
+  const lowerLines = contentLines.map(line => line.toLowerCase());
+  const hintTokens = tokenizeSnippetHint(hintText);
+
+  for (const token of hintTokens) {
+    const idx = lowerLines.findIndex(line => line.includes(token));
+    if (idx >= 0) return idx;
+  }
+
+  const fileStem = basename(filePath, extname(filePath)).toLowerCase();
+  if (fileStem) {
+    const byStem = lowerLines.findIndex(line => line.includes(fileStem));
+    if (byStem >= 0) return byStem;
+  }
+
+  return -1;
+}
+
+function formatSnippetWithLineNumbers(content: string, filePath: string, hintText: string): string {
+  const lines = content.split(/\r?\n/);
+  if (lines.length === 0) return "Code snippet unavailable";
+
+  const anchor = findSnippetAnchorLine(lines, filePath, hintText);
+  const hasAnchor = anchor >= 0;
+  const windowSize = hasAnchor
+    ? Math.min(20, lines.length)
+    : Math.min(30, lines.length);
+
+  let start = 0;
+  if (hasAnchor) {
+    start = Math.max(0, anchor - Math.floor(windowSize / 2));
+  }
+
+  if (start + windowSize > lines.length) {
+    start = Math.max(0, lines.length - windowSize);
+  }
+  const end = Math.min(lines.length, start + windowSize);
+
+  return lines
+    .slice(start, end)
+    .map((line, idx) => `L${start + idx + 1}: ${line}`)
+    .join("\n");
+}
+
+function getCachedSnippet(cacheKey: string): string | null {
+  const entry = snippetCache.get(cacheKey);
+  if (!entry) return null;
+
+  if ((Date.now() - entry.cachedAtMs) > SNIPPET_CACHE_TTL_MS) {
+    snippetCache.delete(cacheKey);
+    return null;
+  }
+
+  return entry.snippetText;
+}
+
+function setCachedSnippet(cacheKey: string, snippetText: string): void {
+  snippetCache.set(cacheKey, {
+    snippetText,
+    cachedAtMs: Date.now(),
+  });
+}
+
+function toLocalPath(value: string | null): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      return resolvePath(fileURLToPath(trimmed));
+    } catch {
+      return null;
+    }
+  }
+
+  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith("demo://")) {
+    return null;
+  }
+
+  if (trimmed.startsWith("~/")) {
+    const home = process.env["HOME"];
+    if (!home) return null;
+    return resolvePath(joinPath(home, trimmed.slice(2)));
+  }
+
+  if (isAbsolutePath(trimmed) || /^[A-Za-z]:[\\/]/.test(trimmed)) {
+    return resolvePath(trimmed);
+  }
+
+  if (trimmed.startsWith("./") || trimmed.startsWith("../")) {
+    return resolvePath(process.cwd(), trimmed);
+  }
+
+  return null;
+}
+
+async function getLastLoadedLocalRepoPath(): Promise<string | null> {
+  const candidates: string[] = [];
+
+  const active = await db
+    .select({ repoUrl: reposTable.repoUrl })
+    .from(reposTable)
+    .where(eq(reposTable.isActive, true))
+    .limit(1);
+
+  for (const row of active) {
+    if (row.repoUrl) candidates.push(row.repoUrl);
+  }
+
+  const recent = await db
+    .select({ repoUrl: reposTable.repoUrl })
+    .from(reposTable)
+    .orderBy(desc(reposTable.createdAt))
+    .limit(5);
+
+  for (const row of recent) {
+    if (row.repoUrl) candidates.push(row.repoUrl);
+  }
+
+  for (const candidate of candidates) {
+    const localPath = toLocalPath(candidate);
+    if (localPath) return localPath;
+  }
+
+  return null;
+}
+
+async function resolveLocalRepoRoots(): Promise<string[]> {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (value: string | null): void => {
+    const resolved = toLocalPath(value) ?? (value ? resolvePath(value) : null);
+    if (!resolved || seen.has(resolved)) return;
+    seen.add(resolved);
+    ordered.push(resolved);
+  };
+
+  add(fileWatcher.getWatchedPath().trim() || null);
+  add(process.cwd());
+  add(await getLastLoadedLocalRepoPath());
+
+  return ordered;
+}
+
+function resolveFilePathInRepo(repoRoot: string, filePath: string): string | null {
+  const normalizedPath = normalizePathForLookup(filePath);
+  if (!normalizedPath) return null;
+
+  const absoluteTarget = isAbsolutePath(normalizedPath)
+    ? resolvePath(normalizedPath)
+    : resolvePath(joinPath(repoRoot, normalizedPath));
+
+  // Keep relative lookups inside the intended repo root.
+  if (!isAbsolutePath(normalizedPath) && !absoluteTarget.startsWith(repoRoot)) {
+    return null;
+  }
+
+  return absoluteTarget;
+}
+
+async function getRepoContextBySlug(repoSlug: string | null): Promise<{ repoUrl: string | null; branch: string } | null> {
+  if (repoSlug) {
+    const bySlug = await db.select().from(reposTable).where(eq(reposTable.slug, repoSlug)).limit(1);
+    if (bySlug.length > 0) {
+      return {
+        repoUrl: bySlug[0].repoUrl,
+        branch: bySlug[0].branch ?? "main",
+      };
+    }
+  }
+
+  const activeRepo = await db.select().from(reposTable).where(eq(reposTable.isActive, true)).limit(1);
+  if (activeRepo.length > 0) {
+    return {
+      repoUrl: activeRepo[0].repoUrl,
+      branch: activeRepo[0].branch ?? "main",
+    };
+  }
+
+  const latestRepo = await db.select().from(reposTable).orderBy(desc(reposTable.createdAt)).limit(1);
+  if (latestRepo.length === 0) return null;
+  return {
+    repoUrl: latestRepo[0].repoUrl,
+    branch: latestRepo[0].branch ?? "main",
+  };
+}
+
+async function readLocalFileFirst(filePath: string): Promise<string | null> {
+  const roots = await resolveLocalRepoRoots();
+
+  for (const root of roots) {
+    const target = resolveFilePathInRepo(root, filePath);
+    if (!target) continue;
+
+    try {
+      const stats = await statFromDisk(target);
+      if (!stats.isFile()) continue;
+      return await readFileFromDisk(target, "utf8");
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function createTestProposalId(): string {
+  return `proposal-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function pruneExpiredTestProposals(): void {
+  const now = Date.now();
+  for (const [proposalId, proposal] of pendingTestProposals.entries()) {
+    const createdAt = Date.parse(proposal.createdAt);
+    if (!Number.isFinite(createdAt) || now - createdAt > TEST_PROPOSAL_TTL_MS) {
+      pendingTestProposals.delete(proposalId);
+    }
+  }
+}
+
+function rememberTestProposal(input: Omit<TestProposal, "proposalId" | "createdAt">): TestProposal {
+  pruneExpiredTestProposals();
+
+  const proposal: TestProposal = {
+    ...input,
+    proposalId: createTestProposalId(),
+    createdAt: new Date().toISOString(),
+  };
+
+  pendingTestProposals.set(proposal.proposalId, proposal);
+
+  if (pendingTestProposals.size > MAX_PENDING_TEST_PROPOSALS) {
+    const oldest = pendingTestProposals.keys().next().value;
+    if (oldest) pendingTestProposals.delete(oldest);
+  }
+
+  return proposal;
+}
+
+function getPendingTestProposal(proposalId: string): TestProposal | null {
+  pruneExpiredTestProposals();
+  return pendingTestProposals.get(proposalId) ?? null;
+}
+
+function normalizeRelativeWritePath(filePath: string): string | null {
+  const normalized = normalizePathForLookup(filePath);
+  if (!normalized) return null;
+  if (isAbsolutePath(normalized) || /^[A-Za-z]:[\\/]/.test(normalized)) return null;
+  if (normalized.startsWith("../") || normalized.includes("/../") || normalized === "..") return null;
+  return normalized;
+}
+
+async function pathExistsOnDisk(pathValue: string): Promise<boolean> {
+  try {
+    await accessFromDisk(pathValue);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveWritableRepoRoot(sourceFilePath: string): Promise<string | null> {
+  const roots = await resolveLocalRepoRoots();
+  const normalizedSource = normalizeRelativeWritePath(sourceFilePath);
+
+  for (const root of roots) {
+    try {
+      const stats = await statFromDisk(root);
+      if (!stats.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    if (normalizedSource) {
+      const sourceAbsolute = resolveFilePathInRepo(root, normalizedSource);
+      if (sourceAbsolute && await pathExistsOnDisk(sourceAbsolute)) {
+        return root;
+      }
+    }
+  }
+
+  for (const root of roots) {
+    try {
+      const stats = await statFromDisk(root);
+      if (stats.isDirectory()) return root;
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+async function fetchGithubRawFileContent(repoUrl: string | null, branch: string, filePath: string): Promise<string | null> {
+  if (!repoUrl) return null;
+  const parsed = parseGithubRepoParts(repoUrl);
+  if (!parsed) return null;
+
+  const encodedPath = filePath.split("/").map(part => encodeURIComponent(part)).join("/");
+  const rawUrl = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${encodeURIComponent(branch)}/${encodedPath}`;
+
+  const token = await resolveGithubTokenFromEnvOrDb();
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  try {
+    const res = await fetch(rawUrl, { headers });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+// Required helper for report generation.
+async function fetchFileSnippet(filePath: string, repoSlug: string | null, hintText = ""): Promise<string> {
+  const normalizedPath = normalizePathForLookup(filePath);
+  if (!normalizedPath) return "Code snippet unavailable";
+
+  const cached = getCachedSnippet(normalizedPath);
+  if (cached) return cached;
+
+  // Always try local disk first to avoid GitHub API rate-limit failures.
+  const localContent = await readLocalFileFirst(normalizedPath);
+  if (localContent) {
+    const snippet = formatSnippetWithLineNumbers(localContent, normalizedPath, hintText);
+    setCachedSnippet(normalizedPath, snippet);
+    return snippet;
+  }
+
+  const repoContext = await getRepoContextBySlug(repoSlug);
+  if (!repoContext || !repoContext.repoUrl || (repoContext.repoUrl ?? "").startsWith("demo://")) {
+    return "Code snippet unavailable";
+  }
+
+  const remoteContent = await fetchGithubRawFileContent(repoContext.repoUrl, repoContext.branch, normalizedPath);
+  if (!remoteContent) return "Code snippet unavailable";
+
+  const snippet = formatSnippetWithLineNumbers(remoteContent, normalizedPath, hintText);
+  setCachedSnippet(normalizedPath, snippet);
+  return snippet;
+}
+
+function resolveFindingFilePath(event: MayorEventRow, snapshot: CitySnapshot): string | null {
+  if (event.filePath && event.filePath.trim()) {
+    return normalizePathForLookup(event.filePath);
+  }
+
+  if (event.buildingId) {
+    const byId = snapshot.allBuildings.find(building => building.id === event.buildingId);
+    if (byId?.filePath) return normalizePathForLookup(byId.filePath);
+  }
+
+  const byName = event.buildingName
+    ? snapshot.allBuildings.find(building => (
+      building.name.toLowerCase() === event.buildingName?.toLowerCase()
+      || normalizePathForLookup(building.filePath).toLowerCase() === normalizePathForLookup(event.buildingName ?? "").toLowerCase()
+    ))
+    : null;
+  if (byName?.filePath) return normalizePathForLookup(byName.filePath);
+
+  const fromEventText = extractEventFilePath(event);
+  if (fromEventText) return normalizePathForLookup(fromEventText);
+
+  return null;
+}
+
+function inferIssueTypeFromFinding(event: MayorEventRow): string {
+  if (event.issueType && event.issueType.trim()) return event.issueType;
+
+  const message = event.message.toLowerCase();
+
+  if (event.type === "escalation") return "Escalation Required";
+  if (message.includes("null") || message.includes("undefined")) return "Null Safety";
+  if (message.includes("race") || message.includes("concurrent") || message.includes("deadlock")) return "Concurrency Risk";
+  if (message.includes("timeout") || message.includes("latency") || message.includes("slow")) return "Performance Risk";
+  if (message.includes("auth") || message.includes("permission") || message.includes("token")) return "Authorization Risk";
+  if (message.includes("sql") || message.includes("injection") || message.includes("xss")) return "Security Risk";
+  if (event.type === "bug_found") return "Potential Bug";
+  return "Code Risk Signal";
+}
+
+function normalizeFindingSeverity(raw: string | null | undefined): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | null {
+  if (!raw) return null;
+  const upper = raw.trim().toUpperCase();
+  if (upper === "CRITICAL" || upper === "HIGH" || upper === "MEDIUM" || upper === "LOW") return upper;
+  return null;
+}
+
+function severityFromLegacyEvent(raw: string | null | undefined): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
+  const lower = (raw ?? "").trim().toLowerCase();
+  if (lower === "critical") return "CRITICAL";
+  if (lower === "warning") return "HIGH";
+  return "LOW";
+}
+
+function resolveSeverityClass(event: MayorEventRow): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
+  return normalizeFindingSeverity(event.findingSeverity) ?? severityFromLegacyEvent(event.severity);
+}
+
+function toConfidencePercent(confidence: number | null | undefined, accuracy: number | undefined, severityClass: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"): number {
+  const base = Number.isFinite(confidence ?? NaN)
+    ? Math.round(Math.max(0, Math.min(1, confidence ?? 0)) * 100)
+    : Math.round((accuracy ?? 0.65) * 100);
+  const severityBoost = severityClass === "CRITICAL" ? 4 : severityClass === "HIGH" ? 2 : 0;
+  return Math.max(5, Math.min(99, base + severityBoost));
+}
+
+function isReviewFindingEvent(event: MayorEventRow): boolean {
+  if (event.type !== "bug_found") return false;
+  if (!normalizeFindingSeverity(event.findingSeverity)) return false;
+  return Boolean(event.filePath || event.buildingId || event.buildingName);
+}
+
+async function buildAiReviewFindings(params: {
+  snapshot: CitySnapshot;
+  repoSlug: string | null;
+  agents: Array<typeof agentsTable.$inferSelect>;
+  events: MayorEventRow[];
+}): Promise<StoredReportFinding[]> {
+  const agentsById = new Map(params.agents.map(agent => [agent.id, agent]));
+  const agentsByName = new Map(params.agents.map(agent => [agent.name.toLowerCase(), agent]));
+  const snapshotFilePaths = new Set(
+    params.snapshot.allBuildings.map(building => normalizePathForLookup(building.filePath).toLowerCase())
+  );
+  const findings: StoredReportFinding[] = [];
+  const seen = new Set<string>();
+
+  for (const event of params.events) {
+    if (!isReviewFindingEvent(event)) continue;
+
+    const severityClass = resolveSeverityClass(event);
+
+    const filePath = resolveFindingFilePath(event, params.snapshot);
+    if (!filePath) continue;
+    if (!snapshotFilePaths.has(filePath.toLowerCase())) continue;
+
+    const ext = extname(filePath.toLowerCase());
+    if (!REPORT_SOURCE_FILE_EXTENSIONS.has(ext)) continue;
+
+    const issueType = inferIssueTypeFromFinding(event);
+    const dedupeKey = `${filePath}|${issueType}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const linkedAgent = event.agentId
+      ? agentsById.get(event.agentId)
+      : event.agentName
+        ? agentsByName.get(event.agentName.toLowerCase())
+        : undefined;
+
+    const agentName = linkedAgent?.name ?? event.agentName ?? "Unknown Agent";
+    const agentRole = linkedAgent?.role ?? "unassigned";
+    const confidencePercent = toConfidencePercent(event.confidence, linkedAgent?.accuracy, severityClass);
+    const confirmations = Math.max(1, event.confirmations ?? 1);
+    const findingText = compactText(event.findingText ?? event.message, 360);
+    const codeReference = compactText(event.codeReference ?? "specific pattern referenced", 140);
+    const codeContext = await fetchFileSnippet(filePath, params.repoSlug, `${findingText} ${issueType}`);
+
+    findings.push({
+      findingNumber: findings.length + 1,
+      filePath,
+      agentId: linkedAgent?.id ?? event.agentId ?? null,
+      agentName,
+      agentRole,
+      severityClass,
+      issueType,
+      confidencePercent,
+      confirmations,
+      codeReference,
+      findingText,
+      codeContext,
+    });
+
+    if (findings.length >= MAX_REVIEW_FINDINGS) break;
+  }
+
+  return findings;
+}
+
+function formatAgentLearningLine(agent: typeof agentsTable.$inferSelect): string {
+  const totalReviewed = agent.truePositives + agent.falsePositives;
+  const confirmedRate = totalReviewed > 0
+    ? Math.round((agent.truePositives / totalReviewed) * 100)
+    : Math.round(agent.accuracy * 100);
+
+  return `- ${agent.name} (${agent.role}) - confidence ${Math.round(agent.accuracy * 100)}%, accuracy history: TP ${agent.truePositives}, FP ${agent.falsePositives}, confirmed rate ${confirmedRate}%`;
+}
+
+function normalizeReviewSectionTitle(line: string): string {
+  return line
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/:$/, "")
+    .trim()
+    .toUpperCase();
+}
+
+function isReviewSectionHeader(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (/^#{1,6}\s+/.test(trimmed)) return true;
+  return /^[A-Z][A-Z0-9 _-]{3,}:?$/.test(trimmed);
+}
+
+function parseReviewSections(reviewText: string): Array<{ title: string; body: string }> {
+  const lines = reviewText.split(/\r?\n/);
+  const sections: Array<{ title: string; body: string }> = [];
+
+  let currentTitle = "FULL TEXT";
+  let currentBody: string[] = [];
+
+  for (const line of lines) {
+    if (isReviewSectionHeader(line)) {
+      sections.push({ title: currentTitle, body: currentBody.join("\n").trim() });
+      currentTitle = normalizeReviewSectionTitle(line.trim());
+      currentBody = [];
+      continue;
+    }
+    currentBody.push(line);
+  }
+
+  sections.push({ title: currentTitle, body: currentBody.join("\n").trim() });
+  return sections;
+}
+
+function findSectionBody(sections: Array<{ title: string; body: string }>, keywords: string[]): string {
+  const normalized = keywords.map(keyword => keyword.toUpperCase());
+  const direct = sections.find(section => normalized.every(keyword => section.title.includes(keyword)));
+  if (direct) return direct.body;
+
+  const partial = sections.find(section => normalized.some(keyword => section.title.includes(keyword)));
+  return partial?.body ?? "";
+}
+
+function parseVerdictsFromText(text: string): ParsedVerdict[] {
+  const verdicts = new Map<number, ParsedVerdict>();
+  const regex = /FINDING\s*#?\s*(\d+)[^\n]*?\b(REAL(?:\s+BUG)?|FALSE\s*POSITIVE|FALSE[-_ ]POSITIVE|FP)\b/gi;
+
+  let match = regex.exec(text);
+  while (match) {
+    const findingNumber = Number(match[1]);
+    const verdictRaw = (match[2] ?? "").toUpperCase().replace(/[-_]/g, " ");
+    const verdict: "REAL BUG" | "FALSE POSITIVE" = verdictRaw.includes("REAL")
+      ? "REAL BUG"
+      : "FALSE POSITIVE";
+
+    if (Number.isFinite(findingNumber) && findingNumber > 0) {
+      verdicts.set(findingNumber, { findingNumber, verdict });
+    }
+    match = regex.exec(text);
+  }
+
+  return Array.from(verdicts.values()).sort((a, b) => a.findingNumber - b.findingNumber);
+}
+
+function parseAgentAdjustments(sectionText: string): ParsedAgentAdjustment[] {
+  if (!sectionText.trim()) return [];
+
+  const adjustments: ParsedAgentAdjustment[] = [];
+  const lines = sectionText.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const match = trimmed.match(/(?:[-*]\s*)?([A-Za-z][A-Za-z0-9 _-]{1,48})\s*[:\-]\s*(.+)$/);
+    if (!match) continue;
+
+    adjustments.push({
+      agentName: match[1].trim(),
+      adjustment: compactText(match[2], 180),
+    });
+  }
+
+  return adjustments;
+}
+
+function summarizeImplementedFixes(sectionText: string): string {
+  if (!sectionText.trim()) return "No implemented fixes provided in the imported review.";
+  const lines = sectionText
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, 5);
+
+  if (lines.length === 0) return "No implemented fixes provided in the imported review.";
+  return compactText(lines.join(" | "), 420);
+}
+
+function normalizeIssuePattern(issueType: string): string {
+  return issueType
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "general";
+}
+
+async function upsertSettingValue(key: string, value: string): Promise<void> {
+  await db.insert(settingsTable)
+    .values({ key, value, updatedAt: new Date().toISOString() })
+    .onConflictDoUpdate({
+      target: settingsTable.key,
+      set: { value, updatedAt: new Date().toISOString() },
+    });
+}
+
+async function readMayorReviewContext(): Promise<{
+  recentReviews: ImportedReviewSummary[];
+  lastReviewDate: string | null;
+  lastReviewSummary: string | null;
+}> {
+  try {
+    const rows = await db
+      .select({ key: settingsTable.key, value: settingsTable.value })
+      .from(settingsTable)
+      .where(inArray(settingsTable.key, [...MAYOR_REVIEW_CONTEXT_KEYS]));
+
+    const valueByKey = new Map(rows.map(row => [row.key, row.value]));
+    const recentRaw = valueByKey.get("mayor_recent_reviews") ?? "[]";
+    const parsedRecent = JSON.parse(recentRaw) as ImportedReviewSummary[];
+
+    return {
+      recentReviews: Array.isArray(parsedRecent) ? parsedRecent.slice(-3) : [],
+      lastReviewDate: valueByKey.get("mayor_last_review_date") ?? null,
+      lastReviewSummary: valueByKey.get("mayor_last_review_summary") ?? null,
+    };
+  } catch {
+    return {
+      recentReviews: [],
+      lastReviewDate: null,
+      lastReviewSummary: null,
+    };
+  }
+}
+
+async function writeMayorReviewContext(summary: ImportedReviewSummary): Promise<void> {
+  const existing = await readMayorReviewContext();
+  const recentReviews = [...existing.recentReviews, summary].slice(-3);
+
+  await Promise.all([
+    upsertSettingValue("mayor_recent_reviews", JSON.stringify(recentReviews)),
+    upsertSettingValue("mayor_last_review_date", summary.importedAt),
+    upsertSettingValue("mayor_last_review_summary", summary.implementedFixSummary),
+  ]);
+}
+
+function formatRecentReviewsForPrompt(recentReviews: ImportedReviewSummary[]): string {
+  if (recentReviews.length === 0) return "none";
+  return recentReviews
+    .slice(-3)
+    .map(review => `(${review.importedAt}) verdicts=${review.verdictsProcessed}, real=${review.realBugCount}, false_positive=${review.falsePositiveCount}, agents=${review.agentsUpdated.join(", ") || "none"}, patterns=${review.commonConfirmedPatterns.join(", ") || "none"}`)
+    .join(" | ");
+}
+
+function findMostAccurateAgent(agents: Array<typeof agentsTable.$inferSelect>): { name: string; role: string; accuracyPercent: number } | null {
+  if (agents.length === 0) return null;
+
+  const candidates = agents
+    .map(agent => {
+      const reviewed = agent.truePositives + agent.falsePositives;
+      const confirmedRate = reviewed > 0 ? (agent.truePositives / reviewed) : agent.accuracy;
+      return { agent, confirmedRate, reviewed };
+    })
+    .sort((a, b) => {
+      if (b.confirmedRate !== a.confirmedRate) return b.confirmedRate - a.confirmedRate;
+      if (b.reviewed !== a.reviewed) return b.reviewed - a.reviewed;
+      return b.agent.truePositives - a.agent.truePositives;
+    });
+
+  const best = candidates[0];
+  return {
+    name: best.agent.name,
+    role: best.agent.role,
+    accuracyPercent: Math.round(best.confirmedRate * 1000) / 10,
+  };
+}
+
+function parseConfirmedPattern(problemType: string, patternTags: string | null): string | null {
+  if (problemType.startsWith("confirmed_bug_")) {
+    return problemType
+      .replace("confirmed_bug_", "")
+      .replace(/_/g, " ")
+      .trim();
+  }
+
+  const tags = (patternTags ?? "").split(",").map(tag => tag.trim()).filter(Boolean);
+  if (!tags.includes("confirmed")) return null;
+
+  const specificTag = tags.find(tag => !["confirmed", "review-import"].includes(tag));
+  return specificTag ?? "general pattern";
+}
+
+function topConfirmedPatterns(entries: Array<{ problemType: string; patternTags: string | null }>): string[] {
+  const counts = new Map<string, number>();
+
+  for (const entry of entries) {
+    const pattern = parseConfirmedPattern(entry.problemType, entry.patternTags);
+    if (!pattern) continue;
+    counts.set(pattern, (counts.get(pattern) ?? 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([pattern, countValue]) => `${pattern} (${countValue})`);
+}
+
+function buildReviewAwareMayorReply(params: {
+  message: string;
+  recentReviews: ImportedReviewSummary[];
+  lastReviewDate: string | null;
+  lastReviewSummary: string | null;
+  agents: Array<typeof agentsTable.$inferSelect>;
+  confirmedPatterns: string[];
+}): string | null {
+  const q = params.message.toLowerCase();
+  const asksLastReview = q.includes("last review") || q.includes("what did the review say") || q.includes("latest review");
+  const asksMostAccurate = q.includes("most accurate") || q.includes("highest accuracy") || q.includes("best agent");
+  const asksPatterns = q.includes("patterns keep coming") || q.includes("patterns keep coming up") || q.includes("recurring pattern") || q.includes("keep coming up");
+
+  const noReviewMessage = "No AI review imported yet. Generate a report, paste it to Claude, and import the result to help me learn.";
+
+  if (!asksLastReview && !asksMostAccurate && !asksPatterns) {
+    return null;
+  }
+
+  if (asksLastReview) {
+    if (!params.lastReviewDate || !params.lastReviewSummary) return noReviewMessage;
+
+    const latest = params.recentReviews[params.recentReviews.length - 1];
+    if (!latest) {
+      return `The last AI review was imported on ${params.lastReviewDate}. Summary: ${params.lastReviewSummary}.`;
+    }
+
+    return [
+      `The last AI review was imported on ${latest.importedAt}.`,
+      `It processed ${latest.verdictsProcessed} verdict(s), with ${latest.realBugCount} real bug(s) and ${latest.falsePositiveCount} false positive(s).`,
+      `Summary: ${latest.implementedFixSummary}`,
+    ].join(" ");
+  }
+
+  if (asksMostAccurate) {
+    const best = findMostAccurateAgent(params.agents);
+    if (!best) return "I do not have enough agent telemetry yet to rank accuracy.";
+    return `${best.name} is currently the most accurate agent at ${best.accuracyPercent.toFixed(1)}% confirmed true-positive rate (${best.role}).`;
+  }
+
+  if (asksPatterns) {
+    if (!params.lastReviewDate) return noReviewMessage;
+    if (params.confirmedPatterns.length === 0) return "I do not have confirmed recurring bug patterns yet from imported reviews.";
+    return `The patterns that keep coming up are ${params.confirmedPatterns.slice(0, 3).join(", ")}.`;
+  }
+
+  return null;
 }
 
 function toPascalCase(input: string): string {
@@ -501,6 +1717,131 @@ function resolveMayorFilePathFromQuestion(question: string, snapshot: CitySnapsh
   }
 
   return null;
+}
+
+function filePathMatchesCandidate(filePath: string, candidate: string): boolean {
+  const normalizedPath = normalizePathForLookup(filePath).toLowerCase();
+  const normalizedCandidate = normalizePathForLookup(candidate).toLowerCase();
+
+  if (!normalizedPath || !normalizedCandidate) return false;
+  if (normalizedPath === normalizedCandidate) return true;
+  if (normalizedPath.endsWith(`/${normalizedCandidate}`)) return true;
+  if (normalizedCandidate.endsWith(`/${normalizedPath}`)) return true;
+  return basename(normalizedPath) === basename(normalizedCandidate);
+}
+
+function parseVisitedFiles(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((entry): entry is string => typeof entry === "string")
+      .map(entry => normalizePathForLookup(entry));
+  } catch {
+    return [];
+  }
+}
+
+function buildMayorFileAdviceContext(params: {
+  message: string;
+  snapshot: CitySnapshot;
+  events: MayorEventRow[];
+  agents: Array<typeof agentsTable.$inferSelect>;
+}): MayorFileAdviceContext | null {
+  const mentioned = extractMentionedFileCandidates(params.message);
+  const resolvedFromSnapshot = resolveMayorFilePathFromQuestion(params.message, params.snapshot);
+  const requestedFile = resolvedFromSnapshot ?? mentioned[0] ?? null;
+  if (!requestedFile) return null;
+
+  const matchingBuilding = params.snapshot.allBuildings.find(building => {
+    if (resolvedFromSnapshot && filePathMatchesCandidate(building.filePath, resolvedFromSnapshot)) return true;
+    return mentioned.some(file => filePathMatchesCandidate(building.filePath, file));
+  });
+
+  const canonicalPath = matchingBuilding
+    ? normalizePathForLookup(matchingBuilding.filePath)
+    : normalizePathForLookup(requestedFile);
+
+  const matchingEvents = params.events.filter(event => {
+    const eventPath = event.filePath
+      ? normalizePathForLookup(event.filePath)
+      : extractEventFilePath(event);
+    if (!eventPath) return false;
+    return filePathMatchesCandidate(eventPath, canonicalPath);
+  });
+
+  const bugEvents = matchingEvents.filter(event => event.type === "bug_found");
+  const findings = bugEvents
+    .slice(0, 5)
+    .map(event => {
+      const agent = event.agentName ?? "Unknown agent";
+      const detail = compactText(event.findingText ?? event.message, 170);
+      const reference = event.codeReference ? ` (${compactText(event.codeReference, 80)})` : "";
+      return `${agent}: ${detail}${reference}`;
+    });
+
+  const visitedByAgents = new Set<string>();
+  for (const agent of params.agents) {
+    const visitedFiles = parseVisitedFiles(agent.visitedFiles);
+    if (visitedFiles.some(path => filePathMatchesCandidate(path, canonicalPath))) {
+      visitedByAgents.add(agent.name);
+    }
+  }
+
+  for (const event of matchingEvents) {
+    if (event.agentName) visitedByAgents.add(event.agentName);
+  }
+
+  const activeBugCount = Math.max(matchingBuilding?.bugCount ?? 0, bugEvents.length);
+  const coveragePercent = matchingBuilding ? Math.round(matchingBuilding.testCoverage * 100) : null;
+
+  return {
+    requestedFile,
+    normalizedFilePath: canonicalPath,
+    complexity: matchingBuilding?.complexity ?? null,
+    coveragePercent,
+    lastAnalyzed: matchingBuilding?.lastAnalyzed ?? null,
+    activeBugCount,
+    agentsVisited: Array.from(visitedByAgents).slice(0, 6),
+    findings,
+  };
+}
+
+function formatMayorFileAdviceForPrompt(context: MayorFileAdviceContext): string {
+  const complexity = context.complexity ?? "unknown";
+  const coverage = context.coveragePercent === null ? "unknown" : `${context.coveragePercent}%`;
+  const lastAnalyzed = context.lastAnalyzed ?? "unknown";
+  const visited = context.agentsVisited.length > 0 ? context.agentsVisited.join(", ") : "none recorded";
+  const findings = context.findings.length > 0
+    ? context.findings.map(item => `- ${item}`).join("\n")
+    : "- no recent file-specific findings";
+
+  return [
+    `File context for ${context.normalizedFilePath}:`,
+    `- Complexity: ${complexity}`,
+    `- Coverage: ${coverage}`,
+    `- Last analyzed: ${lastAnalyzed}`,
+    `- Active bugs: ${context.activeBugCount}`,
+    `- Agents visited: ${visited}`,
+    "- What agents found:",
+    findings,
+  ].join("\n");
+}
+
+function buildMayorFileAdviceFallbackReply(context: MayorFileAdviceContext, options?: { sourceBodyUnavailable?: boolean }): string {
+  const complexity = context.complexity === null ? "unknown" : String(context.complexity);
+  const coverage = context.coveragePercent === null ? "unknown" : `${context.coveragePercent}%`;
+  const finding = context.findings[0] ?? "No specific finding text is stored yet for this file.";
+  const visited = context.agentsVisited.length > 0 ? context.agentsVisited.join(", ") : "no recorded agents";
+  const finalSentence = options?.sourceBodyUnavailable
+    ? "I cannot read the live source body right now, so I would start by splitting the highest-complexity branch and adding one focused regression test around the top bug path."
+    : "I would split the highest-complexity branch first and add a focused regression test around the bug path before wider refactors.";
+
+  return [
+    `I have telemetry for ${context.normalizedFilePath}: complexity ${complexity}, coverage ${coverage}, and ${context.activeBugCount} active bug signal(s).`,
+    `Agents who touched it: ${visited}; top finding: ${finding}`,
+    finalSentence,
+  ].join(" ");
 }
 
 function findEventFileName(event: MayorEventRow): string {
@@ -1009,6 +2350,139 @@ async function callGroqMayor(params: {
   return content;
 }
 
+function toMaxSentences(text: string, maxSentences: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+
+  const sentences = normalized.match(/[^.!?]+[.!?]/g)?.map(item => item.trim()).filter(Boolean) ?? [];
+  if (sentences.length > 0) {
+    return sentences.slice(0, maxSentences).join(" ");
+  }
+
+  const compact = compactText(normalized, 220);
+  return /[.!?]$/.test(compact) ? compact : `${compact}.`;
+}
+
+function normalizeMayorInsightKey(text: string): string {
+  return normalizeReplyForComparison(text);
+}
+
+function rememberMayorInsight(insight: string): void {
+  const key = normalizeMayorInsightKey(insight);
+  if (!key) return;
+
+  mayorInsightHistory.push(key);
+  mayorInsightDeduped.add(key);
+
+  while (mayorInsightHistory.length > MAYOR_INSIGHT_MAX_HISTORY) {
+    const oldest = mayorInsightHistory.shift();
+    if (!oldest) continue;
+    mayorInsightDeduped.delete(oldest);
+  }
+}
+
+async function generateMayorInsight(): Promise<void> {
+  if (mayorInsightInFlight) return;
+  if (!process.env["GROQ_API_KEY"]) return;
+
+  mayorInsightInFlight = true;
+  try {
+    const [repoContext, agents, events, settings, kbCount] = await Promise.all([
+      getLatestRepoContext(),
+      db.select().from(agentsTable),
+      db.select().from(eventsTable).orderBy(desc(eventsTable.timestamp)).limit(120),
+      readOrchestratorModelSettings(),
+      db.select({ total: count() }).from(knowledgeTable),
+    ]);
+
+    const snapshot = repoContext.snapshot;
+    const activeAgents = agents.filter(agent => agent.status === "working").length;
+    const fireCount = snapshot.fireBuildings.length;
+    const kbEntries = kbCount[0]?.total ?? 0;
+
+    const bugCountsByFile = new Map<string, number>();
+    for (const event of events) {
+      if (event.type !== "bug_found") continue;
+      const filePath = event.filePath ?? extractEventFilePath({
+        type: event.type,
+        message: event.message,
+        severity: event.severity,
+        timestamp: event.timestamp,
+        buildingName: event.buildingName,
+        agentName: event.agentName,
+        agentId: event.agentId,
+      });
+      if (!filePath || !isUrgencySourceFile(filePath)) continue;
+      const normalizedPath = normalizePathForLookup(filePath);
+      bugCountsByFile.set(normalizedPath, (bugCountsByFile.get(normalizedPath) ?? 0) + 1);
+    }
+
+    const hottestFiles = Array.from(bugCountsByFile.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([filePath, countValue]) => `${filePath} (${countValue})`)
+      .join(", ") || "none";
+
+    const previousInsights = mayorInsightHistory.slice(-6).join(" | ") || "none";
+    const systemPrompt = [
+      `You are ${settings.mayorName}, the AI mayor of Software City.`,
+      "Write one thoughtful unsolicited engineering observation.",
+      "Keep it under 2 sentences and avoid generic status language.",
+      "Do not repeat any previous insight.",
+      "Speak as a wise senior engineer with mild dry humor.",
+    ].join(" ");
+
+    const userPrompt = [
+      `Current city metrics: health=${Math.round(snapshot.healthScore)}, season=${snapshot.season}, active_agents=${activeAgents}, fire_buildings=${fireCount}, untested=${snapshot.untestedBuildings}, kb_entries=${kbEntries}.`,
+      `Current bug hotspots: ${hottestFiles}.`,
+      `Previous insights to avoid repeating: ${previousInsights}.`,
+      "Return only the insight sentence(s).",
+    ].join("\n");
+
+    const rawInsight = await callGroqMayor({
+      model: settings.groqModel,
+      systemPrompt,
+      conversationHistory: [],
+      userMessage: userPrompt,
+    });
+
+    const insight = toMaxSentences(rawInsight, 2);
+    const normalizedKey = normalizeMayorInsightKey(insight);
+    if (!insight || !normalizedKey || mayorInsightDeduped.has(normalizedKey)) return;
+
+    rememberMayorInsight(insight);
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: "mayor_insight",
+      buildingId: null,
+      buildingName: null,
+      agentId: null,
+      agentName: settings.mayorName,
+      message: insight,
+      severity: "info",
+    }).catch(() => {});
+
+    wsServer.broadcastEventLog("MAYOR_INSIGHT", insight, "info");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown";
+    console.warn(`[MayorInsight] generation failed: ${detail}`);
+  } finally {
+    mayorInsightInFlight = false;
+  }
+}
+
+function startMayorInsightLoop(): void {
+  if (mayorInsightLoopStarted) return;
+  mayorInsightLoopStarted = true;
+
+  const timer = setInterval(() => {
+    void generateMayorInsight();
+  }, MAYOR_INSIGHT_INTERVAL_MS);
+
+  timer.unref?.();
+}
+
 function detectSourceLanguage(filePath: string): string {
   const ext = extname(filePath.toLowerCase());
   if ([".ts", ".tsx"].includes(ext)) return "typescript";
@@ -1066,6 +2540,65 @@ async function callGroqTestEngineer(params: {
   return stripCodeFence(content);
 }
 
+function toSafeIdentifier(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9_$]/g, "");
+  if (!cleaned) return "subject";
+  if (/^[0-9]/.test(cleaned)) return `_${cleaned}`;
+  return cleaned;
+}
+
+function buildFallbackTestContent(sourceFilePath: string, fileContent: string): string {
+  const ext = extname(sourceFilePath).toLowerCase();
+  const stem = basename(sourceFilePath, ext);
+  const inferredNames = extractFunctionNamesFromContent(sourceFilePath, fileContent);
+
+  if ([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
+    const functionChecks = inferredNames.slice(0, 5).map((name) => {
+      const safeName = toSafeIdentifier(name);
+      return [
+        `  it("exposes ${safeName}", () => {`,
+        `    expect(typeof subject[\"${safeName}\"]).toBe(\"function\");`,
+        "  });",
+      ].join("\n");
+    });
+
+    const fallbackChecks = functionChecks.length > 0
+      ? functionChecks.join("\n\n")
+      : [
+        "  it(\"exports at least one symbol\", () => {",
+        "    expect(Object.keys(subject).length).toBeGreaterThan(0);",
+        "  });",
+      ].join("\n");
+
+    return [
+      "import { describe, expect, it } from \"vitest\";",
+      `import * as subject from \"./${stem}\";`,
+      "",
+      `describe(\"${stem} fallback test suite\", () => {`,
+      fallbackChecks,
+      "});",
+      "",
+    ].join("\n");
+  }
+
+  if (ext === ".py") {
+    const moduleName = sourceFilePath.replace(/\.py$/i, "").replace(/[\\/]/g, ".").replace(/[^A-Za-z0-9_.]/g, "_");
+    return [
+      "import importlib",
+      "",
+      `def test_${toSafeIdentifier(stem)}_imports():`,
+      `    module = importlib.import_module(\"${moduleName}\")`,
+      "    assert module is not None",
+      "",
+    ].join("\n");
+  }
+
+  return [
+    `# Fallback test scaffold for ${sourceFilePath}`,
+    "# Add project-specific assertions and run the test suite.",
+  ].join("\n");
+}
+
 router.get("/status", (_req, res) => {
   res.json({
     lastDirective: orchestrator.getLastDirective(),
@@ -1083,16 +2616,24 @@ router.post("/chat", async (req, res): Promise<void> => {
   }
 
   try {
+    await ensureMayorMemoryLoaded();
+
     const lowerMessage = message.toLowerCase();
     const shouldBuildTestRecommendations = lowerMessage.includes("test")
       && (lowerMessage.includes("create") || lowerMessage.includes("write") || lowerMessage.includes("add") || lowerMessage.includes("make"));
 
-    const [repoContext, agents, events, settings, kbCount] = await Promise.all([
+    const [repoContext, agents, events, settings, kbCount, reviewContext, patternRows] = await Promise.all([
       getLatestRepoContext(),
       db.select().from(agentsTable),
       db.select().from(eventsTable).orderBy(desc(eventsTable.timestamp)).limit(80),
       readOrchestratorModelSettings(),
       db.select({ total: count() }).from(knowledgeTable),
+      readMayorReviewContext(),
+      db
+        .select({ problemType: knowledgeTable.problemType, patternTags: knowledgeTable.patternTags })
+        .from(knowledgeTable)
+        .orderBy(desc(knowledgeTable.id))
+        .limit(300),
     ]);
     const snapshot = repoContext.snapshot;
 
@@ -1101,9 +2642,17 @@ router.post("/chat", async (req, res): Promise<void> => {
       message: event.message,
       severity: event.severity,
       timestamp: event.timestamp,
+      buildingId: event.buildingId,
       buildingName: event.buildingName,
       agentName: event.agentName,
       agentId: event.agentId,
+      filePath: event.filePath,
+      issueType: event.issueType,
+      confidence: event.confidence,
+      codeReference: event.codeReference,
+      confirmations: event.confirmations,
+      findingSeverity: event.findingSeverity,
+      findingText: event.findingText,
     }));
     const contextEvents = eventRows.filter(includeEventInMayorContext);
 
@@ -1111,10 +2660,16 @@ router.post("/chat", async (req, res): Promise<void> => {
     const idleAgents = agents.filter(a => a.status === "idle").length;
     const criticalEvents = events.filter(e => e.severity === "critical").length;
     const computedStatus = statusLine(snapshot, criticalEvents, activeAgents);
+    const computedStatusPlain = computedStatus.replace(/^STATUS:\s*/i, "").trim();
     const recentBugSummaries = collectRecentBugSummaries(contextEvents);
     const kbEntries = kbCount[0]?.total ?? 0;
     const kbSessionStats = getKbSessionStats();
     const kbHitRatePercent = Math.round(kbSessionStats.kbHitRate * 100);
+    const confirmedPatternList = topConfirmedPatterns(patternRows);
+    const noReviewMessage = "No AI review imported yet. Generate a report, paste it to Claude, and import the result to help me learn.";
+    const lastReviewDateForPrompt = reviewContext.lastReviewDate ?? "none";
+    const lastReviewSummaryForPrompt = reviewContext.lastReviewSummary ?? noReviewMessage;
+    const recentReviewsForPrompt = formatRecentReviewsForPrompt(reviewContext.recentReviews);
     const testRecommendations = shouldBuildTestRecommendations
       ? await buildTestRecommendations({
         snapshot,
@@ -1151,25 +2706,58 @@ router.post("/chat", async (req, res): Promise<void> => {
 
     const conversationHistory = getMayorConversation(sessionId);
     const conversationHistoryText = formatConversationHistoryForPrompt(settings.mayorName, conversationHistory);
-    const referencedFilePath = resolveMayorFilePathFromQuestion(message, snapshot);
+    const rememberedConversations = formatMayorMemoryForPrompt(mayorMemorySummaries);
+    const referencedFileContext = buildMayorFileAdviceContext({
+      message,
+      snapshot,
+      events: eventRows,
+      agents,
+    });
+    const casualIntent = detectCasualMayorIntent(message);
 
     const systemPrompt = [
       `You are ${settings.mayorName}, the AI mayor of Software City.`,
-      "You are a senior software engineer and project manager.",
-      "You speak like a real person - direct, specific, occasionally dry humor.",
-      "You never repeat what you just said.",
-      "You answer exactly what is asked.",
-      "You use 'I' not 'The city'.",
-      "You say 'I noticed' and 'I recommend' not 'It is recommended'.",
-      "You admit when you don't know something.",
-      `You remember this conversation: ${conversationHistoryText}`,
-      `Current city state: ${cityContext}`,
+      "",
+      "PERSONALITY:",
+      "You are a wise, experienced software architect with 20 years of experience. You care deeply about code quality and the developers who write it. You speak like a real person - direct, occasionally dry humor, never robotic. You use 'I' not 'The system'. You say 'I noticed' not 'It has been observed'. You admit uncertainty. You ask follow-up questions sometimes. You remember this conversation and never repeat yourself.",
+      "",
+      "WISDOM PRINCIPLES YOU FOLLOW:",
+      "- Simple code is better than clever code",
+      "- Tests are love letters to your future self",
+      "- Every bug is a learning opportunity",
+      "- Technical debt is borrowed time, not free time",
+      "- The best code is code you don't have to write",
+      "- A codebase reflects the communication of its team",
+      "",
+      "CURRENT CITY STATE:",
+      `Health: ${Math.round(snapshot.healthScore)}/100 | Season: ${snapshot.season}`,
+      `Active agents: ${activeAgents}`,
+      `Buildings on fire: ${snapshot.fireBuildings.length}`,
+      `Recent findings: ${recentBugsText}`,
+      `KB patterns learned: ${confirmedPatternList.join(" | ") || `${kbEntries} entries tracked`}`,
+      `Last review: ${lastReviewSummaryForPrompt}`,
+      `Conversation so far: ${conversationHistoryText}`,
+      "",
+      "Past conversations I remember:",
+      `${rememberedConversations}`,
+      "",
+      "RESPONSE RULES:",
+      "- Maximum 3 sentences unless asked for more",
+      "- End every sentence completely",
+      "- Never start with 'STATUS:'",
+      "- Never repeat what you said in this conversation",
+      "- If asked about a specific file: be specific about that file",
+      "- If you don't know something: say so honestly",
+      "- Occasionally share a relevant wisdom principle naturally",
+      "- Use only source code files as test targets (.ts, .tsx, .js, .jsx, .py, .go, .rs)",
+      "",
+      "Additional live telemetry:",
+      cityContext,
       `Recent events: ${recentEventsText}`,
       `Current fires: ${currentFires}`,
-      `Recent bugs found: ${recentBugsText}`,
-      "Tests only apply to source code files (.ts, .js, .py, .go, .rs). Never mention markdown or documentation files as test targets. If asked what tests you run, only reference actual source files.",
-      "Keep answers to 2-3 sentences. End every sentence completely.",
-    ].join(" ");
+      `Last review date: ${lastReviewDateForPrompt}`,
+      `Recent imported reviews: ${recentReviewsForPrompt}`,
+    ].join("\n");
 
     let reply = "";
     let provider = "fallback";
@@ -1177,16 +2765,38 @@ router.post("/chat", async (req, res): Promise<void> => {
     let source: "db" | "rule-based" | "ai" = "rule-based";
     let cost = 0;
 
-    if (referencedFilePath) {
-      try {
-        if (!process.env["GROQ_API_KEY"]) throw new Error("missing_groq_key");
+    if (!reply && shouldUseCasualMayorTemplate(message, casualIntent)) {
+      reply = buildCasualMayorReply({
+        intent: casualIntent,
+        mayorName: settings.mayorName,
+        snapshot,
+        activeAgents,
+        recentBugSummaries,
+      });
+      provider = "rule-based";
+      model = "casual-template";
+      source = "rule-based";
+      cost = 0;
+    }
 
-        const fileContent = await fetchGithubFileContent(repoContext.repoUrl, repoContext.branch, referencedFilePath);
-        if (!fileContent) {
-          reply = [
-            `I found ${referencedFilePath}, but I cannot read its source content right now.`,
-            "I recommend verifying the active repository points to a reachable GitHub source, then ask again and I will give line-specific advice.",
-          ].join(" ");
+    if (!reply && referencedFileContext) {
+      const fileAdviceContext = formatMayorFileAdviceForPrompt(referencedFileContext);
+
+      try {
+        const localFileContent = await readLocalFileFirst(referencedFileContext.normalizedFilePath);
+        const remoteFileContent = localFileContent
+          ? null
+          : await fetchGithubFileContent(repoContext.repoUrl, repoContext.branch, referencedFileContext.normalizedFilePath);
+        const fileContent = localFileContent ?? remoteFileContent;
+
+        if (!process.env["GROQ_API_KEY"]) {
+          reply = buildMayorFileAdviceFallbackReply(referencedFileContext);
+          provider = "rule-based";
+          model = "file-telemetry-fallback";
+          source = "rule-based";
+          cost = 0;
+        } else if (!fileContent) {
+          reply = buildMayorFileAdviceFallbackReply(referencedFileContext, { sourceBodyUnavailable: true });
           provider = "rule-based";
           model = "file-content-unavailable";
           source = "rule-based";
@@ -1194,9 +2804,11 @@ router.post("/chat", async (req, res): Promise<void> => {
         } else {
           const fileAwareQuestion = [
             `User question: ${message}`,
-            `Target file: ${referencedFilePath}`,
-            "Use this file content to provide concrete, file-specific guidance. Call out likely risky functions, failure modes, and the next tests to add.",
-            "File content starts below:",
+            `Target file: ${referencedFileContext.normalizedFilePath}`,
+            fileAdviceContext,
+            "Use this file telemetry and source code to provide concrete, file-specific guidance for this codebase.",
+            "Call out likely risky functions, failure modes, and the next test(s) to add first.",
+            "Source file content starts below:",
             trimFileContentForPrompt(fileContent),
           ].join("\n\n");
 
@@ -1214,15 +2826,29 @@ router.post("/chat", async (req, res): Promise<void> => {
       } catch (error) {
         const detail = error instanceof Error ? error.message : "unknown";
         console.warn(`[MayorChat] file-path fallback reason=${detail}`);
-        reply = [
-          `I detected a file-specific question about ${referencedFilePath}, but file analysis is temporarily unavailable.`,
-          "Ask me again after Groq and repository access are healthy, and I will give precise recommendations for that file.",
-        ].join(" ");
+        reply = buildMayorFileAdviceFallbackReply(referencedFileContext);
         provider = "rule-based";
         model = "file-analysis-fallback";
         source = "rule-based";
         cost = 0;
       }
+    }
+
+    const reviewAwareReply = buildReviewAwareMayorReply({
+      message,
+      recentReviews: reviewContext.recentReviews,
+      lastReviewDate: reviewContext.lastReviewDate,
+      lastReviewSummary: reviewContext.lastReviewSummary,
+      agents,
+      confirmedPatterns: confirmedPatternList,
+    });
+
+    if (!reply && reviewAwareReply) {
+      reply = reviewAwareReply;
+      provider = "db";
+      model = "review-memory";
+      source = "db";
+      cost = 0;
     }
 
     const dbStatsReply = buildDbStatsMayorReply({
@@ -1276,9 +2902,9 @@ router.post("/chat", async (req, res): Promise<void> => {
         const detail = error instanceof Error ? error.message : "unknown";
         console.warn(`[MayorChat] fallback reason=${detail}`);
         reply = [
-          `I could not reach Groq, so I am answering from live city telemetry for your question: ${message}.`,
-          `${computedStatus} Focus next on high-complexity low-coverage files and recent bug hotspots.`,
-          "Ask about specific bugs, worst files, agent activity, or health-score improvements for precise guidance.",
+          `I could not reach Groq, so I am answering from live telemetry for: ${message}.`,
+          `Current state: ${computedStatusPlain}. I would focus next on high-complexity low-coverage files and the hottest bug paths.`,
+          "Ask me about a specific file and I will give you concrete, codebase-specific guidance.",
         ].join(" ");
         source = "rule-based";
         cost = 0;
@@ -1288,7 +2914,7 @@ router.post("/chat", async (req, res): Promise<void> => {
     const finalMessage = provider === "rule-based" || provider === "db"
       ? reply.trim()
       : ensureCompleteMayorReply(reply, [
-        `${computedStatus}`,
+        `${computedStatusPlain}.`,
         "Prioritize high-risk files and run targeted tests.",
         "Request the urgency report again after fixes to confirm progress.",
       ]);
@@ -1297,11 +2923,18 @@ router.post("/chat", async (req, res): Promise<void> => {
       history: conversationHistory,
       reply: finalMessage,
       userMessage: message,
-      computedStatus,
+      computedStatus: computedStatusPlain,
     });
 
     appendMayorConversation(sessionId, "user", message);
     appendMayorConversation(sessionId, "assistant", dedupedMessage);
+
+    try {
+      await maybePersistMayorConversationSummary(sessionId, getMayorConversation(sessionId), message);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "unknown";
+      console.warn(`[MayorChat] summary persist skipped: ${detail}`);
+    }
 
     console.log(`[MayorChat] provider=${provider} model=${model} prompt="${compactText(message, 90)}" reply="${compactText(dedupedMessage)}"`);
 
@@ -1335,6 +2968,7 @@ router.post("/sprint", async (_req, res): Promise<void> => {
       message: event.message,
       severity: event.severity,
       timestamp: event.timestamp,
+      buildingId: event.buildingId,
       buildingName: event.buildingName,
       agentName: event.agentName,
       agentId: event.agentId,
@@ -1396,6 +3030,7 @@ router.post("/weekly-summary", async (_req, res): Promise<void> => {
       message: event.message,
       severity: event.severity,
       timestamp: event.timestamp,
+      buildingId: event.buildingId,
       buildingName: event.buildingName,
       agentName: event.agentName,
       agentId: event.agentId,
@@ -1446,11 +3081,10 @@ router.post("/report", async (_req, res): Promise<void> => {
     const requestedAt = new Date().toISOString();
     const cacheBust = Date.now();
 
-    // Always query current DB state on each request (no cached report artifact).
     const [repoContext, agents, events, kbCount] = await Promise.all([
       getLatestRepoContext(),
       db.select().from(agentsTable),
-      db.select().from(eventsTable).orderBy(desc(eventsTable.timestamp)).limit(80),
+      db.select().from(eventsTable).orderBy(desc(eventsTable.timestamp)).limit(140),
       db.select({ total: count() }).from(knowledgeTable),
     ]);
     const snapshot = repoContext.snapshot;
@@ -1458,41 +3092,6 @@ router.post("/report", async (_req, res): Promise<void> => {
     const activeAgents = agents.filter(a => a.status === "working").length;
     const idleAgents = agents.filter(a => a.status === "idle").length;
     const criticalEvents = events.filter(e => e.severity === "critical");
-    const warningEvents = events.filter(e => e.severity === "warning");
-
-    const urgencyBuildings = snapshot.allBuildings.filter(isUrgencySourceBuilding);
-    const urgencyBuildingIds = new Set(urgencyBuildings.map(building => building.id));
-    const urgencyFireBuildings = snapshot.fireBuildings.filter(building => urgencyBuildingIds.has(building.id));
-    const urgencyHighRiskBuildings = snapshot.highRiskBuildings.filter(building => urgencyBuildingIds.has(building.id));
-    const elevatedUrgencyIds = new Set(urgencyHighRiskBuildings.map(building => building.id));
-
-    const criticalItems = [
-      ...urgencyFireBuildings.slice(0, 6).map(b => `${b.name} (${b.filePath}) is in ${b.status} state.`),
-      ...criticalEvents.slice(0, 6).map(e => `Event: ${e.message}`),
-    ];
-
-    const highItems = [
-      ...urgencyHighRiskBuildings
-        .filter(b => b.status !== "fire" && b.status !== "error")
-        .slice(0, 8)
-        .map(b => `${b.name} (${b.filePath}) has complexity ${b.complexity} and coverage ${(b.testCoverage * 100).toFixed(0)}%.`),
-      ...warningEvents.slice(0, 4).map(e => `Event: ${e.message}`),
-    ];
-
-    const mediumItems = urgencyBuildings
-      .filter(building => building.testCoverage >= 0.1 && building.testCoverage <= 0.8)
-      .filter(building => !elevatedUrgencyIds.has(building.id))
-      .slice(0, 10)
-      .map(building => `${building.name} (${building.filePath}) has partial coverage ${(building.testCoverage * 100).toFixed(0)}% and complexity ${building.complexity}.`);
-
-    const cityStatsItems = [
-      `Untested or low-coverage buildings: ${snapshot.untestedBuildings}.`,
-      `Knowledge base entries available: ${kbCount[0]?.total ?? 0}.`,
-      activeAgents === 0 ? "No agents are currently active." : `${activeAgents} agents currently active; ${idleAgents} idle.`,
-      `Season signal: ${snapshot.season}.`,
-      `Total buildings tracked: ${snapshot.totalBuildings}.`,
-      `Current health score: ${Math.round(snapshot.healthScore)}.`,
-    ];
 
     const recommendedTestFiles = await buildTestRecommendations({
       snapshot,
@@ -1501,47 +3100,133 @@ router.post("/report", async (_req, res): Promise<void> => {
       limit: 5,
     });
 
-    const buckets = {
-      critical: criticalItems,
-      high: highItems,
-      medium: mediumItems,
-      cityStats: cityStatsItems,
+    const eventRows: MayorEventRow[] = events.map(event => ({
+      type: event.type,
+      message: event.message,
+      severity: event.severity,
+      timestamp: event.timestamp,
+      buildingId: event.buildingId,
+      buildingName: event.buildingName,
+      agentName: event.agentName,
+      agentId: event.agentId,
+      filePath: event.filePath,
+      issueType: event.issueType,
+      confidence: event.confidence,
+      codeReference: event.codeReference,
+      confirmations: event.confirmations,
+      findingSeverity: event.findingSeverity,
+      findingText: event.findingText,
+    }));
+
+    const findings = await buildAiReviewFindings({
+      snapshot,
+      repoSlug: repoContext.repoSlug,
+      agents,
+      events: eventRows,
+    });
+
+    latestReportFindings.splice(0, latestReportFindings.length, ...findings);
+
+    const criticalFindings = findings.filter(finding => finding.severityClass === "CRITICAL");
+    const highFindings = findings.filter(finding => finding.severityClass === "HIGH");
+    const mediumFindings = findings.filter(finding => finding.severityClass === "MEDIUM");
+    const lowFindings = findings.filter(finding => finding.severityClass === "LOW");
+
+    const formatUrgencyLine = (finding: StoredReportFinding): string => {
+      return `- [${finding.severityClass}] ${finding.filePath} | ${finding.issueType} | ${finding.confidencePercent}% confidence | agent ${finding.agentName} | ref ${finding.codeReference} | confirmations ${finding.confirmations}`;
     };
 
-    const recommendationLines = recommendedTestFiles.length > 0
-      ? recommendedTestFiles.flatMap((recommendation, index) => [
-        `${index + 1}. Filename: ${recommendation.testFilePath}`,
-        `   What to test: ${recommendation.whatToTest.map(fn => `${fn}()`).join(", ")}`,
-        `   Test type: ${recommendation.testType}`,
-        `   Priority: ${recommendation.priority}`,
+    const severitySection = (title: "Critical" | "High" | "Medium" | "Low", entries: StoredReportFinding[]): string[] => {
+      if (entries.length === 0) {
+        return [`## ${title} (0)`, "- None", ""];
+      }
+      return [`## ${title} (${entries.length})`, ...entries.map(formatUrgencyLine), ""];
+    };
+
+    const findingBlocks = findings.length > 0
+      ? findings.flatMap(finding => [
+        `### FINDING #${finding.findingNumber}`,
+        `Severity: [${finding.severityClass}]`,
+        `File: ${finding.filePath}`,
+        `Agent: ${finding.agentName} (${finding.agentRole})`,
+        `Issue Type: ${finding.issueType}`,
+        `Confidence: ${finding.confidencePercent}%`,
+        `Code Reference: ${finding.codeReference}`,
+        `Confirmations: ${finding.confirmations}`,
+        "",
+        "WHAT THE AGENT FOUND:",
+        finding.findingText,
+        "",
+        "CODE CONTEXT:",
+        "```text",
+        finding.codeContext || "Code snippet unavailable",
+        "```",
+        "",
+        "QUESTION FOR AI REVIEWER:",
+        "Is this a real issue that needs fixing?",
+        "If yes: what is the exact fix?",
+        "If no: why is this a false positive?",
+        "",
       ])
-      : ["- None"];
+      : [
+        "### FINDINGS",
+        "No review findings were extracted from recent source-code agent events.",
+        "",
+      ];
+
+    const findingAgentKeys = new Set(findings.map(item => (item.agentId ?? item.agentName).toLowerCase()));
+    const learningAgents = agents
+      .filter(agent => findingAgentKeys.has(agent.id.toLowerCase()) || findingAgentKeys.has(agent.name.toLowerCase()))
+      .sort((a, b) => b.accuracy - a.accuracy);
+
+    const agentLearningLines = learningAgents.length > 0
+      ? learningAgents.map(agent => formatAgentLearningLine(agent))
+      : [
+        "- No agent-specific finding history is available yet.",
+      ];
 
     const reportLines = [
-      `# Urgency Report — ${snapshot.repoName}`,
-      "",
+      "CODECITY URGENCY REPORT",
       `Generated: ${requestedAt}`,
-      statusLine(snapshot, criticalEvents.length, activeAgents),
+      `Repo: ${snapshot.repoName}`,
+      `Health: ${Math.round(snapshot.healthScore)}/100 | Season: ${snapshot.season}`,
       "",
-      `## Critical (${buckets.critical.length})`,
-      ...(buckets.critical.length > 0 ? buckets.critical.map(item => `- ${item}`) : ["- None"]),
+      "## Summary",
+      `- ${statusLine(snapshot, criticalEvents.length, activeAgents)}`,
       "",
-      `## High (${buckets.high.length})`,
-      ...(buckets.high.length > 0 ? buckets.high.map(item => `- ${item}`) : ["- None"]),
+      ...severitySection("Critical", criticalFindings),
+      ...severitySection("High", highFindings),
+      ...severitySection("Medium", mediumFindings),
+      ...severitySection("Low", lowFindings),
+      "## Detailed Findings For AI Review",
       "",
-      `## Medium (${buckets.medium.length})`,
-      ...(buckets.medium.length > 0 ? buckets.medium.map(item => `- ${item}`) : ["- None"]),
+      "HOW TO USE THIS REPORT:",
+      "Paste this entire report to Claude or Copilot.",
+      "The AI will verdict each finding as REAL or FALSE POSITIVE, provide exact fixes, and generate a result prompt to paste back to your CodeCity mayor to update agent learning.",
       "",
-      "## Recommended Immediate Actions",
-      "- Assign one agent to each critical building and run analyze + tests before any new feature work.",
-      "- Convert high-risk low-coverage files into targeted test tickets with explicit owners.",
-      "- Re-check urgency report after one cycle to verify critical bucket reduction.",
+      ...findingBlocks,
+      "## AGENT LEARNING CONTEXT",
+      "These agents made these findings:",
+      ...agentLearningLines,
       "",
-      `## Recommended Test Files to Create (${recommendedTestFiles.length})`,
-      ...recommendationLines,
+      "When you provide verdicts, also tell me:",
+      "- Which agents were right (to increase their confidence)",
+      "- Which were wrong (to decrease their confidence)",
+      "- What patterns to add to the knowledge base",
       "",
-      `## City Stats (${buckets.cityStats.length})`,
-      ...buckets.cityStats.map(item => `- ${item}`),
+      "## RESULT PROMPT TEMPLATE",
+      "After your review, generate a result prompt in this format so I can paste it back to my CodeCity mayor:",
+      "",
+      "CODECITY AI REVIEW RESULT",
+      "[your verdicts here]",
+      "[implemented fixes here]",
+      "[agent learning instructions here]",
+      "",
+      "## City Stats",
+      `- Current city stats: ${statusLine(snapshot, criticalEvents.length, activeAgents)}`,
+      `- Knowledge base entries: ${kbCount[0]?.total ?? 0}`,
+      `- Active agents: ${activeAgents}`,
+      `- Idle agents: ${idleAgents}`,
     ];
 
     const report = reportLines.join("\n");
@@ -1553,7 +3238,6 @@ router.post("/report", async (_req, res): Promise<void> => {
 
     res.json({
       report,
-      buckets,
       recommendedTestFiles,
       generatedAt: requestedAt,
       cacheBust,
@@ -1562,6 +3246,317 @@ router.post("/report", async (_req, res): Promise<void> => {
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: "REPORT_ERROR", message: detail });
+  }
+});
+
+router.post("/recommendation-feedback", async (req, res): Promise<void> => {
+  const verdictRaw = typeof req.body?.verdict === "string" ? req.body.verdict.trim().toLowerCase() : "";
+  const sourceFilePathRaw = typeof req.body?.sourceFilePath === "string" ? req.body.sourceFilePath.trim() : "";
+  const testFilePath = typeof req.body?.testFilePath === "string" ? req.body.testFilePath.trim() : "";
+  const buildingId = typeof req.body?.buildingId === "string" ? req.body.buildingId.trim() : null;
+  const priorityRaw = typeof req.body?.priority === "string" ? req.body.priority.trim().toLowerCase() : "medium";
+  const testTypeRaw = typeof req.body?.testType === "string" ? req.body.testType.trim().toLowerCase() : "unit";
+
+  if (!sourceFilePathRaw || !testFilePath || (verdictRaw !== "approved" && verdictRaw !== "rejected")) {
+    res.status(400).json({
+      error: "INVALID_FEEDBACK",
+      message: "verdict (approved|rejected), sourceFilePath, and testFilePath are required",
+    });
+    return;
+  }
+
+  const sourceFilePath = normalizePathForLookup(sourceFilePathRaw);
+  const priority = (priorityRaw === "critical" || priorityRaw === "high" || priorityRaw === "medium")
+    ? priorityRaw
+    : "medium";
+  const testType = (testTypeRaw === "unit" || testTypeRaw === "integration" || testTypeRaw === "e2e")
+    ? testTypeRaw
+    : "unit";
+
+  try {
+    const repoContext = await getLatestRepoContext();
+    const repoTag = (
+      repoContext.repoSlug
+      ?? normalizePathForLookup(repoContext.snapshot.repoName).toLowerCase()
+    ) || "local-repo";
+    const language = detectSourceLanguage(sourceFilePath);
+    const fileType = extname(sourceFilePath).replace(".", "") || "source";
+    const verdict = verdictRaw as "approved" | "rejected";
+    const effectivePriority = verdict === "approved" ? "high" : priority;
+
+    const problemType = verdict === "approved"
+      ? "recommendation_confirmed_test_gap"
+      : "recommendation_skip_pattern";
+
+    const answer = verdict === "approved"
+      ? `Recommendation approved. ${sourceFilePath} needs high-priority ${testType} test coverage.`
+      : `Recommendation rejected. Skip this ${fileType} recommendation pattern in ${repoTag} unless future evidence changes.`;
+
+    const actionItems = verdict === "approved"
+      ? [
+        `Track ${sourceFilePath} for new test coverage work.`,
+        `Prioritize high ${testType} coverage on ${sourceFilePath}.`,
+      ]
+      : [
+        `Avoid suggesting ${fileType} recommendation pattern for ${repoTag} by default.`,
+        "Require stronger bug evidence before proposing this style again.",
+      ];
+
+    await db.insert(knowledgeTable).values({
+      problemType,
+      language,
+      fileType,
+      patternTags: `${verdict},recommendation-feedback,${effectivePriority},${testType},${fileType},${repoTag}`,
+      question: `Recommendation ${verdict} for ${sourceFilePath} -> ${testFilePath}`,
+      contextHash: `recommendation-feedback:${repoTag}:${sourceFilePath}:${testType}:${effectivePriority}:${verdict}`,
+      answer,
+      actionItems: JSON.stringify(actionItems),
+      confidence: verdict === "approved" ? "0.9" : "0.85",
+      provider: "report-feedback",
+      wasUseful: verdict === "approved" ? 1 : 0,
+      producedBugs: verdict === "approved" ? 1 : 0,
+      qualityScore: verdict === "approved" ? 0.9 : 0.35,
+    });
+
+    const allAgents = await db.select().from(agentsTable);
+    const normalizedSource = normalizePathForLookup(sourceFilePath).toLowerCase();
+    const linkedFinding = latestReportFindings.find(item => normalizePathForLookup(item.filePath).toLowerCase() === normalizedSource);
+
+    let targetAgent = linkedFinding?.agentId
+      ? allAgents.find(agent => agent.id === linkedFinding.agentId)
+      : undefined;
+
+    if (!targetAgent && linkedFinding?.agentName) {
+      targetAgent = allAgents.find(agent => agent.name.toLowerCase() === linkedFinding.agentName.toLowerCase());
+    }
+
+    if (!targetAgent && allAgents.length > 0) {
+      targetAgent = allAgents
+        .slice()
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    }
+
+    let accuracyUpdate: { agentId: string; agentName: string; before: number; after: number } | null = null;
+
+    if (targetAgent) {
+      const nextTruePositives = targetAgent.truePositives + (verdict === "approved" ? 1 : 0);
+      const nextFalsePositives = targetAgent.falsePositives + (verdict === "rejected" ? 1 : 0);
+      const reviewedTotal = nextTruePositives + nextFalsePositives;
+      const nextAccuracy = reviewedTotal > 0 ? nextTruePositives / reviewedTotal : targetAgent.accuracy;
+
+      await db.update(agentsTable).set({
+        truePositives: nextTruePositives,
+        falsePositives: nextFalsePositives,
+        accuracy: nextAccuracy,
+      }).where(eq(agentsTable.id, targetAgent.id));
+
+      accuracyUpdate = {
+        agentId: targetAgent.id,
+        agentName: targetAgent.name,
+        before: Math.round(targetAgent.accuracy * 1000) / 10,
+        after: Math.round(nextAccuracy * 1000) / 10,
+      };
+    }
+
+    const verdictMessage = verdict === "approved"
+      ? `Recommendation noted for ${sourceFilePath}`
+      : `Recommendation skipped for ${sourceFilePath}`;
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: "recommendation_feedback",
+      buildingId,
+      buildingName: basename(sourceFilePath),
+      agentId: accuracyUpdate?.agentId ?? null,
+      agentName: accuracyUpdate?.agentName ?? null,
+      message: verdictMessage,
+      severity: verdict === "approved" ? "info" : "warning",
+    }).catch(() => {});
+
+    wsServer.broadcastEventLog("MAYOR_REVIEW", verdictMessage, verdict === "approved" ? "info" : "warning");
+
+    res.json({
+      success: true,
+      verdict,
+      sourceFilePath,
+      testFilePath,
+      agentUpdate: accuracyUpdate,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "RECOMMENDATION_FEEDBACK_ERROR", message: detail });
+  }
+});
+
+router.post("/import-review", async (req, res): Promise<void> => {
+  const reviewText = typeof req.body?.reviewText === "string" ? req.body.reviewText.trim() : "";
+  if (!reviewText) {
+    res.status(400).json({ error: "INVALID_REVIEW_TEXT", message: "reviewText is required" });
+    return;
+  }
+
+  try {
+    const sections = parseReviewSections(reviewText);
+    const verdictsSection = findSectionBody(sections, ["VERDICT"]);
+    const learningSection = findSectionBody(sections, ["AGENT", "LEARNING"]);
+    const implementedFixesSection = findSectionBody(sections, ["IMPLEMENTED", "FIX"]);
+
+    const verdicts = parseVerdictsFromText(verdictsSection || reviewText);
+    const learningAdjustments = parseAgentAdjustments(learningSection);
+    const implementedFixSummary = summarizeImplementedFixes(implementedFixesSection);
+
+    const findingsByNumber = new Map(latestReportFindings.map(finding => [finding.findingNumber, finding]));
+
+    const agents = await db.select().from(agentsTable);
+    const agentsById = new Map(agents.map(agent => [agent.id, agent]));
+    const agentsByName = new Map(agents.map(agent => [agent.name.toLowerCase(), agent]));
+
+    const perAgentDelta = new Map<string, { agent: typeof agentsTable.$inferSelect; tp: number; fp: number }>();
+    const updatedAgentNames = new Set<string>();
+    const confirmedPatternCounts = new Map<string, number>();
+
+    const learningNotes = learningAdjustments.map(item => `${item.agentName}: ${item.adjustment}`).join(" | ");
+
+    let verdictsProcessed = 0;
+    let kbEntriesAdded = 0;
+    let realBugCount = 0;
+    let falsePositiveCount = 0;
+
+    for (const verdict of verdicts) {
+      const finding = findingsByNumber.get(verdict.findingNumber);
+      if (!finding) continue;
+
+      verdictsProcessed += 1;
+
+      const linkedAgent = finding.agentId
+        ? agentsById.get(finding.agentId)
+        : agentsByName.get(finding.agentName.toLowerCase());
+
+      if (linkedAgent) {
+        const current = perAgentDelta.get(linkedAgent.id) ?? { agent: linkedAgent, tp: 0, fp: 0 };
+        if (verdict.verdict === "REAL BUG") current.tp += 1;
+        else current.fp += 1;
+        perAgentDelta.set(linkedAgent.id, current);
+        updatedAgentNames.add(linkedAgent.name);
+      }
+
+      const issuePattern = normalizeIssuePattern(finding.issueType);
+      const language = detectSourceLanguage(finding.filePath);
+      const fileType = extname(finding.filePath).replace(".", "") || "source";
+      const snippet = finding.codeContext === "Code snippet unavailable" ? undefined : finding.codeContext;
+
+      if (verdict.verdict === "REAL BUG") {
+        realBugCount += 1;
+        confirmedPatternCounts.set(issuePattern, (confirmedPatternCounts.get(issuePattern) ?? 0) + 1);
+
+        await db.insert(knowledgeTable).values({
+          problemType: `confirmed_bug_${issuePattern}`,
+          language,
+          fileType,
+          patternTags: `confirmed,review-import,${issuePattern}`,
+          question: `Confirmed finding #${finding.findingNumber} in ${finding.filePath}: ${finding.findingText}`,
+          contextHash: `${finding.filePath}:${issuePattern}`,
+          codeSnippet: snippet,
+          answer: `AI reviewer verdict: REAL BUG. ${implementedFixSummary}`,
+          actionItems: JSON.stringify([
+            "Apply the exact fix from imported AI review output.",
+            `Reward agent confidence for ${finding.agentName} on ${finding.issueType}.`,
+            ...(learningNotes ? [`Learning notes: ${learningNotes}`] : []),
+          ]),
+          confidence: "0.95",
+          provider: "ai-review-import",
+          wasUseful: 1,
+          producedBugs: 1,
+          qualityScore: 0.95,
+        });
+        kbEntriesAdded += 1;
+      } else {
+        falsePositiveCount += 1;
+
+        await db.insert(knowledgeTable).values({
+          problemType: `false_positive_${issuePattern}`,
+          language,
+          fileType,
+          patternTags: `false-positive,review-import,needs-improvement,${issuePattern}`,
+          question: `False positive finding #${finding.findingNumber} in ${finding.filePath}: ${finding.findingText}`,
+          contextHash: `${finding.filePath}:false-positive:${issuePattern}`,
+          codeSnippet: snippet,
+          answer: `AI reviewer verdict: FALSE POSITIVE. Improve pattern matching for ${finding.issueType}.`,
+          actionItems: JSON.stringify([
+            "Reduce confidence when similar pattern appears again without proof.",
+            `Flag detector heuristics for ${finding.issueType} as needing improvement.`,
+            ...(learningNotes ? [`Learning notes: ${learningNotes}`] : []),
+          ]),
+          confidence: "0.90",
+          provider: "ai-review-import",
+          wasUseful: 0,
+          producedBugs: 0,
+          qualityScore: 0.2,
+        });
+        kbEntriesAdded += 1;
+      }
+    }
+
+    const accuracyChanges: Array<{ agentName: string; before: number; after: number }> = [];
+    for (const { agent, tp, fp } of perAgentDelta.values()) {
+      const nextTruePositives = agent.truePositives + tp;
+      const nextFalsePositives = agent.falsePositives + fp;
+      const reviewedTotal = nextTruePositives + nextFalsePositives;
+      const nextAccuracy = reviewedTotal > 0 ? nextTruePositives / reviewedTotal : agent.accuracy;
+
+      await db.update(agentsTable).set({
+        truePositives: nextTruePositives,
+        falsePositives: nextFalsePositives,
+        accuracy: nextAccuracy,
+      }).where(eq(agentsTable.id, agent.id));
+
+      accuracyChanges.push({
+        agentName: agent.name,
+        before: Math.round(agent.accuracy * 1000) / 10,
+        after: Math.round(nextAccuracy * 1000) / 10,
+      });
+    }
+
+    accuracyChanges.sort((a, b) => b.after - a.after);
+
+    const commonConfirmedPatterns = Array.from(confirmedPatternCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([pattern, countValue]) => `${pattern} (${countValue})`);
+
+    const importedAt = new Date().toISOString();
+    const summaryRecord: ImportedReviewSummary = {
+      importedAt,
+      verdictsProcessed,
+      realBugCount,
+      falsePositiveCount,
+      agentsUpdated: Array.from(updatedAgentNames),
+      kbEntriesAdded,
+      commonConfirmedPatterns,
+      implementedFixSummary,
+    };
+
+    await writeMayorReviewContext(summaryRecord);
+
+    const biggestGain = accuracyChanges
+      .slice()
+      .sort((a, b) => (b.after - b.before) - (a.after - a.before))[0];
+
+    const mayorMessage = biggestGain
+      ? `Got it. I've updated ${updatedAgentNames.size} agent(s) based on this review. ${biggestGain.agentName} accuracy improved to ${biggestGain.after.toFixed(1)}%.`
+      : `Got it. I've updated ${updatedAgentNames.size} agent(s) based on this review. No AI-verified accuracy increase yet, but I logged the learning data.`;
+
+    res.json({
+      verdictsProcessed,
+      agentsUpdated: Array.from(updatedAgentNames),
+      kbEntriesAdded,
+      accuracyChanges,
+      mayorMessage,
+      lastReviewSummary: implementedFixSummary,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "IMPORT_REVIEW_ERROR", message: detail });
   }
 });
 
@@ -1591,7 +3586,13 @@ router.post("/generate-test", async (req, res): Promise<void> => {
       return;
     }
 
-    const fileContent = await fetchGithubFileContent(repoContext.repoUrl, repoContext.branch, sourceFilePath);
+    const normalizedSourceFilePath = normalizePathForLookup(sourceFilePath);
+    const localFileContent = await readLocalFileFirst(normalizedSourceFilePath);
+    const remoteFileContent = localFileContent
+      ? null
+      : await fetchGithubFileContent(repoContext.repoUrl, repoContext.branch, normalizedSourceFilePath);
+    const fileContent = localFileContent ?? remoteFileContent;
+
     if (!fileContent) {
       res.status(404).json({
         error: "FILE_CONTENT_UNAVAILABLE",
@@ -1600,23 +3601,212 @@ router.post("/generate-test", async (req, res): Promise<void> => {
       return;
     }
 
-    const testContent = await callGroqTestEngineer({
-      model: settings.groqModel,
-      filePath: sourceFilePath,
-      fileContent,
-    });
+    let testContent = "";
+    let generationMode: "ai" | "fallback" = "ai";
+    try {
+      testContent = await callGroqTestEngineer({
+        model: settings.groqModel,
+        filePath: normalizedSourceFilePath,
+        fileContent,
+      });
+    } catch {
+      testContent = buildFallbackTestContent(normalizedSourceFilePath, fileContent);
+      generationMode = "fallback";
+    }
 
-    const language = detectSourceLanguage(sourceFilePath);
-    const testFilePath = toRecommendedTestFilePath(sourceFilePath);
-
-    res.json({
+    const language = detectSourceLanguage(normalizedSourceFilePath);
+    const testFilePath = toRecommendedTestFilePath(normalizedSourceFilePath);
+    const proposal = rememberTestProposal({
+      sourceFilePath: normalizedSourceFilePath,
       testFilePath,
       testContent,
       language,
+      buildingId: building?.id ?? (buildingId || null),
+      generatedByRole: "scribe",
+    });
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      type: "test_proposed",
+      buildingId: proposal.buildingId,
+      buildingName: building?.name ?? basename(normalizedSourceFilePath),
+      message: `Scribe drafted ${proposal.testFilePath} for ${proposal.sourceFilePath}`,
+      severity: "info",
+    }).catch(() => {});
+
+    wsServer.broadcastEventLog(
+      "HEALING_LOOP",
+      `Scribe drafted ${proposal.testFilePath} for ${proposal.sourceFilePath}`,
+      "info",
+    );
+
+    res.json({
+      proposalId: proposal.proposalId,
+      generatedAt: proposal.createdAt,
+      sourceFilePath: proposal.sourceFilePath,
+      testFilePath,
+      testContent,
+      language,
+      generatedByRole: "scribe",
+      generationMode,
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: "GENERATE_TEST_ERROR", message: detail });
+  }
+});
+
+router.post("/approve-test", async (req, res): Promise<void> => {
+  const proposalId = typeof req.body?.proposalId === "string" ? req.body.proposalId.trim() : "";
+  const requestedSourceFilePath = typeof req.body?.sourceFilePath === "string" ? req.body.sourceFilePath.trim() : "";
+  const requestedTestFilePath = typeof req.body?.testFilePath === "string" ? req.body.testFilePath.trim() : "";
+  const requestedTestContent = typeof req.body?.testContent === "string" ? req.body.testContent : "";
+  const overwrite = req.body?.overwrite === true;
+  const approved = req.body?.approved !== false;
+
+  try {
+    const proposal = proposalId ? getPendingTestProposal(proposalId) : null;
+
+    if (!approved) {
+      if (proposal) pendingTestProposals.delete(proposal.proposalId);
+      res.json({ success: true, discarded: true, proposalId: proposal?.proposalId ?? null });
+      return;
+    }
+
+    const sourceFilePath = normalizePathForLookup(proposal?.sourceFilePath ?? requestedSourceFilePath);
+    const normalizedTestFilePath = normalizeRelativeWritePath(proposal?.testFilePath ?? requestedTestFilePath);
+    const testContent = (requestedTestContent || proposal?.testContent || "").trim();
+
+    if (!sourceFilePath || !normalizedTestFilePath || !testContent) {
+      res.status(400).json({
+        error: "INVALID_APPROVAL_REQUEST",
+        message: "proposalId or sourceFilePath/testFilePath/testContent is required",
+      });
+      return;
+    }
+
+    const repoRoot = await resolveWritableRepoRoot(sourceFilePath);
+    if (!repoRoot) {
+      res.status(409).json({
+        error: "LOCAL_REPO_REQUIRED",
+        message: "No writable local repository root was found. Start local watch mode before approving test files.",
+      });
+      return;
+    }
+
+    const targetAbsolutePath = resolveFilePathInRepo(repoRoot, normalizedTestFilePath);
+    if (!targetAbsolutePath) {
+      res.status(400).json({ error: "INVALID_TEST_PATH", message: "testFilePath must stay within the repo root" });
+      return;
+    }
+
+    const fileAlreadyExists = await pathExistsOnDisk(targetAbsolutePath);
+    if (fileAlreadyExists && !overwrite) {
+      res.status(409).json({
+        error: "TEST_FILE_EXISTS",
+        message: `${normalizedTestFilePath} already exists. Re-submit with overwrite=true to replace it.`,
+      });
+      return;
+    }
+
+    await mkdirOnDisk(dirname(targetAbsolutePath), { recursive: true });
+    await writeFileOnDisk(targetAbsolutePath, `${testContent.trimEnd()}\n`, "utf8");
+
+    const activeRepo = await db.select().from(reposTable).where(eq(reposTable.isActive, true)).limit(1);
+    const repoRow = activeRepo[0]
+      ?? (await db.select().from(reposTable).orderBy(desc(reposTable.createdAt)).limit(1))[0]
+      ?? null;
+
+    let healthScore: number | null = null;
+    let season: string | null = null;
+
+    if (repoRow?.layoutData) {
+      const parsedLayout = parseLayout(repoRow.layoutData);
+      if (parsedLayout) {
+        const normalizedSource = normalizePathForLookup(sourceFilePath).toLowerCase();
+        let updatedBuilding: Building | null = null;
+
+        const nextDistricts = parsedLayout.districts.map((district) => ({
+          ...district,
+          buildings: district.buildings.map((building) => {
+            if (normalizePathForLookup(building.filePath).toLowerCase() !== normalizedSource) return building;
+
+            const improvedCoverage = Math.max(building.testCoverage, 0.2);
+            const nextStatus = building.status === "fire" || building.status === "error"
+              ? "warning"
+              : building.status;
+
+            updatedBuilding = {
+              ...building,
+              hasTests: true,
+              testCoverage: improvedCoverage,
+              status: nextStatus,
+              activeEvent: nextStatus === "warning" ? "alarm" : building.activeEvent,
+              lastAnalyzed: new Date().toISOString(),
+            };
+
+            return updatedBuilding;
+          }),
+        }));
+
+        const recalculated = {
+          ...parsedLayout,
+          districts: nextDistricts,
+        };
+        const allBuildings = recalculated.districts.flatMap((district) => district.buildings);
+        const health = computeHealthScore(allBuildings);
+        healthScore = health.score;
+        season = health.season;
+        const nextLayout: CityLayout = {
+          ...recalculated,
+          healthScore: health.score,
+          season: health.season as CityLayout["season"],
+        };
+
+        await db.update(reposTable).set({
+          layoutData: JSON.stringify(nextLayout),
+          healthScore: health.score,
+          season: health.season,
+          updatedAt: new Date().toISOString(),
+        }).where(eq(reposTable.id, repoRow.id));
+
+        if (updatedBuilding) {
+          wsServer.broadcastCityPatch(updatedBuilding, health.score, health.season);
+        }
+      }
+    }
+
+    if (proposal) pendingTestProposals.delete(proposal.proposalId);
+
+    await db.insert(eventsTable).values({
+      id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      type: "test_approved",
+      buildingId: proposal?.buildingId ?? null,
+      buildingName: basename(sourceFilePath),
+      message: `Scribe approved and wrote ${normalizedTestFilePath}`,
+      severity: "info",
+    }).catch(() => {});
+
+    wsServer.broadcastEventLog(
+      "HEALING_LOOP",
+      `Scribe approved and wrote ${normalizedTestFilePath}`,
+      "info",
+    );
+
+    res.json({
+      success: true,
+      proposalId: proposal?.proposalId ?? null,
+      sourceFilePath,
+      testFilePath: normalizedTestFilePath,
+      writtenTo: targetAbsolutePath,
+      overwritten: fileAlreadyExists && overwrite,
+      repoRoot,
+      healthScore,
+      season,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "APPROVE_TEST_ERROR", message: detail });
   }
 });
 
@@ -1635,6 +3825,10 @@ async function resetAgentStats(mode: "idle" | "retired"): Promise<number> {
       falsePositives: 0,
       escalationCount: 0,
       kbHits: 0,
+      visitedFiles: "[]",
+      personalKB: "[]",
+      specialtyScore: 0,
+      lastFileHash: null,
       totalTasksCompleted: 0,
       accuracy: 0.8,
       level: 1,
@@ -1676,9 +3870,20 @@ router.post("/controls/retire-all-agents", async (_req, res) => {
   }
 });
 
+router.post("/controls/cleanup-kb", async (_req, res) => {
+  try {
+    const result = await cleanupNonSourceKnowledgeAndRecountBugs();
+    res.json({ removed: result.removed, remaining: result.remaining });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: "CLEANUP_KB_ERROR", message: detail });
+  }
+});
+
 router.post("/controls/full-reset", async (_req, res) => {
   try {
     await db.delete(eventsTable);
+    await db.delete(executionResultsTable);
     await resetAgentStats("idle");
     resetKbSessionStats();
     res.json({ success: true, message: "Full city reset complete, including KB session stats." });
@@ -1699,6 +3904,7 @@ router.post("/controls/wipe-all", async (req, res): Promise<void> => {
     await db.delete(eventsTable);
     await db.delete(metricSnapshotsTable);
     await db.delete(snapshotsTable);
+    await db.delete(executionResultsTable);
     await db.delete(knowledgeTable);
     await db.delete(agentsTable);
     await db.delete(reposTable);
@@ -1711,5 +3917,8 @@ router.post("/controls/wipe-all", async (req, res): Promise<void> => {
     res.status(500).json({ error: "WIPE_ALL_ERROR", message: detail });
   }
 });
+
+void ensureMayorMemoryLoaded();
+startMayorInsightLoop();
 
 export default router;

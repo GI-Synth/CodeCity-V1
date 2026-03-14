@@ -24,6 +24,14 @@ const TYPE_COLORS: Record<string, string> = {
   unknown: "#888888",
 };
 
+function getBuildingColor(building: Building): string {
+  if (building.status === "fire") return "#ff3b1f";
+  if (building.status === "error") return "#ff7a1a";
+  if (building.status === "warning") return "#ffb020";
+  if (building.status === "dark") return "#5a6370";
+  return TYPE_COLORS[building.fileType] || TYPE_COLORS.unknown;
+}
+
 const DISTRICT_COLORS: Record<string, string> = {
   source: "rgba(0, 255, 247, 0.1)",
   test: "rgba(255, 0, 255, 0.1)",
@@ -340,7 +348,7 @@ export function CityMap({
               {district.buildings?.map(building => {
                 if (!isBuildingVisible(building)) return null;
 
-                const color = TYPE_COLORS[building.fileType] || TYPE_COLORS.unknown;
+                const color = getBuildingColor(building);
                 const isSelected = selectedBuildingId === building.id;
                 const isConnected = connectedBuildingIds.has(building.id);
                 const isDimmed = selectedBuildingId && !isSelected && !isConnected;

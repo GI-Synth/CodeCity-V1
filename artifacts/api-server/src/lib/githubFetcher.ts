@@ -1,6 +1,40 @@
 import { getLanguage, type FileInfo } from "./cityAnalyzer";
+import { resolveGithubTokenFromEnvOrDb } from "./githubTokenStore";
 
-export async function fetchGithubRepo(repoUrl: string, branch = "main", token?: string): Promise<{ files: FileInfo[]; repoName: string }> {
+type GithubRepoMeta = {
+  default_branch?: string;
+};
+
+async function getDefaultBranch(
+  owner: string,
+  repo: string,
+  headers: Record<string, string>,
+): Promise<string> {
+  const repoUrl = `https://api.github.com/repos/${owner}/${repo}`;
+  const repoRes = await fetch(repoUrl, { headers });
+
+  if (!repoRes.ok) {
+    if (repoRes.status === 404) {
+      throw new Error(
+        `Repository '${owner}/${repo}' not found. If it's private, make sure your token has 'repo' scope.`,
+      );
+    }
+    if (repoRes.status === 401) {
+      throw new Error("Invalid GitHub token. Check that your Personal Access Token is correct and has 'repo' scope.");
+    }
+    if (repoRes.status === 403) {
+      throw new Error("GitHub API rate limit exceeded, or your token lacks permission. Try again later.");
+    }
+    throw new Error(`GitHub API error while loading repo metadata: ${repoRes.status}`);
+  }
+
+  const meta = (await repoRes.json()) as GithubRepoMeta;
+  return meta.default_branch && meta.default_branch.trim() !== ""
+    ? meta.default_branch
+    : "main";
+}
+
+export async function fetchGithubRepo(repoUrl: string, branch?: string, token?: string): Promise<{ files: FileInfo[]; repoName: string }> {
   // Parse GitHub URL
   const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/|$)/);
   if (!match) throw new Error("Invalid GitHub URL. Expected format: https://github.com/owner/repo");
@@ -12,14 +46,21 @@ export async function fetchGithubRepo(repoUrl: string, branch = "main", token?: 
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  if (token) baseHeaders["Authorization"] = `Bearer ${token}`;
+  const resolvedToken = token?.trim() || await resolveGithubTokenFromEnvOrDb();
+  if (resolvedToken) baseHeaders["Authorization"] = `Bearer ${resolvedToken}`;
+
+  const resolvedBranch = branch?.trim() || await getDefaultBranch(owner, repo, baseHeaders);
 
   // Fetch file tree from GitHub API
-  const treeUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+  const treeUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${resolvedBranch}?recursive=1`;
   const treeRes = await fetch(treeUrl, { headers: baseHeaders });
 
   if (!treeRes.ok) {
-    if (treeRes.status === 404) throw new Error(`Repository '${repoName}' not found. If it's private, make sure your token has 'repo' scope.`);
+    if (treeRes.status === 404) {
+      throw new Error(
+        `Repository '${repoName}' not found on branch '${resolvedBranch}'. Try providing the correct branch explicitly.`,
+      );
+    }
     if (treeRes.status === 401) throw new Error("Invalid GitHub token. Check that your Personal Access Token is correct and has 'repo' scope.");
     if (treeRes.status === 403) throw new Error("GitHub API rate limit exceeded, or your token lacks permission. Try again later.");
     throw new Error(`GitHub API error: ${treeRes.status}`);
@@ -54,7 +95,7 @@ export async function fetchGithubRepo(repoUrl: string, branch = "main", token?: 
     const batch = filteredFiles.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
       batch.map(async (item) => {
-        const contentUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${item.path}?ref=${branch}`;
+        const contentUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${item.path}?ref=${resolvedBranch}`;
         const res = await fetch(contentUrl, { headers: baseHeaders });
         if (!res.ok) return null;
         const data = (await res.json()) as { content?: string };

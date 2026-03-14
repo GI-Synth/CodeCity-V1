@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Component, useCallback } from "react";
+import { useState, useEffect, useRef, Component, useCallback, useMemo } from "react";
 import type { ReactNode, ErrorInfo } from "react";
 import { useLocation } from "wouter";
 import { AppLayout } from "@/components/layout/AppLayout";
@@ -32,6 +32,10 @@ import {
   MessageSquare,
   FileWarning,
   Copy,
+  FlaskConical,
+  TerminalSquare,
+  ThumbsUp,
+  ThumbsDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -45,7 +49,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogClose } from "@/components/ui/dialog";
 
 class CityMapErrorBoundary extends Component<
   { children: ReactNode },
@@ -181,6 +185,81 @@ interface UrgencyReportResponse {
   cacheBust?: number;
 }
 
+type ReportSectionId = "summary" | "critical" | "high" | "medium" | "low" | "recommended-tests" | "city-stats";
+
+interface ParsedReportSections {
+  critical: string[];
+  high: string[];
+  medium: string[];
+  low: string[];
+  cityStats: string[];
+}
+
+function normalizeHeadingTitle(line: string): string {
+  return line
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/\(\s*\d+\s*\)\s*$/, "")
+    .replace(/:$/, "")
+    .trim()
+    .toLowerCase();
+}
+
+function extractReportSectionItems(report: string, sectionTitle: string): string[] {
+  if (!report.trim()) return [];
+
+  const wanted = sectionTitle.trim().toLowerCase();
+  const lines = report.split(/\r?\n/);
+  const items: string[] = [];
+  let capturing = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (/^#{1,6}\s+/.test(line)) {
+      const heading = normalizeHeadingTitle(line);
+      if (capturing && heading !== wanted) break;
+      capturing = heading.startsWith(wanted);
+      continue;
+    }
+
+    if (!capturing) continue;
+    if (!line || line === "```" || line.startsWith("```")) continue;
+
+    if (line.startsWith("- ") || line.startsWith("* ")) {
+      items.push(line.replace(/^[-*]\s+/, ""));
+      continue;
+    }
+
+    // Keep plain lines for sections that might not use bullet formatting.
+    if (wanted === "city stats") {
+      items.push(line);
+    }
+  }
+
+  return items;
+}
+
+function parseReportSections(report: string): ParsedReportSections {
+  const parsed: ParsedReportSections = {
+    critical: extractReportSectionItems(report, "critical"),
+    high: extractReportSectionItems(report, "high"),
+    medium: extractReportSectionItems(report, "medium"),
+    low: extractReportSectionItems(report, "low"),
+    cityStats: extractReportSectionItems(report, "city stats"),
+  };
+
+  if (parsed.cityStats.length === 0) {
+    const cityStatsLine = report
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(line => line.toLowerCase().startsWith("current city stats:"));
+
+    if (cityStatsLine) parsed.cityStats.push(cityStatsLine);
+  }
+
+  return parsed;
+}
+
 interface SprintPlanResponse {
   plan: string;
   generatedAt: string;
@@ -191,6 +270,29 @@ interface WeeklySummaryResponse {
   summary: string;
   generatedAt: string;
   range: string;
+}
+
+interface ImportReviewResponse {
+  verdictsProcessed: number;
+  agentsUpdated: string[];
+  kbEntriesAdded: number;
+  accuracyChanges: Array<{ agentName: string; before: number; after: number }>;
+  mayorMessage?: string;
+  lastReviewSummary?: string;
+}
+
+interface AlchemistResult {
+  id: number | null;
+  command: string;
+  status: "success" | "failed" | "blocked" | "timeout";
+  exitCode: number | null;
+  durationMs: number;
+  reason?: string | null;
+  startedAt?: string;
+}
+
+interface AlchemistResultsResponse {
+  results: AlchemistResult[];
 }
 
 const WIPE_CONFIRMATION_TEXT = "RESET";
@@ -238,11 +340,34 @@ export function CityView() {
   const [weeklyLoading, setWeeklyLoading] = useState(false);
   const [isGeneratingWeekly, setIsGeneratingWeekly] = useState(false);
   const [weeklyData, setWeeklyData] = useState<WeeklySummaryResponse | null>(null);
+  const [importReviewOpen, setImportReviewOpen] = useState(false);
+  const [importReviewText, setImportReviewText] = useState("");
+  const [processingReviewImport, setProcessingReviewImport] = useState(false);
+  const [importReviewResult, setImportReviewResult] = useState<ImportReviewResponse | null>(null);
+  const [recommendationFeedback, setRecommendationFeedback] = useState<Record<string, "approved" | "rejected">>({});
+  const [savingRecommendationPath, setSavingRecommendationPath] = useState<string | null>(null);
+  const [hiddenRecommendations, setHiddenRecommendations] = useState<Set<string>>(new Set());
+  const [activeReportSection, setActiveReportSection] = useState<ReportSectionId>("summary");
   const [generatingTestFilePath, setGeneratingTestFilePath] = useState<string | null>(null);
   const [generatedTestFile, setGeneratedTestFile] = useState<GeneratedTestFile | null>(null);
   const [generatedTestOpen, setGeneratedTestOpen] = useState(false);
   const [runningControlAction, setRunningControlAction] = useState<string | null>(null);
+  const [alchemistOpen, setAlchemistOpen] = useState(false);
+  const [alchemistCommand, setAlchemistCommand] = useState("pnpm run typecheck");
+  const [alchemistRunning, setAlchemistRunning] = useState(false);
+  const [alchemistResults, setAlchemistResults] = useState<AlchemistResult[]>([]);
+  const [alchemistBanner, setAlchemistBanner] = useState<AlchemistResult | null>(null);
   const mayorSessionIdRef = useRef<string>(getOrCreateMayorSessionId());
+  const reportScrollRef = useRef<HTMLDivElement | null>(null);
+  const reportSectionRefs = useRef<Record<ReportSectionId, HTMLElement | null>>({
+    summary: null,
+    critical: null,
+    high: null,
+    medium: null,
+    low: null,
+    "recommended-tests": null,
+    "city-stats": null,
+  });
   const exportRef = useRef<HTMLDivElement>(null);
   const isGeneratingReportRef = useRef(false);
 
@@ -289,6 +414,27 @@ export function CityView() {
       refetchHealth();
     } else if (type === "task_complete") {
       refetchAgents();
+    } else if (type === "alchemist_result") {
+      const alchemistPayload = payload as {
+        id?: number | null;
+        command?: string;
+        status?: AlchemistResult["status"];
+        exitCode?: number | null;
+        durationMs?: number;
+        reason?: string | null;
+      };
+
+      const liveResult: AlchemistResult = {
+        id: typeof alchemistPayload.id === "number" ? alchemistPayload.id : null,
+        command: alchemistPayload.command ?? "unknown command",
+        status: alchemistPayload.status ?? "failed",
+        exitCode: typeof alchemistPayload.exitCode === "number" ? alchemistPayload.exitCode : null,
+        durationMs: typeof alchemistPayload.durationMs === "number" ? alchemistPayload.durationMs : 0,
+        reason: alchemistPayload.reason ?? null,
+      };
+      setAlchemistBanner(liveResult);
+      setAlchemistResults(prev => [liveResult, ...prev].slice(0, 12));
+      refetchHealth();
     }
   }, [lastMessage]);
 
@@ -321,6 +467,172 @@ export function CityView() {
   const selectedBuilding = layout?.districts
     ?.flatMap(d => d.buildings)
     .find(b => b.id === selectedBuildingId);
+
+  const visibleRecommendedTestFiles = useMemo(() => {
+    const list = reportData?.recommendedTestFiles ?? [];
+    if (hiddenRecommendations.size === 0) return list;
+    return list.filter(item => !hiddenRecommendations.has(item.testFilePath));
+  }, [reportData?.recommendedTestFiles, hiddenRecommendations]);
+
+  const recommendationFallbackByPriority = useMemo(() => {
+    const grouped: Record<"critical" | "high" | "medium", string[]> = {
+      critical: [],
+      high: [],
+      medium: [],
+    };
+
+    for (const recommendation of visibleRecommendedTestFiles) {
+      const line = `${recommendation.sourceFilePath} -> ${recommendation.testFilePath}`;
+      if (recommendation.priority === "critical") grouped.critical.push(line);
+      else if (recommendation.priority === "high") grouped.high.push(line);
+      else grouped.medium.push(line);
+    }
+
+    return grouped;
+  }, [visibleRecommendedTestFiles]);
+
+  const parsedReportSections = useMemo(() => parseReportSections(reportData?.report ?? ""), [reportData?.report]);
+
+  const reportSectionItems = useMemo(() => {
+    return {
+      critical: parsedReportSections.critical.length > 0 ? parsedReportSections.critical : recommendationFallbackByPriority.critical,
+      high: parsedReportSections.high.length > 0 ? parsedReportSections.high : recommendationFallbackByPriority.high,
+      medium: parsedReportSections.medium.length > 0 ? parsedReportSections.medium : recommendationFallbackByPriority.medium,
+      low: parsedReportSections.low,
+      cityStats: parsedReportSections.cityStats.length > 0
+        ? parsedReportSections.cityStats
+        : (reportData?.summary ? [reportData.summary] : []),
+    };
+  }, [parsedReportSections, recommendationFallbackByPriority, reportData?.summary]);
+
+  const reportNavSections = useMemo(() => {
+    return [
+      { id: "summary" as const, icon: "📊", label: "Summary", count: null },
+      { id: "critical" as const, icon: "🔴", label: "Critical", count: reportSectionItems.critical.length },
+      { id: "high" as const, icon: "🟠", label: "High", count: reportSectionItems.high.length },
+      { id: "medium" as const, icon: "🟡", label: "Medium", count: reportSectionItems.medium.length },
+      { id: "low" as const, icon: "⚪", label: "Low", count: reportSectionItems.low.length },
+      { id: "recommended-tests" as const, icon: "🧪", label: "Recommended Tests", count: visibleRecommendedTestFiles.length },
+      { id: "city-stats" as const, icon: "📈", label: "City Stats", count: reportSectionItems.cityStats.length },
+    ];
+  }, [reportSectionItems, visibleRecommendedTestFiles.length]);
+
+  const setReportSectionRef = useCallback((sectionId: ReportSectionId, element: HTMLElement | null) => {
+    reportSectionRefs.current[sectionId] = element;
+  }, []);
+
+  useEffect(() => {
+    const search = new URLSearchParams(window.location.search);
+    if (search.get("openReport") === "1") {
+      setReportOpen(true);
+    }
+  }, []);
+
+  const scrollToReportSection = useCallback((sectionId: ReportSectionId) => {
+    const target = reportSectionRefs.current[sectionId];
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    setActiveReportSection(sectionId);
+  }, []);
+
+  useEffect(() => {
+    if (!reportOpen) return;
+
+    const root = reportScrollRef.current;
+    if (!root) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let bestEntry: IntersectionObserverEntry | null = null;
+
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          if (!bestEntry || entry.intersectionRatio > bestEntry.intersectionRatio) {
+            bestEntry = entry;
+          }
+        }
+
+        if (!bestEntry) return;
+
+        const matched = Object.entries(reportSectionRefs.current).find(([, element]) => element === bestEntry?.target);
+        if (!matched?.[0]) return;
+
+        setActiveReportSection(matched[0] as ReportSectionId);
+      },
+      {
+        root,
+        threshold: [0.2, 0.4, 0.7],
+        rootMargin: "-10% 0px -55% 0px",
+      }
+    );
+
+    for (const sectionId of reportNavSections.map(section => section.id)) {
+      const sectionElement = reportSectionRefs.current[sectionId];
+      if (sectionElement) observer.observe(sectionElement);
+    }
+
+    return () => observer.disconnect();
+  }, [reportOpen, reportData?.report, reportNavSections, visibleRecommendedTestFiles.length]);
+
+  useEffect(() => {
+    if (!reportOpen) return;
+    setRecommendationFeedback({});
+    setHiddenRecommendations(new Set());
+    setSavingRecommendationPath(null);
+    setActiveReportSection("summary");
+    if (reportScrollRef.current) reportScrollRef.current.scrollTop = 0;
+  }, [reportOpen, reportData?.generatedAt, reportData?.cacheBust]);
+
+  const handleRecommendationFeedback = async (
+    recommendation: RecommendedTestFile,
+    verdict: "approved" | "rejected",
+  ) => {
+    const key = recommendation.testFilePath;
+    if (savingRecommendationPath === key) return;
+
+    setSavingRecommendationPath(key);
+    try {
+      const res = await fetch("/api/orchestrator/recommendation-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          verdict,
+          buildingId: recommendation.buildingId,
+          sourceFilePath: recommendation.sourceFilePath,
+          testFilePath: recommendation.testFilePath,
+          priority: recommendation.priority,
+          testType: recommendation.testType,
+        }),
+      });
+
+      const data = await res.json() as { success?: boolean; message?: string; error?: string };
+      if (!res.ok || !data.success) {
+        throw new Error(data.error ?? data.message ?? "Failed to save recommendation feedback");
+      }
+
+      setRecommendationFeedback(prev => ({
+        ...prev,
+        [key]: verdict,
+      }));
+
+      if (verdict === "rejected") {
+        window.setTimeout(() => {
+          setHiddenRecommendations(prev => {
+            const next = new Set(prev);
+            next.add(key);
+            return next;
+          });
+        }, 400);
+      }
+
+      toast({ title: "Feedback saved to agent memory." });
+      refetchAgents();
+    } catch {
+      toast({ title: "Failed to save recommendation feedback", variant: "destructive" });
+    } finally {
+      setSavingRecommendationPath((current) => (current === key ? null : current));
+    }
+  };
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -566,6 +878,60 @@ export function CityView() {
     }
   };
 
+  const handleProcessImportedReview = async () => {
+    const reviewText = importReviewText.trim();
+    if (!reviewText || processingReviewImport) return;
+
+    setProcessingReviewImport(true);
+    try {
+      const res = await fetch("/api/orchestrator/import-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewText }),
+      });
+
+      const data = await res.json() as Partial<ImportReviewResponse> & { error?: string; message?: string };
+      if (!res.ok || typeof data.verdictsProcessed !== "number" || !Array.isArray(data.agentsUpdated) || typeof data.kbEntriesAdded !== "number" || !Array.isArray(data.accuracyChanges)) {
+        throw new Error(data.error ?? data.message ?? "Failed to import review");
+      }
+
+      const typed: ImportReviewResponse = {
+        verdictsProcessed: data.verdictsProcessed,
+        agentsUpdated: data.agentsUpdated,
+        kbEntriesAdded: data.kbEntriesAdded,
+        accuracyChanges: data.accuracyChanges,
+        mayorMessage: data.mayorMessage,
+        lastReviewSummary: data.lastReviewSummary,
+      };
+
+      setImportReviewResult(typed);
+      setImportReviewText("");
+      setImportReviewOpen(false);
+
+      const bestGain = typed.accuracyChanges
+        .slice()
+        .sort((a, b) => (b.after - b.before) - (a.after - a.before))[0];
+
+      const fallbackMayorMessage = bestGain
+        ? `Got it. I've updated ${typed.agentsUpdated.length} agent(s) based on this review. ${bestGain.agentName} accuracy improved to ${bestGain.after.toFixed(1)}%.`
+        : `Got it. I've updated ${typed.agentsUpdated.length} agent(s) based on this review. No measurable accuracy increase yet, but I stored the learning.`;
+
+      appendMayorMessage("mayor", typed.mayorMessage ?? fallbackMayorMessage);
+
+      toast({
+        title: "AI review imported",
+        description: `Processed ${typed.verdictsProcessed} verdict(s), updated ${typed.agentsUpdated.length} agent(s), and added ${typed.kbEntriesAdded} KB entr${typed.kbEntriesAdded === 1 ? "y" : "ies"}.`,
+      });
+
+      refetchAgents();
+      refetchHealth();
+    } catch {
+      toast({ title: "Failed to import AI review", variant: "destructive" });
+    } finally {
+      setProcessingReviewImport(false);
+    }
+  };
+
   const handleGenerateTestFile = async (recommendation: RecommendedTestFile) => {
     if (generatingTestFilePath) return;
     setGeneratingTestFilePath(recommendation.testFilePath);
@@ -607,6 +973,74 @@ export function CityView() {
       toast({ title: "Copy failed", variant: "destructive" });
     }
   };
+
+  const fetchAlchemistResults = useCallback(async () => {
+    try {
+      const res = await fetch("/api/alchemist/results?limit=8", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json() as AlchemistResultsResponse;
+      const nextResults = Array.isArray(data.results) ? data.results : [];
+      setAlchemistResults(nextResults);
+      if (nextResults.length > 0) {
+        setAlchemistBanner(nextResults[0]);
+      }
+    } catch {
+      // Keep last known alchemist results if polling fails.
+    }
+  }, []);
+
+  const runAlchemist = useCallback(async (command: string) => {
+    const trimmed = command.trim();
+    if (!trimmed || alchemistRunning) return;
+
+    setAlchemistRunning(true);
+    try {
+      const res = await fetch("/api/alchemist/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: trimmed, triggeredBy: "city-controls" }),
+      });
+
+      const data = await res.json() as Partial<AlchemistResult> & { error?: string; message?: string };
+      if (!res.ok || !data.command || !data.status) {
+        throw new Error(data.error ?? data.message ?? "Alchemist command failed");
+      }
+
+      const result: AlchemistResult = {
+        id: typeof data.id === "number" ? data.id : null,
+        command: data.command,
+        status: data.status,
+        exitCode: typeof data.exitCode === "number" ? data.exitCode : null,
+        durationMs: typeof data.durationMs === "number" ? data.durationMs : 0,
+        reason: data.reason,
+        startedAt: data.startedAt,
+      };
+
+      setAlchemistResults(prev => [result, ...prev].slice(0, 12));
+      setAlchemistBanner(result);
+      refetchHealth();
+
+      toast({
+        title: result.status === "success" ? "Alchemist completed" : "Alchemist finished with issues",
+        description: `${result.status.toUpperCase()} — ${result.command}`,
+        variant: result.status === "success" ? "default" : "destructive",
+      });
+    } catch {
+      toast({ title: "Alchemist run failed", variant: "destructive" });
+    } finally {
+      setAlchemistRunning(false);
+      void fetchAlchemistResults();
+    }
+  }, [alchemistRunning, fetchAlchemistResults, refetchHealth, toast]);
+
+  useEffect(() => {
+    void fetchAlchemistResults();
+    const timer = setInterval(() => {
+      void fetchAlchemistResults();
+    }, 8000);
+
+    return () => clearInterval(timer);
+  }, [fetchAlchemistResults]);
 
   const runControlAction = async (
     key: string,
@@ -709,6 +1143,24 @@ export function CityView() {
             totalBuildings={totalCount}
           />
 
+          {alchemistBanner && (
+            <div
+              className={cn(
+                "absolute top-20 left-1/2 -translate-x-1/2 z-20 rounded-full border px-4 py-1.5 text-[10px] font-mono tracking-wide backdrop-blur",
+                alchemistBanner.status === "success"
+                  ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300"
+                  : alchemistBanner.status === "blocked"
+                    ? "border-yellow-400/50 bg-yellow-400/10 text-yellow-300"
+                    : "border-red-400/50 bg-red-400/10 text-red-300"
+              )}
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <FlaskConical size={11} />
+                Alchemist {alchemistBanner.status.toUpperCase()}: {alchemistBanner.command.slice(0, 80)}
+              </span>
+            </div>
+          )}
+
           <div className="absolute top-4 left-4 z-20 flex gap-2">
             <Button
               variant="outline"
@@ -766,6 +1218,13 @@ export function CityView() {
                   }}
                 >
                   <RotateCcw size={13} /> Full Reset (KB Session Included)
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    setAlchemistOpen(true);
+                  }}
+                >
+                  <FlaskConical size={13} /> Open Alchemist Console
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -842,6 +1301,15 @@ export function CityView() {
                 <Button
                   variant="outline"
                   size="sm"
+                  onClick={() => setImportReviewOpen(true)}
+                  disabled={processingReviewImport}
+                  className="h-7 border-primary/30 px-2 text-[10px] font-mono"
+                >
+                  {processingReviewImport ? "Importing..." : "Import AI Review"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
                   onClick={() => {
                     void handlePlanSprint();
                   }}
@@ -875,6 +1343,12 @@ export function CityView() {
                 </Button>
               </div>
             </div>
+
+            {importReviewResult && (
+              <div className="mb-2 rounded border border-primary/30 bg-black/25 px-2 py-1 text-[10px] font-mono text-muted-foreground">
+                Last AI review import: {importReviewResult.verdictsProcessed} verdict(s), {importReviewResult.agentsUpdated.length} agent(s) updated, {importReviewResult.kbEntriesAdded} KB entr{importReviewResult.kbEntriesAdded === 1 ? "y" : "ies"} added.
+              </div>
+            )}
 
             <div className="mb-2 h-36 overflow-y-auto rounded border border-border/40 bg-black/30 p-2 text-xs font-mono">
               {mayorMessages.length === 0 ? (
@@ -949,58 +1423,281 @@ export function CityView() {
       </div>
 
       <Dialog open={reportOpen} onOpenChange={setReportOpen}>
+        <DialogContent className="left-1/2 top-1/2 w-[calc(100vw-20px)] max-w-none translate-x-[-50%] translate-y-[-50%] p-0 sm:w-[90vw] max-h-[85vh] border-primary/40 bg-background/95 font-mono [&>button]:hidden">
+          <div className="flex h-[85vh] min-h-0 flex-col">
+            <div className="sticky top-0 z-30 border-b border-primary/30 bg-background/95 px-3 py-3 sm:px-5">
+              <div className="flex items-start justify-between gap-3">
+                <DialogHeader className="space-y-1 text-left">
+                  <DialogTitle className="text-primary">City Urgency Report</DialogTitle>
+                  <div className="text-xs text-muted-foreground">
+                    {reportData ? `Generated at ${reportData.generatedAt}` : "Report will appear once generation completes."}
+                  </div>
+                </DialogHeader>
+
+                <DialogClose asChild>
+                  <Button variant="outline" size="sm" className="h-7 px-2 text-[10px] font-mono border-primary/30">
+                    Close
+                  </Button>
+                </DialogClose>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex flex-1 overflow-hidden">
+              <aside className="w-12 shrink-0 border-r border-border/30 bg-black/20 md:w-52">
+                <div className="sticky top-0 p-2 md:p-3">
+                  <div className="mb-2 hidden text-[10px] font-semibold uppercase tracking-widest text-primary md:block">Sections</div>
+                  <div className="space-y-1 animate-in slide-in-from-left-4 duration-300">
+                    {reportNavSections.map((section) => (
+                      <button
+                        key={section.id}
+                        type="button"
+                        onClick={() => scrollToReportSection(section.id)}
+                        className={cn(
+                          "group flex w-full items-center gap-2 rounded border px-1.5 py-1.5 text-left text-[10px] font-mono transition-colors",
+                          activeReportSection === section.id
+                            ? "border-primary/60 bg-primary/20 text-primary"
+                            : "border-border/30 bg-black/30 text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                        )}
+                        title={`${section.icon} ${section.label}${section.count !== null ? ` (${section.count})` : ""}`}
+                      >
+                        <span className="text-sm leading-none">{section.icon}</span>
+                        <span className="hidden truncate md:inline">{section.label}{section.count !== null ? ` (${section.count})` : ""}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </aside>
+
+              <div ref={reportScrollRef} className="min-h-0 flex-1 overflow-y-auto scroll-smooth px-3 py-3 sm:px-5">
+                {reportLoading && !reportData ? (
+                  <div className="rounded border border-border/40 bg-black/35 p-3 text-xs text-muted-foreground flex items-center gap-2">
+                    <Loader2 size={12} className="animate-spin" /> Building urgency report...
+                  </div>
+                ) : (
+                  <div className="space-y-4 text-xs leading-relaxed">
+                    <section
+                      id="report-section-summary"
+                      ref={(element) => setReportSectionRef("summary", element)}
+                      className="scroll-mt-24 rounded border border-primary/30 bg-black/25 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-primary">📊 Summary</div>
+                      <div className="text-foreground/90">{reportData?.summary ?? "No report summary available."}</div>
+                      <pre className="mt-3 max-h-56 overflow-y-auto whitespace-pre-wrap rounded border border-border/30 bg-black/35 p-2 text-[11px] text-muted-foreground">
+                        {reportData?.report ?? "No report available."}
+                      </pre>
+                    </section>
+
+                    <section
+                      id="report-section-critical"
+                      ref={(element) => setReportSectionRef("critical", element)}
+                      className="scroll-mt-24 rounded border border-red-500/30 bg-red-500/5 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-red-300">🔴 Critical ({reportSectionItems.critical.length})</div>
+                      {reportSectionItems.critical.length === 0 ? (
+                        <div className="text-muted-foreground">No critical items in this report.</div>
+                      ) : (
+                        <ul className="space-y-1">
+                          {reportSectionItems.critical.map((item, idx) => (
+                            <li key={`critical-${idx}`} className="rounded border border-red-500/20 bg-black/30 px-2 py-1">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+
+                    <section
+                      id="report-section-high"
+                      ref={(element) => setReportSectionRef("high", element)}
+                      className="scroll-mt-24 rounded border border-orange-500/30 bg-orange-500/5 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-orange-300">🟠 High ({reportSectionItems.high.length})</div>
+                      {reportSectionItems.high.length === 0 ? (
+                        <div className="text-muted-foreground">No high-priority items in this report.</div>
+                      ) : (
+                        <ul className="space-y-1">
+                          {reportSectionItems.high.map((item, idx) => (
+                            <li key={`high-${idx}`} className="rounded border border-orange-500/20 bg-black/30 px-2 py-1">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+
+                    <section
+                      id="report-section-medium"
+                      ref={(element) => setReportSectionRef("medium", element)}
+                      className="scroll-mt-24 rounded border border-yellow-500/30 bg-yellow-500/5 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-yellow-200">🟡 Medium ({reportSectionItems.medium.length})</div>
+                      {reportSectionItems.medium.length === 0 ? (
+                        <div className="text-muted-foreground">No medium-priority items in this report.</div>
+                      ) : (
+                        <ul className="space-y-1">
+                          {reportSectionItems.medium.map((item, idx) => (
+                            <li key={`medium-${idx}`} className="rounded border border-yellow-500/20 bg-black/30 px-2 py-1">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+
+                    <section
+                      id="report-section-low"
+                      ref={(element) => setReportSectionRef("low", element)}
+                      className="scroll-mt-24 rounded border border-slate-400/30 bg-slate-500/5 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-slate-200">⚪ Low ({reportSectionItems.low.length})</div>
+                      {reportSectionItems.low.length === 0 ? (
+                        <div className="text-muted-foreground">No low-priority items in this report.</div>
+                      ) : (
+                        <ul className="space-y-1">
+                          {reportSectionItems.low.map((item, idx) => (
+                            <li key={`low-${idx}`} className="rounded border border-slate-400/20 bg-black/30 px-2 py-1">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+
+                    <section
+                      id="report-section-recommended-tests"
+                      ref={(element) => setReportSectionRef("recommended-tests", element)}
+                      className="scroll-mt-24 rounded border border-primary/30 bg-black/25 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-primary">🧪 Recommended Tests ({visibleRecommendedTestFiles.length})</div>
+                      {visibleRecommendedTestFiles.length === 0 ? (
+                        <div className="text-muted-foreground">No recommended test files currently listed.</div>
+                      ) : (
+                        <div className="space-y-2">
+                          {visibleRecommendedTestFiles.map((recommendation) => {
+                            const feedback = recommendationFeedback[recommendation.testFilePath];
+                            const savingFeedback = savingRecommendationPath === recommendation.testFilePath;
+                            const approved = feedback === "approved";
+                            const rejected = feedback === "rejected";
+
+                            return (
+                              <div key={recommendation.testFilePath} className="rounded border border-border/40 p-2 text-[11px]">
+                                <div className="font-semibold text-foreground">{recommendation.testFilePath}</div>
+                                <div className="text-muted-foreground">Source: {recommendation.sourceFilePath}</div>
+                                <div className="text-muted-foreground">What to test: {recommendation.whatToTest.join(", ")}</div>
+                                <div className="text-muted-foreground">Type: {recommendation.testType} · Priority: {recommendation.priority}</div>
+                                <div className="mt-2 flex items-center gap-1.5">
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={savingFeedback || rejected}
+                                    onClick={() => {
+                                      void handleRecommendationFeedback(recommendation, "approved");
+                                    }}
+                                    className={cn(
+                                      "h-7 px-2 text-[10px] font-mono",
+                                      approved ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300" : ""
+                                    )}
+                                    title="Approve suggestion without generating"
+                                  >
+                                    {approved ? "✓ Noted" : <ThumbsUp size={12} />}
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={savingFeedback || rejected}
+                                    onClick={() => {
+                                      void handleRecommendationFeedback(recommendation, "rejected");
+                                    }}
+                                    className={cn(
+                                      "h-7 px-2 text-[10px] font-mono",
+                                      rejected ? "border-red-500/50 bg-red-500/15 text-red-300" : ""
+                                    )}
+                                    title="Reject suggestion and skip this pattern"
+                                  >
+                                    {rejected ? "✗ Skipped" : <ThumbsDown size={12} />}
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={generatingTestFilePath !== null || rejected}
+                                    onClick={() => {
+                                      void handleGenerateTestFile(recommendation);
+                                    }}
+                                    className="h-7 text-[10px] font-mono"
+                                  >
+                                    {generatingTestFilePath === recommendation.testFilePath ? "GENERATING..." : "GENERATE"}
+                                  </Button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+
+                    <section
+                      id="report-section-city-stats"
+                      ref={(element) => setReportSectionRef("city-stats", element)}
+                      className="scroll-mt-24 rounded border border-blue-500/30 bg-blue-500/5 p-3"
+                    >
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-blue-200">📈 City Stats ({reportSectionItems.cityStats.length})</div>
+                      {reportSectionItems.cityStats.length === 0 ? (
+                        <div className="text-muted-foreground">No city stats were extracted from this report.</div>
+                      ) : (
+                        <ul className="space-y-1">
+                          {reportSectionItems.cityStats.map((item, idx) => (
+                            <li key={`city-stats-${idx}`} className="rounded border border-blue-500/20 bg-black/30 px-2 py-1">{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="sticky bottom-0 z-30 border-t border-primary/30 bg-background/95 px-3 py-3 sm:px-5">
+              <div className="flex justify-end gap-2">
+                <DialogClose asChild>
+                  <Button variant="outline" className="h-8 text-xs font-mono">Close</Button>
+                </DialogClose>
+                <Button onClick={() => { void handleCopyReport(); }} disabled={!reportData?.report} className="h-8 text-xs font-mono">
+                  <Copy size={12} className="mr-1.5" /> Copy Full Report
+                </Button>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={importReviewOpen} onOpenChange={setImportReviewOpen}>
         <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
           <DialogHeader>
-            <DialogTitle className="text-primary">City Urgency Report</DialogTitle>
+            <DialogTitle className="text-primary">Import AI Review</DialogTitle>
           </DialogHeader>
 
           <div className="text-xs text-muted-foreground">
-            {reportData ? `Generated at ${reportData.generatedAt}` : "Report will appear once generation completes."}
+            Paste the full "CODECITY AI REVIEW RESULT" response from Claude or Copilot.
           </div>
 
-          <div className="max-h-[60vh] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed">
-            {reportLoading && !reportData ? (
-              <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={12} className="animate-spin" /> Building urgency report...</div>
-            ) : (
-              <pre className="whitespace-pre-wrap">{reportData?.report ?? "No report available."}</pre>
-            )}
-          </div>
-
-          {reportData?.recommendedTestFiles && reportData.recommendedTestFiles.length > 0 && (
-            <div className="rounded border border-primary/30 bg-black/25 p-3">
-              <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-primary">
-                Recommended Test Files to Create
-              </div>
-              <div className="space-y-2">
-                {reportData.recommendedTestFiles.map((recommendation) => (
-                  <div key={recommendation.testFilePath} className="rounded border border-border/40 p-2 text-[11px]">
-                    <div className="font-semibold text-foreground">{recommendation.testFilePath}</div>
-                    <div className="text-muted-foreground">Source: {recommendation.sourceFilePath}</div>
-                    <div className="text-muted-foreground">What to test: {recommendation.whatToTest.join(", ")}</div>
-                    <div className="text-muted-foreground">Type: {recommendation.testType} · Priority: {recommendation.priority}</div>
-                    <div className="mt-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={generatingTestFilePath !== null}
-                        onClick={() => {
-                          void handleGenerateTestFile(recommendation);
-                        }}
-                        className="h-7 text-[10px] font-mono"
-                      >
-                        {generatingTestFilePath === recommendation.testFilePath ? "Generating..." : "Generate"}
-                      </Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          <textarea
+            value={importReviewText}
+            onChange={(event) => setImportReviewText(event.target.value)}
+            placeholder="CODECITY AI REVIEW RESULT\n[verdicts]\n[implemented fixes]\n[agent learning instructions]"
+            className="min-h-[280px] w-full rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+          />
 
           <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={() => setReportOpen(false)} className="h-8 text-xs font-mono">Close</Button>
-            <Button onClick={() => { void handleCopyReport(); }} disabled={!reportData?.report} className="h-8 text-xs font-mono">
-              <Copy size={12} className="mr-1.5" /> Copy Full Report
+            <Button
+              variant="outline"
+              onClick={() => setImportReviewOpen(false)}
+              disabled={processingReviewImport}
+              className="h-8 text-xs font-mono"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                void handleProcessImportedReview();
+              }}
+              disabled={processingReviewImport || !importReviewText.trim()}
+              className="h-8 text-xs font-mono"
+            >
+              {processingReviewImport ? <Loader2 size={11} className="animate-spin" /> : "Process Review"}
             </Button>
           </div>
         </DialogContent>
@@ -1079,6 +1776,103 @@ export function CityView() {
             <Button onClick={() => { void handleCopyWeeklySummary(); }} disabled={!weeklyData?.summary} className="h-8 text-xs font-mono">
               <Copy size={12} className="mr-1.5" /> Copy Markdown
             </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={alchemistOpen} onOpenChange={setAlchemistOpen}>
+        <DialogContent className="max-w-3xl border-primary/40 bg-background/95 font-mono">
+          <DialogHeader>
+            <DialogTitle className="text-primary flex items-center gap-2">
+              <TerminalSquare size={16} /> Alchemist Console
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="text-xs text-muted-foreground">
+            Execute guarded maintenance commands and track runtime outcomes.
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <Button
+              variant="outline"
+              className="h-8 text-xs font-mono"
+              onClick={() => {
+                const cmd = "pnpm run typecheck";
+                setAlchemistCommand(cmd);
+                void runAlchemist(cmd);
+              }}
+              disabled={alchemistRunning}
+            >
+              Workspace Typecheck
+            </Button>
+            <Button
+              variant="outline"
+              className="h-8 text-xs font-mono"
+              onClick={() => {
+                const cmd = "pnpm --filter @workspace/api-server run typecheck";
+                setAlchemistCommand(cmd);
+                void runAlchemist(cmd);
+              }}
+              disabled={alchemistRunning}
+            >
+              API Typecheck
+            </Button>
+            <Button
+              variant="outline"
+              className="h-8 text-xs font-mono"
+              onClick={() => {
+                const cmd = "pnpm --filter @workspace/software-city run typecheck";
+                setAlchemistCommand(cmd);
+                void runAlchemist(cmd);
+              }}
+              disabled={alchemistRunning}
+            >
+              UI Typecheck
+            </Button>
+          </div>
+
+          <div className="flex gap-2">
+            <input
+              value={alchemistCommand}
+              onChange={(event) => setAlchemistCommand(event.target.value)}
+              placeholder="pnpm run typecheck"
+              className="h-9 flex-1 rounded border border-border/40 bg-black/40 px-2 text-xs font-mono text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+            />
+            <Button
+              onClick={() => { void runAlchemist(alchemistCommand); }}
+              disabled={alchemistRunning || !alchemistCommand.trim()}
+              className="h-9 px-3 text-xs font-mono"
+            >
+              {alchemistRunning ? "Running..." : "Run"}
+            </Button>
+          </div>
+
+          <div className="max-h-[280px] overflow-y-auto rounded border border-border/40 bg-black/35 p-3 text-xs leading-relaxed space-y-2">
+            {alchemistResults.length === 0 ? (
+              <div className="text-muted-foreground">No execution results yet.</div>
+            ) : (
+              alchemistResults.map((result, index) => (
+                <div key={`${result.id ?? "tmp"}-${index}`} className="rounded border border-border/40 bg-black/30 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={cn(
+                      "text-[10px] font-semibold uppercase tracking-widest",
+                      result.status === "success"
+                        ? "text-emerald-300"
+                        : result.status === "blocked"
+                          ? "text-yellow-300"
+                          : "text-red-300"
+                    )}>
+                      {result.status}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">{(result.durationMs / 1000).toFixed(1)}s</span>
+                  </div>
+                  <div className="mt-1 break-all text-[11px] text-foreground">{result.command}</div>
+                  {result.reason && (
+                    <div className="mt-1 text-[10px] text-muted-foreground">{result.reason}</div>
+                  )}
+                </div>
+              ))
+            )}
           </div>
         </DialogContent>
       </Dialog>

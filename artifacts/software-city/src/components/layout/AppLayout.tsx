@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { Activity, Building2, Bot, BookOpen, ChevronRight, Terminal, Menu, X, Trophy, BarChart3, Settings } from "lucide-react";
+import { Activity, Building2, Bot, BookOpen, ChevronRight, Terminal, Menu, X, Trophy, BarChart3, Settings, Home } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useGetEventStream } from "@workspace/api-client-react";
@@ -63,6 +63,20 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
         timestamp: lastMessage.timestamp,
       };
       setWsEvents(prev => [evt, ...prev].slice(0, 50));
+    } else if (lastMessage.type === "alchemist_result") {
+      const payload = lastMessage.payload;
+      const status = String(payload.status ?? "failed");
+      const severity = status === "success" ? "info" : status === "blocked" ? "warning" : "critical";
+      const durationMs = Number(payload.durationMs ?? 0);
+      const durationSec = Number.isFinite(durationMs) ? (durationMs / 1000).toFixed(1) : "0.0";
+      const evt: LocalEvent = {
+        id: `ws-alchemy-${Date.now()}`,
+        type: "alchemist_result",
+        message: `Alchemist ${status}: ${String(payload.command ?? "unknown command")} (${durationSec}s)`,
+        severity,
+        timestamp: lastMessage.timestamp,
+      };
+      setWsEvents(prev => [evt, ...prev].slice(0, 50));
     }
   }, [lastMessage]);
 
@@ -85,6 +99,11 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
             <img src="/api/assets/logo" alt="Logo" className="w-8 h-8 rounded" />
             <span className="font-mono font-bold text-lg text-primary text-glow uppercase tracking-wider">Software City</span>
           </div>
+          <Link href="/" className="ml-auto">
+            <div className="flex items-center gap-1.5 rounded border border-primary/30 px-2 py-1 text-[10px] font-mono uppercase tracking-wider text-primary hover:bg-primary/10">
+              <Home size={11} /> Home
+            </div>
+          </Link>
         </div>
 
         <nav className="flex-1 overflow-y-auto py-6 px-4 space-y-2">
@@ -129,18 +148,22 @@ const EVENT_BORDER_COLORS: Record<string, string> = {
   bug_found: "border-l-2 border-l-destructive",
   test_passed: "border-l-2 border-l-success",
   escalation: "border-l-2 border-l-orange-400",
+  orchestrator: "border-l-2 border-l-cyan-400",
   agent_promoted: "border-l-2 border-l-primary",
   task_complete: "border-l-2 border-l-blue-400",
   building_collapse: "border-l-2 border-l-destructive bg-destructive/10",
+  alchemist_result: "border-l-2 border-l-emerald-400",
 };
 
 const EVENT_TEXT_COLORS: Record<string, string> = {
   bug_found: "text-destructive",
   test_passed: "text-success",
   escalation: "text-orange-400",
+  orchestrator: "text-cyan-300",
   agent_promoted: "text-primary",
   task_complete: "text-blue-400",
   building_collapse: "text-destructive",
+  alchemist_result: "text-emerald-300",
   info: "text-muted-foreground",
   warning: "text-warning",
   critical: "text-destructive",
@@ -180,6 +203,7 @@ function EventStream({ wsEvents }: { wsEvents: LocalEvent[] }) {
             const typeKey = evt.type.toLowerCase();
             const borderClass = EVENT_BORDER_COLORS[typeKey] ?? "";
             const textClass = EVENT_TEXT_COLORS[typeKey] ?? EVENT_TEXT_COLORS[evt.severity] ?? "text-muted-foreground";
+            const message = typeKey === "orchestrator" ? `🏛 ${evt.message}` : evt.message;
 
             return (
               <div key={evt.id} className={cn("flex flex-col gap-1 pb-2 last:border-0 pl-2", borderClass)}>
@@ -188,7 +212,7 @@ function EventStream({ wsEvents }: { wsEvents: LocalEvent[] }) {
                   <span className="uppercase">[{evt.type}]</span>
                 </div>
                 <div className={cn("break-words", textClass)}>
-                  {">"} {evt.message}
+                  {">"} {message}
                 </div>
                 {evt.buildingName && (
                   <div className="text-[10px] text-primary/70">Loc: {evt.buildingName}</div>

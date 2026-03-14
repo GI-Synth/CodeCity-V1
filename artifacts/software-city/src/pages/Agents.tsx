@@ -8,12 +8,31 @@ import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 
 const ROLE_CONFIG = {
-  qa_inspector: { icon: Shield, color: "text-blue-400", bg: "bg-blue-400/10", label: "QA Inspector" },
-  api_fuzzer: { icon: Flame, color: "text-orange-400", bg: "bg-orange-400/10", label: "API Fuzzer" },
-  load_tester: { icon: Zap, color: "text-yellow-400", bg: "bg-yellow-400/10", label: "Load Tester" },
-  edge_explorer: { icon: Compass, color: "text-green-400", bg: "bg-green-400/10", label: "Edge Explorer" },
-  ui_navigator: { icon: MousePointer2, color: "text-purple-400", bg: "bg-purple-400/10", label: "UI Navigator" },
+  qa_inspector: { icon: Shield, color: "text-blue-400", bg: "bg-blue-400/10", label: "QA Inspector", specialty: "Static bug triage" },
+  api_fuzzer: { icon: Flame, color: "text-orange-400", bg: "bg-orange-400/10", label: "API Fuzzer", specialty: "Malformed request probing" },
+  load_tester: { icon: Zap, color: "text-yellow-400", bg: "bg-yellow-400/10", label: "Load Tester", specialty: "Concurrency pressure checks" },
+  edge_explorer: { icon: Compass, color: "text-green-400", bg: "bg-green-400/10", label: "Edge Explorer", specialty: "Boundary condition mapping" },
+  ui_navigator: { icon: MousePointer2, color: "text-purple-400", bg: "bg-purple-400/10", label: "UI Navigator", specialty: "User-flow weakness hunting" },
+  scribe: { icon: Terminal, color: "text-emerald-400", bg: "bg-emerald-400/10", label: "Scribe", specialty: "Healing-loop test authoring" },
 };
+
+function parseArrayCount(raw: unknown): number {
+  if (Array.isArray(raw)) return raw.length;
+  if (!raw || typeof raw !== "string") return 0;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return 0;
+    return parsed.length;
+  } catch {
+    return 0;
+  }
+}
+
+function specialtyPercent(raw: unknown): number {
+  const value = typeof raw === "number" ? raw : Number(raw ?? 0);
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value * 100)));
+}
 
 export function Agents() {
   const { toast } = useToast();
@@ -86,6 +105,10 @@ function AgentCard({ agent, onRefetch }: { agent: Agent; onRefetch: () => void }
   const config = ROLE_CONFIG[agent.role as keyof typeof ROLE_CONFIG] || ROLE_CONFIG.qa_inspector;
   const Icon = config.icon;
   const isPaused = agent.status === "paused";
+  const visitedFilesCount = parseArrayCount((agent as any).visitedFiles);
+  const patternCount = parseArrayCount((agent as any).personalKB);
+  const specialty = specialtyPercent((agent as any).specialtyScore);
+  const lastHash = typeof (agent as any).lastFileHash === "string" ? (agent as any).lastFileHash as string : "";
 
   const handleTogglePause = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -136,6 +159,18 @@ function AgentCard({ agent, onRefetch }: { agent: Agent; onRefetch: () => void }
         <p className="text-xs font-mono text-foreground/80 italic leading-relaxed">
           "{agent.dialogue}"
         </p>
+        <div className="mt-2 border-t border-border/30 pt-2">
+          <div className="text-[10px] font-mono text-muted-foreground">Focus: {config.specialty}</div>
+          <div className="mt-1 h-1.5 w-full rounded bg-black/60 overflow-hidden">
+            <div className="h-full bg-primary/80 transition-all" style={{ width: `${specialty}%` }} />
+          </div>
+          <div className="mt-1 text-[10px] font-mono text-primary/80">Specialty Score {specialty}%</div>
+          <div className="mt-1 text-[10px] font-mono text-muted-foreground/80 flex gap-3">
+            <span>Memory {visitedFilesCount}</span>
+            <span>Patterns {patternCount}</span>
+            {lastHash ? <span>Hash {lastHash.slice(0, 8)}</span> : <span>Hash n/a</span>}
+          </div>
+        </div>
         {agent.status === 'working' && (
           <div className="absolute bottom-2 right-2 flex gap-1">
             <span className="w-1 h-1 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0ms' }}/>
@@ -220,7 +255,7 @@ function SpawnAgentDialog({ onSpawn }: { onSpawn: () => void }) {
               <config.icon className={cn("mr-4", config.color)} size={24} />
               <div className="flex flex-col items-start text-left">
                 <span className="font-mono font-bold text-foreground group-hover:text-primary transition-colors">{config.label}</span>
-                <span className="text-xs font-mono text-muted-foreground">Select to deploy this specialization.</span>
+                <span className="text-xs font-mono text-muted-foreground">{config.specialty}</span>
               </div>
             </Button>
           ))}

@@ -1,4 +1,4 @@
-import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
@@ -12,6 +12,13 @@ export const eventsTable = sqliteTable("city_events", {
   agentName: text("agent_name"),
   message: text("message").notNull(),
   severity: text("severity").default("info").notNull(),
+  filePath: text("file_path"),
+  issueType: text("issue_type"),
+  confidence: real("confidence"),
+  codeReference: text("code_reference"),
+  confirmations: integer("confirmations").default(1).notNull(),
+  findingSeverity: text("finding_severity"),
+  findingText: text("finding_text"),
   timestamp: text("timestamp").default(sql`(datetime('now'))`).notNull(),
 });
 

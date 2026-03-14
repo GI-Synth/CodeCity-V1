@@ -37,6 +37,30 @@ function detectDistrictType(folderName: string): District["type"] {
   return "source";
 }
 
+function normalizeStem(filePath: string): string {
+  return filePath
+    .replace(/\\/g, "/")
+    .toLowerCase()
+    .replace(/\.(test|spec|e2e|unit|integration)(?=\.)/g, "")
+    .replace(/\.[^.\/]+$/, "");
+}
+
+function isTestLikePath(filePath: string): boolean {
+  const lower = filePath.replace(/\\/g, "/").toLowerCase();
+  return /(^|\/)(__tests__|tests|test|spec)(\/|$)/.test(lower)
+    || /\.(test|spec)\.[^.\/]+$/.test(lower);
+}
+
+function estimateCoverage(isTestFile: boolean, hasTests: boolean, complexity: number, realLoc: number): number {
+  if (isTestFile) return 1;
+  if (!hasTests) return 0;
+
+  const base = 0.72;
+  const complexityPenalty = Math.min(0.28, complexity / 100);
+  const locPenalty = Math.min(0.18, realLoc / 1800);
+  return Math.max(0, Math.min(1, base - complexityPenalty - locPenalty));
+}
+
 export function getLanguage(filename: string): string {
   return codeAnalyzer.detectLanguage(filename);
 }
@@ -52,10 +76,16 @@ export interface FileInfo {
 
 export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout {
   const folderMap = new Map<string, FileInfo[]>();
+  const testStemSet = new Set<string>();
+
   for (const file of files) {
     const folder = file.folder || "root";
     if (!folderMap.has(folder)) folderMap.set(folder, []);
     folderMap.get(folder)!.push(file);
+
+    if (isTestLikePath(file.path)) {
+      testStemSet.add(normalizeStem(file.path));
+    }
   }
 
   const districts: District[] = [];
@@ -104,9 +134,10 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
 
       const fileType = metrics.fileType as Building["fileType"];
       const isTestFile = fileType === "test" || file.name.includes(".test.") || file.name.includes(".spec.");
-      const hasTests = isTestFile;
-      const testCoverage = isTestFile ? 0.85 + Math.random() * 0.15 : (hasTests ? 0.4 + Math.random() * 0.4 : 0.05 + Math.random() * 0.15);
-      const commitCount = Math.floor(realLoc / 15) + Math.floor(Math.random() * 20) + 1;
+      const normalizedStem = normalizeStem(file.path);
+      const hasTests = isTestFile || testStemSet.has(normalizedStem);
+      const testCoverage = estimateCoverage(isTestFile, hasTests, complexity, realLoc);
+      const commitCount = Math.max(1, Math.floor(realLoc / 20) + metrics.imports.length * 2 + (hasTests ? 4 : 0));
       const age: Building["age"] = commitCount > 80 ? "ancient" : commitCount > 40 ? "aged" : commitCount > 15 ? "modern" : "new";
 
       let status: Building["status"] = "healthy";
@@ -205,14 +236,18 @@ export function buildCityLayout(files: FileInfo[], repoName: string): CityLayout
   }
 
   if (roads.length < 5 && buildings.length > 1) {
-    const ba = Array.from(buildingMap.values());
-    for (let i = 0; i < Math.min(ba.length - 1, 20); i++) {
+    const orderedBuildings = Array.from(buildingMap.values())
+      .sort((a, b) => a.filePath.localeCompare(b.filePath));
+
+    for (let i = 0; i < orderedBuildings.length - 1; i++) {
       if (roads.length > 25) break;
-      const to = ba[Math.floor(Math.random() * ba.length)];
-      if (ba[i].id !== to.id && !roads.find(r => r.fromBuilding === ba[i].id && r.toBuilding === to.id)) {
+
+      const from = orderedBuildings[i];
+      const to = orderedBuildings[i + 1];
+      if (!roads.find(r => r.fromBuilding === from.id && r.toBuilding === to.id)) {
         roads.push({
           id: `road-${roadIndex++}`,
-          fromBuilding: ba[i].id,
+          fromBuilding: from.id,
           toBuilding: to.id,
           type: "import",
         });

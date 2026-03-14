@@ -26,6 +26,15 @@ if (!basePath) {
   );
 }
 
+const rawApiPort = process.env.API_PORT ?? "3000";
+const apiPort = Number(rawApiPort);
+
+if (Number.isNaN(apiPort) || apiPort <= 0) {
+  throw new Error(`Invalid API_PORT value: "${rawApiPort}"`);
+}
+
+const apiTarget = `http://127.0.0.1:${apiPort}`;
+
 export default defineConfig({
   base: basePath,
   plugins: [
@@ -62,6 +71,17 @@ export default defineConfig({
     port,
     host: "0.0.0.0",
     allowedHosts: true,
+    proxy: {
+      "/api": {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      "/ws": {
+        target: apiTarget,
+        changeOrigin: true,
+        ws: true,
+      },
+    },
     fs: {
       strict: true,
       deny: ["**/.*"],

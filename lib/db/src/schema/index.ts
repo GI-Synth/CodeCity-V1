@@ -5,3 +5,5 @@ export * from "./repos";
 export * from "./snapshots";
 export * from "./metrics";
 export * from "./settings";
+export * from "./executionResults";
+export * from "./findings";
