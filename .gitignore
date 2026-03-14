@@ -54,3 +54,4 @@ data/*.db-shm
 data/*.db-wal
 .env
 .env
+.env.template
