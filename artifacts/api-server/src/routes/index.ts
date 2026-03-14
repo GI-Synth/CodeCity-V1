@@ -15,6 +15,7 @@ import metricsRouter from "./metrics";
 import reportRouter from "./report";
 import orchestratorRouter from "./orchestrator";
 import alchemistRouter from "./alchemist";
+import debugRouter from "./debug";
 
 const router: IRouter = Router();
 
@@ -36,5 +37,6 @@ router.use("/metrics", metricsRouter);
 router.use("/city", reportRouter);
 router.use("/orchestrator", orchestratorRouter);
 router.use("/alchemist", alchemistRouter);
+router.use("/debug", debugRouter);
 
 export default router;

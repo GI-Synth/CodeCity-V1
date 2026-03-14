@@ -9,11 +9,11 @@ import {
   calibrateConfidence,
   extractFileType,
   findSimilarPersonalPattern,
-  isGenericFinding,
   isSecurityAdjacentFinding,
   mapRoleToPersona,
   parsePersonalKb,
   patternSimilarity,
+  shouldApplyGenericPenalty,
   shouldUsePersonalMemory,
   toMemoryPattern,
   type FindingSeverity,
@@ -61,6 +61,24 @@ function inferSeverityFromText(text: string): FindingSeverity {
 function clampConfidence(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(1, value));
+}
+
+function formatConfidence(value: number): string {
+  return clampConfidence(value).toFixed(2);
+}
+
+function logFindingDecision(params: {
+  filePath: string;
+  confidence: number;
+  calibratedConfidence: number;
+  decision: "bug" | "observation" | "discard";
+  reason: string;
+}): void {
+  console.log(
+    `[FindingQuality] ${params.filePath} confidence=${formatConfidence(params.confidence)} `
+      + `after_calibration=${formatConfidence(params.calibratedConfidence)} `
+      + `decision=${params.decision} reason=${params.reason}`,
+  );
 }
 
 function normalizeNoFindingText(raw: string | null): string | null {
@@ -374,6 +392,14 @@ export async function analyzeBuildingForAgent(params: {
   }
 
   if (!findingText) {
+    logFindingDecision({
+      filePath,
+      confidence: baseConfidence,
+      calibratedConfidence: baseConfidence,
+      decision: "discard",
+      reason: "no_finding",
+    });
+
     const findingId = await insertFindingRow({
       agentRow: params.agentRow,
       building: params.building,
@@ -438,13 +464,19 @@ export async function analyzeBuildingForAgent(params: {
     sharedPatternMatch,
     accuracy: params.agentRow.accuracy,
     filePreviouslyNoFinding: priorNoFinding,
-    genericFinding: isGenericFinding(functionName),
+    genericFinding: shouldApplyGenericPenalty({
+      findingText,
+      functionName,
+      lineReference,
+    }),
   });
 
   const qualityAssessment = assessFindingCandidate({
     agentName: params.agentRow.name,
     filePath,
     findingText,
+    functionName,
+    lineReference,
     confidence: calibration.after,
   });
 
@@ -474,6 +506,22 @@ export async function analyzeBuildingForAgent(params: {
     effectiveFindingText = findingText;
     effectiveCodeReference = lineReference ?? null;
   }
+
+  const decision = classification === "bug"
+    ? "bug"
+    : classification === "observation"
+      ? "observation"
+      : "discard";
+  const reason = qualityReason
+    ?? (qualityAssessment.status === "accepted" ? "accepted" : qualityAssessment.status);
+
+  logFindingDecision({
+    filePath,
+    confidence: calibration.before,
+    calibratedConfidence: calibration.after,
+    decision,
+    reason,
+  });
 
   const findingId = await insertFindingRow({
     agentRow: params.agentRow,

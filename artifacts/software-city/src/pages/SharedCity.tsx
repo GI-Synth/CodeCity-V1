@@ -102,6 +102,7 @@ export function SharedCity() {
           <CityMap
             layout={snap.layout}
             agents={[]}
+            activeBuildings={new Set<string>()}
             selectedBuildingId={null}
             onSelectBuilding={() => {}}
           />

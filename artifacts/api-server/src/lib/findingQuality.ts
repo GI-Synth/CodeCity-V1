@@ -3,20 +3,10 @@ import { eventsTable } from "@workspace/db/schema";
 import { and, desc, eq } from "drizzle-orm";
 import { basename, extname } from "node:path";
 import { classifyFindingSeverity, type FindingSeverity } from "./escalationEngine";
+import { isGenericFinding as isGenericFindingHeuristic } from "./smartAgents";
 
 const REPORTABLE_SOURCE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
-const GENERIC_FINDING_MARKERS = [
-  "this file has complexity",
-  "file has complexity",
-  "might have bugs",
-  "might exist",
-  "potential issues",
-  "this file has issues",
-  "needs review",
-  "complexity is high",
-  "generic analysis",
-  "possible bug",
-];
+const MIN_BUG_CONFIDENCE = 0.72;
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {
   CRITICAL: 4,
@@ -75,11 +65,6 @@ function compactText(text: string, max = 220): string {
   return text.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-function countWords(text: string): number {
-  const parts = text.trim().split(/\s+/).filter(Boolean);
-  return parts.length;
-}
-
 function parseEventTimestamp(value: string | null | undefined): number | null {
   if (!value) return null;
   const isoLike = value.includes("T") ? value : value.replace(" ", "T");
@@ -108,30 +93,6 @@ function toLegacyEventSeverity(severity: FindingSeverity): "critical" | "warning
   if (severity === "CRITICAL") return "critical";
   if (severity === "HIGH" || severity === "MEDIUM") return "warning";
   return "info";
-}
-
-function hasSpecificReference(text: string): boolean {
-  const lineRef = /\bline\s+\d+\b|\bL\d+\b|:\d+(?::\d+)?\b/i;
-  if (lineRef.test(text)) return true;
-
-  const functionRef = /\b(?:function|method|class|handler|module)\s+[`'\"]?[A-Za-z_$][\w$]*[`'\"]?/i;
-  if (functionRef.test(text)) return true;
-
-  const invocationRef = /\b[A-Za-z_$][\w$]*\s*\([^\n)]{0,80}\)/;
-  if (invocationRef.test(text)) return true;
-
-  const codeFenceRef = /`[^`]{3,120}`/;
-  if (codeFenceRef.test(text)) return true;
-
-  const codePatternRef = /\b(?:if|for|while|switch|await|throw|catch|try)\b\s*\(?/i;
-  return codePatternRef.test(text);
-}
-
-function isGenericFinding(text: string): boolean {
-  const lower = text.toLowerCase();
-  if (countWords(text) < 20) return true;
-  if (!hasSpecificReference(text)) return true;
-  return GENERIC_FINDING_MARKERS.some(marker => lower.includes(marker));
 }
 
 export function isReportableSourceFilePath(filePath: string): boolean {
@@ -171,6 +132,8 @@ export function assessFindingCandidate(params: {
   agentName: string;
   filePath: string;
   findingText: string;
+  functionName?: string | null;
+  lineReference?: string | null;
   confidence: number;
 }): FindingAssessment {
   const normalizedPath = normalizePath(params.filePath);
@@ -188,7 +151,7 @@ export function assessFindingCandidate(params: {
     };
   }
 
-  if (params.confidence < 0.75) {
+  if (params.confidence < MIN_BUG_CONFIDENCE) {
     const confidencePercent = Math.round(params.confidence * 100);
     return {
       status: "observation",
@@ -197,7 +160,11 @@ export function assessFindingCandidate(params: {
     };
   }
 
-  if (isGenericFinding(normalizedText)) {
+  if (isGenericFindingHeuristic({
+    findingText: normalizedText,
+    functionName: params.functionName ?? null,
+    lineReference: params.lineReference ?? null,
+  })) {
     console.log(`[QA] Discarded generic finding in ${normalizedPath}`);
     return { status: "discarded", reason: "generic" };
   }

@@ -385,6 +385,92 @@ export function CityView() {
     return a;
   });
 
+  const { activeBuildings, activeBuildingColors } = useMemo(() => {
+    const resolvedIds = new Set<string>();
+    const colorById = new Map<string, string>();
+    const buildings = (layout?.districts ?? []).flatMap((district) => district.buildings ?? []);
+
+    if (buildings.length === 0) {
+      return { activeBuildings: resolvedIds, activeBuildingColors: colorById };
+    }
+
+    const ids = new Set(buildings.map((building) => building.id));
+    const lowerIdMap = new Map(buildings.map((building) => [building.id.toLowerCase(), building.id] as const));
+
+    const resolveByRawId = (rawId: string): string | null => {
+      if (ids.has(rawId)) return rawId;
+
+      const lowerRawId = rawId.toLowerCase();
+      const lowerMatch = lowerIdMap.get(lowerRawId);
+      if (lowerMatch) return lowerMatch;
+
+      for (const building of buildings) {
+        const candidate = building.id.toLowerCase();
+        if (candidate.endsWith(lowerRawId) || lowerRawId.endsWith(candidate)) {
+          return building.id;
+        }
+      }
+
+      const rawTail = lowerRawId.startsWith("building-") ? lowerRawId.slice("building-".length) : lowerRawId;
+      for (const building of buildings) {
+        if (building.id.toLowerCase().endsWith(rawTail)) {
+          return building.id;
+        }
+      }
+
+      return null;
+    };
+
+    const resolveByPosition = (agent: Agent): string | null => {
+      const agentX = typeof agent.x === "number" ? agent.x : null;
+      const agentY = typeof agent.y === "number" ? agent.y : null;
+      if (agentX === null || agentY === null) return null;
+
+      const containing = buildings.find((building) => (
+        agentX >= building.x
+        && agentX <= building.x + building.width
+        && agentY >= building.y
+        && agentY <= building.y + building.height
+      ));
+      if (containing) return containing.id;
+
+      let nearestId: string | null = null;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      for (const building of buildings) {
+        const centerX = building.x + building.width / 2;
+        const centerY = building.y + building.height / 2;
+        const deltaX = agentX - centerX;
+        const deltaY = agentY - centerY;
+        const distance = deltaX * deltaX + deltaY * deltaY;
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestId = building.id;
+        }
+      }
+
+      return nearestDistance <= 160 * 160 ? nearestId : null;
+    };
+
+    for (const agent of agents) {
+      if (agent.status !== "working") continue;
+
+      const rawId =
+        agent.currentBuilding
+        ?? (agent as Agent & { currentBuildingId?: string | null }).currentBuildingId
+        ?? null;
+
+      const resolvedId = (rawId ? resolveByRawId(rawId) : null) ?? resolveByPosition(agent);
+      if (!resolvedId) continue;
+
+      resolvedIds.add(resolvedId);
+      if (!colorById.has(resolvedId)) {
+        colorById.set(resolvedId, agent.color || "#00fff7");
+      }
+    }
+
+    return { activeBuildings: resolvedIds, activeBuildingColors: colorById };
+  }, [agents, layout]);
+
   useEffect(() => {
     if (!lastMessage) return;
     const { type, payload } = lastMessage;
@@ -1398,6 +1484,8 @@ export function CityView() {
             <CityMap
               layout={layout}
               agents={agents}
+              activeBuildings={activeBuildings}
+              activeBuildingColors={activeBuildingColors}
               selectedBuildingId={selectedBuildingId}
               onSelectBuilding={setSelectedBuildingId}
               flashedBuildings={flashedBuildings}

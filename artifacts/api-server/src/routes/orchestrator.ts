@@ -222,13 +222,18 @@ type MayorFileAdviceContext = {
   normalizedFilePath: string;
   complexity: number | null;
   coveragePercent: number | null;
+  linesOfCode: number | null;
   lastAnalyzed: string | null;
-  activeBugCount: number;
+  bugCount: number;
+  status: string | null;
   agentsVisited: string[];
+  taskCompletionAgents: string[];
+  taskCompletionCount: number;
   findings: string[];
 };
 
 type CasualMayorIntent = "greeting" | "how_are_you" | "what_can_you_do" | "thanks" | "praise";
+type MayorHealthBand = "optimistic" | "focused" | "concerned";
 
 const mayorSessionConversations = new Map<string, MayorConversationEntry[]>();
 const mayorSessionSummaryFingerprints = new Map<string, string>();
@@ -499,22 +504,75 @@ function buildMayorWatchTarget(snapshot: CitySnapshot, recentBugSummaries: Recen
   return "high-complexity low-coverage files";
 }
 
+function getMayorHealthBand(healthScore: number): MayorHealthBand {
+  if (healthScore > 70) return "optimistic";
+  if (healthScore >= 40) return "focused";
+  return "concerned";
+}
+
+function chooseNonRepeatingMayorLine(lines: string[], history: MayorConversationEntry[]): string {
+  const priorAssistantLines = new Set(
+    history
+      .filter(entry => entry.role === "assistant")
+      .map(entry => normalizeReplyForComparison(entry.content))
+  );
+
+  const unseen = lines.find(line => !priorAssistantLines.has(normalizeReplyForComparison(line)));
+  if (unseen) return unseen;
+
+  const assistantReplyCount = history.filter(entry => entry.role === "assistant").length;
+  return lines[assistantReplyCount % lines.length] ?? lines[0] ?? "Hello.";
+}
+
 function buildCasualMayorReply(params: {
   intent: CasualMayorIntent;
   mayorName: string;
   snapshot: CitySnapshot;
   activeAgents: number;
   recentBugSummaries: RecentBugSummary[];
+  conversationHistory: MayorConversationEntry[];
 }): string {
   const cityFact = buildMayorCityFact(params.snapshot, params.activeAgents);
   const watchTarget = buildMayorWatchTarget(params.snapshot, params.recentBugSummaries);
+  const healthBand = getMayorHealthBand(params.snapshot.healthScore);
 
   if (params.intent === "greeting") {
-    return `Hey, I am ${params.mayorName}, your mayor and stubborn old architect. ${cityFact}, and I have already started nudging the riskiest files in the right direction.`;
+    const greetingByBand: Record<MayorHealthBand, string[]> = {
+      optimistic: [
+        `Hello, I am ${params.mayorName}, and the city is in a strong rhythm today.`,
+        `Hi, ${params.mayorName} here; we are in a healthy window, so this is a good time to harden weak seams.`,
+        `Good to see you, I am ${params.mayorName}, and we have enough stability to improve quality with intention.`,
+      ],
+      focused: [
+        `Hello, I am ${params.mayorName}; we are stable enough to move, but we need disciplined execution.`,
+        `Hi, ${params.mayorName} here; conditions are mixed, so I am prioritizing practical risk reduction.`,
+        `Good to connect, I am ${params.mayorName}, and my focus is steady progress on the highest-risk blocks.`,
+      ],
+      concerned: [
+        `Hello, I am ${params.mayorName}; we are under pressure, and I am staying calm and deliberate.`,
+        `Hi, ${params.mayorName} here; the city needs careful triage, so we will solve the sharpest problems first.`,
+        `Good to see you, I am ${params.mayorName}, and I am focused on controlled recovery over rushed changes.`,
+      ],
+    };
+
+    const followUpByBand: Record<MayorHealthBand, string> = {
+      optimistic: `${cityFact}, and I want to keep momentum by hardening ${watchTarget} before it surprises us.`,
+      focused: `${cityFact}, and I want tight execution around ${watchTarget} to prevent avoidable regressions.`,
+      concerned: `${cityFact}, and I want calm, targeted fixes around ${watchTarget} before we widen scope.`,
+    };
+
+    const intro = chooseNonRepeatingMayorLine(greetingByBand[healthBand], params.conversationHistory);
+    return `${intro} ${followUpByBand[healthBand]}`;
   }
 
   if (params.intent === "how_are_you") {
-    return `I am doing well enough to be useful. ${cityFact}, and I am happier when we trade heroics for steady, boring reliability.`;
+    if (healthBand === "optimistic") {
+      return `I am doing well and fully in the loop. ${cityFact}, so I am pushing preventive cleanup while conditions are favorable.`;
+    }
+    if (healthBand === "focused") {
+      return `I am focused and practical right now. ${cityFact}, and I am keeping attention on ${watchTarget} so the city stays predictable.`;
+    }
+    return `I am calm and alert. ${cityFact}, and my priority is reducing risk in ${watchTarget} with clean, reversible changes.`;
   }
 
   if (params.intent === "what_can_you_do") {
@@ -1719,15 +1777,216 @@ function resolveMayorFilePathFromQuestion(question: string, snapshot: CitySnapsh
   return null;
 }
 
-function filePathMatchesCandidate(filePath: string, candidate: string): boolean {
+function filePathMatchScore(filePath: string, candidate: string): number {
   const normalizedPath = normalizePathForLookup(filePath).toLowerCase();
   const normalizedCandidate = normalizePathForLookup(candidate).toLowerCase();
 
-  if (!normalizedPath || !normalizedCandidate) return false;
-  if (normalizedPath === normalizedCandidate) return true;
-  if (normalizedPath.endsWith(`/${normalizedCandidate}`)) return true;
-  if (normalizedCandidate.endsWith(`/${normalizedPath}`)) return true;
-  return basename(normalizedPath) === basename(normalizedCandidate);
+  if (!normalizedPath || !normalizedCandidate) return 0;
+  if (normalizedPath === normalizedCandidate) return 100;
+  if (normalizedPath.endsWith(`/${normalizedCandidate}`) || normalizedCandidate.endsWith(`/${normalizedPath}`)) return 95;
+
+  const pathBase = basename(normalizedPath);
+  const candidateBase = basename(normalizedCandidate);
+  if (pathBase === candidateBase) return 90;
+
+  const pathStem = basename(pathBase, extname(pathBase));
+  const candidateStem = basename(candidateBase, extname(candidateBase));
+  if (pathStem && pathStem === candidateStem) return 85;
+
+  if (normalizedPath.includes(normalizedCandidate) || normalizedCandidate.includes(normalizedPath)) return 70;
+  if (pathStem && candidateStem && (pathStem.includes(candidateStem) || candidateStem.includes(pathStem))) return 60;
+  return 0;
+}
+
+function filePathMatchesCandidate(filePath: string, candidate: string): boolean {
+  return filePathMatchScore(filePath, candidate) >= 85;
+}
+
+type MayorTelemetryBuilding = {
+  normalizedFilePath: string;
+  complexity: number | null;
+  coveragePercent: number | null;
+  linesOfCode: number | null;
+  lastAnalyzed: string | null;
+  bugCount: number;
+  status: string | null;
+};
+
+function toNullableNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function toCoveragePercent(value: unknown): number | null {
+  const numeric = toNullableNumber(value);
+  if (numeric === null) return null;
+  if (numeric <= 1) return Math.round(Math.max(0, Math.min(1, numeric)) * 100);
+  return Math.round(Math.max(0, Math.min(100, numeric)));
+}
+
+function toMayorTelemetryBuilding(raw: unknown): MayorTelemetryBuilding | null {
+  if (!raw || typeof raw !== "object") return null;
+
+  const record = raw as Record<string, unknown>;
+  const filePathValue = typeof record.filePath === "string"
+    ? record.filePath
+    : typeof record.path === "string"
+      ? record.path
+      : "";
+
+  const normalizedFilePath = normalizePathForLookup(filePathValue);
+  if (!normalizedFilePath) return null;
+
+  return {
+    normalizedFilePath,
+    complexity: toNullableNumber(record.complexity),
+    coveragePercent: toCoveragePercent(record.testCoverage),
+    linesOfCode: toNullableNumber(record.linesOfCode) ?? toNullableNumber(record.loc),
+    lastAnalyzed: typeof record.lastAnalyzed === "string" && record.lastAnalyzed.trim()
+      ? record.lastAnalyzed
+      : null,
+    bugCount: Math.max(0, Math.round(toNullableNumber(record.bugCount) ?? 0)),
+    status: typeof record.status === "string" && record.status.trim()
+      ? record.status
+      : null,
+  };
+}
+
+function telemetryCompletenessScore(building: MayorTelemetryBuilding): number {
+  let score = 0;
+  if (building.complexity !== null) score += 1;
+  if (building.coveragePercent !== null) score += 1;
+  if (building.linesOfCode !== null) score += 1;
+  if (building.lastAnalyzed) score += 1;
+  if (building.status) score += 1;
+  if (building.bugCount > 0) score += 1;
+  return score;
+}
+
+function findBestTelemetryBuildingMatch(buildings: MayorTelemetryBuilding[], candidates: string[]): {
+  building: MayorTelemetryBuilding;
+  score: number;
+  completeness: number;
+} | null {
+  let best: { building: MayorTelemetryBuilding; score: number; completeness: number } | null = null;
+
+  for (const building of buildings) {
+    const score = candidates.reduce((currentBest, candidate) => {
+      return Math.max(currentBest, filePathMatchScore(building.normalizedFilePath, candidate));
+    }, 0);
+    if (score <= 0) continue;
+
+    const completeness = telemetryCompletenessScore(building);
+    if (!best || score > best.score || (score === best.score && completeness > best.completeness)) {
+      best = { building, score, completeness };
+    }
+  }
+
+  return best;
+}
+
+function extractEventFileCandidates(event: MayorEventRow): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (raw: string | null | undefined): void => {
+    if (!raw) return;
+    const normalized = normalizePathForLookup(raw.trim());
+    if (!normalized) return;
+
+    const lower = normalized.toLowerCase();
+    if (seen.has(lower)) return;
+    seen.add(lower);
+    candidates.push(normalized);
+  };
+
+  addCandidate(event.filePath ?? null);
+  addCandidate(event.buildingName ?? null);
+  addCandidate(extractEventFilePath(event));
+
+  const fromMessage = event.message.match(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g) ?? [];
+  for (const token of fromMessage) addCandidate(token);
+
+  return candidates;
+}
+
+function collectTaskCompletionVisits(events: MayorEventRow[], canonicalPath: string): {
+  taskCompletionAgents: string[];
+  taskCompletionCount: number;
+} {
+  const taskCompletionAgents = new Set<string>();
+  let taskCompletionCount = 0;
+
+  for (const event of events) {
+    if (event.type !== "task_complete") continue;
+    const eventFiles = extractEventFileCandidates(event);
+    if (eventFiles.length === 0) continue;
+
+    const matchesFile = eventFiles.some(candidate => filePathMatchesCandidate(candidate, canonicalPath));
+    if (!matchesFile) continue;
+
+    taskCompletionCount += 1;
+    if (event.agentName) taskCompletionAgents.add(event.agentName);
+  }
+
+  return {
+    taskCompletionAgents: Array.from(taskCompletionAgents).slice(0, 6),
+    taskCompletionCount,
+  };
+}
+
+async function resolveMayorTelemetryBuilding(candidates: string[], snapshot: CitySnapshot): Promise<MayorTelemetryBuilding | null> {
+  const normalizedCandidates = Array.from(new Set(
+    candidates
+      .map(candidate => normalizePathForLookup(candidate))
+      .filter(Boolean)
+  ));
+
+  if (normalizedCandidates.length === 0) return null;
+
+  const snapshotBuildings = snapshot.allBuildings
+    .map(building => toMayorTelemetryBuilding(building))
+    .filter((building): building is MayorTelemetryBuilding => Boolean(building));
+
+  let bestMatch = findBestTelemetryBuildingMatch(snapshotBuildings, normalizedCandidates);
+  if (bestMatch?.score === 100) return bestMatch.building;
+
+  try {
+    const repoRows = await db
+      .select({ layoutData: reposTable.layoutData })
+      .from(reposTable)
+      .orderBy(desc(reposTable.isActive), desc(reposTable.updatedAt))
+      .limit(8);
+
+    for (const row of repoRows) {
+      const layout = parseLayout(row.layoutData ?? null);
+      if (!layout || !Array.isArray(layout.districts)) continue;
+
+      const buildings = layout.districts
+        .flatMap(district => district.buildings ?? [])
+        .map(building => toMayorTelemetryBuilding(building))
+        .filter((building): building is MayorTelemetryBuilding => Boolean(building));
+
+      const candidateMatch = findBestTelemetryBuildingMatch(buildings, normalizedCandidates);
+      if (!candidateMatch) continue;
+
+      if (!bestMatch || candidateMatch.score > bestMatch.score || (candidateMatch.score === bestMatch.score && candidateMatch.completeness > bestMatch.completeness)) {
+        bestMatch = candidateMatch;
+      }
+
+      if (bestMatch.score === 100 && bestMatch.completeness >= 3) {
+        break;
+      }
+    }
+  } catch {
+    // Keep best known telemetry from snapshot if DB fallback fails.
+  }
+
+  return bestMatch?.building ?? null;
 }
 
 function parseVisitedFiles(raw: string): string[] {
@@ -1742,32 +2001,30 @@ function parseVisitedFiles(raw: string): string[] {
   }
 }
 
-function buildMayorFileAdviceContext(params: {
+async function buildMayorFileAdviceContext(params: {
   message: string;
   snapshot: CitySnapshot;
   events: MayorEventRow[];
   agents: Array<typeof agentsTable.$inferSelect>;
-}): MayorFileAdviceContext | null {
+}): Promise<MayorFileAdviceContext | null> {
   const mentioned = extractMentionedFileCandidates(params.message);
   const resolvedFromSnapshot = resolveMayorFilePathFromQuestion(params.message, params.snapshot);
   const requestedFile = resolvedFromSnapshot ?? mentioned[0] ?? null;
   if (!requestedFile) return null;
 
-  const matchingBuilding = params.snapshot.allBuildings.find(building => {
-    if (resolvedFromSnapshot && filePathMatchesCandidate(building.filePath, resolvedFromSnapshot)) return true;
-    return mentioned.some(file => filePathMatchesCandidate(building.filePath, file));
-  });
+  const lookupCandidates = Array.from(new Set([
+    requestedFile,
+    resolvedFromSnapshot ?? "",
+    ...mentioned,
+  ].filter(Boolean).map(value => normalizePathForLookup(value))));
 
-  const canonicalPath = matchingBuilding
-    ? normalizePathForLookup(matchingBuilding.filePath)
-    : normalizePathForLookup(requestedFile);
+  const telemetryBuilding = await resolveMayorTelemetryBuilding(lookupCandidates, params.snapshot);
+  const canonicalPath = telemetryBuilding?.normalizedFilePath ?? normalizePathForLookup(requestedFile);
 
   const matchingEvents = params.events.filter(event => {
-    const eventPath = event.filePath
-      ? normalizePathForLookup(event.filePath)
-      : extractEventFilePath(event);
-    if (!eventPath) return false;
-    return filePathMatchesCandidate(eventPath, canonicalPath);
+    const eventFiles = extractEventFileCandidates(event);
+    if (eventFiles.length === 0) return false;
+    return eventFiles.some(eventFile => filePathMatchesCandidate(eventFile, canonicalPath));
   });
 
   const bugEvents = matchingEvents.filter(event => event.type === "bug_found");
@@ -1792,17 +2049,25 @@ function buildMayorFileAdviceContext(params: {
     if (event.agentName) visitedByAgents.add(event.agentName);
   }
 
-  const activeBugCount = Math.max(matchingBuilding?.bugCount ?? 0, bugEvents.length);
-  const coveragePercent = matchingBuilding ? Math.round(matchingBuilding.testCoverage * 100) : null;
+  const taskCompletionVisits = collectTaskCompletionVisits(params.events, canonicalPath);
+  for (const agentName of taskCompletionVisits.taskCompletionAgents) {
+    visitedByAgents.add(agentName);
+  }
+
+  const bugCount = Math.max(telemetryBuilding?.bugCount ?? 0, bugEvents.length);
 
   return {
     requestedFile,
     normalizedFilePath: canonicalPath,
-    complexity: matchingBuilding?.complexity ?? null,
-    coveragePercent,
-    lastAnalyzed: matchingBuilding?.lastAnalyzed ?? null,
-    activeBugCount,
+    complexity: telemetryBuilding?.complexity ?? null,
+    coveragePercent: telemetryBuilding?.coveragePercent ?? null,
+    linesOfCode: telemetryBuilding?.linesOfCode ?? null,
+    lastAnalyzed: telemetryBuilding?.lastAnalyzed ?? null,
+    bugCount,
+    status: telemetryBuilding?.status ?? null,
     agentsVisited: Array.from(visitedByAgents).slice(0, 6),
+    taskCompletionAgents: taskCompletionVisits.taskCompletionAgents,
+    taskCompletionCount: taskCompletionVisits.taskCompletionCount,
     findings,
   };
 }
@@ -1810,8 +2075,15 @@ function buildMayorFileAdviceContext(params: {
 function formatMayorFileAdviceForPrompt(context: MayorFileAdviceContext): string {
   const complexity = context.complexity ?? "unknown";
   const coverage = context.coveragePercent === null ? "unknown" : `${context.coveragePercent}%`;
+  const linesOfCode = context.linesOfCode === null ? "unknown" : String(context.linesOfCode);
   const lastAnalyzed = context.lastAnalyzed ?? "unknown";
+  const status = context.status ?? "unknown";
   const visited = context.agentsVisited.length > 0 ? context.agentsVisited.join(", ") : "none recorded";
+  const taskVisits = context.taskCompletionAgents.length > 0
+    ? `${context.taskCompletionAgents.join(", ")} (${context.taskCompletionCount} completion records)`
+    : context.taskCompletionCount > 0
+      ? `${context.taskCompletionCount} completion records`
+      : "none recorded";
   const findings = context.findings.length > 0
     ? context.findings.map(item => `- ${item}`).join("\n")
     : "- no recent file-specific findings";
@@ -1820,9 +2092,12 @@ function formatMayorFileAdviceForPrompt(context: MayorFileAdviceContext): string
     `File context for ${context.normalizedFilePath}:`,
     `- Complexity: ${complexity}`,
     `- Coverage: ${coverage}`,
+    `- LOC: ${linesOfCode}`,
+    `- Status: ${status}`,
     `- Last analyzed: ${lastAnalyzed}`,
-    `- Active bugs: ${context.activeBugCount}`,
-    `- Agents visited: ${visited}`,
+    `- Bug count: ${context.bugCount}`,
+    `- Agents from task completions: ${taskVisits}`,
+    `- Agents touched (all signals): ${visited}`,
     "- What agents found:",
     findings,
   ].join("\n");
@@ -1831,17 +2106,40 @@ function formatMayorFileAdviceForPrompt(context: MayorFileAdviceContext): string
 function buildMayorFileAdviceFallbackReply(context: MayorFileAdviceContext, options?: { sourceBodyUnavailable?: boolean }): string {
   const complexity = context.complexity === null ? "unknown" : String(context.complexity);
   const coverage = context.coveragePercent === null ? "unknown" : `${context.coveragePercent}%`;
+  const linesOfCode = context.linesOfCode === null ? "unknown" : String(context.linesOfCode);
+  const status = context.status ?? "unknown";
+  const lastAnalyzed = context.lastAnalyzed ?? "unknown";
   const finding = context.findings[0] ?? "No specific finding text is stored yet for this file.";
   const visited = context.agentsVisited.length > 0 ? context.agentsVisited.join(", ") : "no recorded agents";
+  const completionVisits = context.taskCompletionAgents.length > 0
+    ? `${context.taskCompletionAgents.join(", ")} (${context.taskCompletionCount} completion records)`
+    : context.taskCompletionCount > 0
+      ? `${context.taskCompletionCount} completion records without agent names`
+      : "no recorded task completion visits";
   const finalSentence = options?.sourceBodyUnavailable
     ? "I cannot read the live source body right now, so I would start by splitting the highest-complexity branch and adding one focused regression test around the top bug path."
     : "I would split the highest-complexity branch first and add a focused regression test around the bug path before wider refactors.";
 
   return [
-    `I have telemetry for ${context.normalizedFilePath}: complexity ${complexity}, coverage ${coverage}, and ${context.activeBugCount} active bug signal(s).`,
-    `Agents who touched it: ${visited}; top finding: ${finding}`,
+    `I have telemetry for ${context.normalizedFilePath}: complexity ${complexity}, coverage ${coverage}, LOC ${linesOfCode}, status ${status}, last analyzed ${lastAnalyzed}, and bug count ${context.bugCount}.`,
+    `Task-completion visits: ${completionVisits}; broader agent touches: ${visited}; top finding: ${finding}`,
     finalSentence,
   ].join(" ");
+}
+
+function buildMayorFileTelemetryLead(context: MayorFileAdviceContext): string {
+  const complexity = context.complexity === null ? "unknown" : String(context.complexity);
+  const coverage = context.coveragePercent === null ? "unknown" : `${context.coveragePercent}%`;
+  const linesOfCode = context.linesOfCode === null ? "unknown" : String(context.linesOfCode);
+  const lastAnalyzed = context.lastAnalyzed ?? "unknown";
+  const status = context.status ?? "unknown";
+  const completionVisits = context.taskCompletionAgents.length > 0
+    ? `${context.taskCompletionAgents.join(", ")} (${context.taskCompletionCount} completion records)`
+    : context.taskCompletionCount > 0
+      ? `${context.taskCompletionCount} completion records without agent names`
+      : "none recorded";
+
+  return `For ${context.normalizedFilePath}, telemetry shows complexity ${complexity}, coverage ${coverage}, LOC ${linesOfCode}, last analyzed ${lastAnalyzed}, bug count ${context.bugCount}, status ${status}, and task-completion visits ${completionVisits}.`;
 }
 
 function findEventFileName(event: MayorEventRow): string {
@@ -2267,7 +2565,7 @@ function ensureCompleteMayorReply(reply: string, fallbackSentences: string[]): s
     return fallbackSentences.slice(0, 2).join(" ");
   }
 
-  const completeSentences = normalized.match(/[^.!?]+[.!?]/g)?.map(s => s.trim()).filter(Boolean) ?? [];
+  const completeSentences = splitMayorSentences(normalized);
   const selected = completeSentences.slice(0, 3);
 
   for (const fallback of fallbackSentences) {
@@ -2285,6 +2583,20 @@ function ensureCompleteMayorReply(reply: string, fallbackSentences: string[]): s
   }
 
   return selected.slice(0, 3).join(" ");
+}
+
+function protectMayorFileExtensions(text: string): string {
+  return text.replace(/\.([a-z]{1,4})\b/gi, (_match, ext: string) => `__MAYOR_EXT_${ext.toLowerCase()}__`);
+}
+
+function restoreMayorFileExtensions(text: string): string {
+  return text.replace(/__MAYOR_EXT_([a-z]{1,4})__/gi, (_match, ext: string) => `.${ext}`);
+}
+
+function splitMayorSentences(text: string): string[] {
+  const protectedText = protectMayorFileExtensions(text);
+  const sentences = protectedText.match(/[^.!?]+[.!?]/g)?.map(item => item.trim()).filter(Boolean) ?? [];
+  return sentences.map(sentence => restoreMayorFileExtensions(sentence));
 }
 
 async function readOrchestratorModelSettings(): Promise<{ groqModel: string; mayorName: string }> {
@@ -2354,7 +2666,7 @@ function toMaxSentences(text: string, maxSentences: number): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
 
-  const sentences = normalized.match(/[^.!?]+[.!?]/g)?.map(item => item.trim()).filter(Boolean) ?? [];
+  const sentences = splitMayorSentences(normalized);
   if (sentences.length > 0) {
     return sentences.slice(0, maxSentences).join(" ");
   }
@@ -2707,7 +3019,7 @@ router.post("/chat", async (req, res): Promise<void> => {
     const conversationHistory = getMayorConversation(sessionId);
     const conversationHistoryText = formatConversationHistoryForPrompt(settings.mayorName, conversationHistory);
     const rememberedConversations = formatMayorMemoryForPrompt(mayorMemorySummaries);
-    const referencedFileContext = buildMayorFileAdviceContext({
+    const referencedFileContext = await buildMayorFileAdviceContext({
       message,
       snapshot,
       events: eventRows,
@@ -2772,6 +3084,7 @@ router.post("/chat", async (req, res): Promise<void> => {
         snapshot,
         activeAgents,
         recentBugSummaries,
+        conversationHistory,
       });
       provider = "rule-based";
       model = "casual-template";
@@ -2806,18 +3119,20 @@ router.post("/chat", async (req, res): Promise<void> => {
             `User question: ${message}`,
             `Target file: ${referencedFileContext.normalizedFilePath}`,
             fileAdviceContext,
+            "In your first sentence, explicitly state complexity, coverage, LOC, last analyzed, bug count, status, and task-completion agent visits.",
             "Use this file telemetry and source code to provide concrete, file-specific guidance for this codebase.",
             "Call out likely risky functions, failure modes, and the next test(s) to add first.",
             "Source file content starts below:",
             trimFileContentForPrompt(fileContent),
           ].join("\n\n");
 
-          reply = await callGroqMayor({
+          const aiReply = await callGroqMayor({
             model: settings.groqModel,
             systemPrompt,
             conversationHistory,
             userMessage: fileAwareQuestion,
           });
+          reply = `${buildMayorFileTelemetryLead(referencedFileContext)} ${toMaxSentences(aiReply, 2)}`.trim();
           provider = "groq";
           model = settings.groqModel;
           source = "ai";

@@ -157,6 +157,15 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
   const kbHitRatePercent = Math.round((kbSessionStats?.kbHitRate ?? 0) * 100);
   const alchemistSuccessRate = Math.round((alchemistSummary?.successRate ?? 0) * 100);
   const alchemistStatus = alchemistSummary?.lastRun?.status ?? "idle";
+  const healthColor =
+    health.score > 70
+      ? "#00ff88"
+      : health.score >= 40
+        ? "#ffcc00"
+        : health.score >= 20
+          ? "#ff8800"
+          : "#ff3b3b";
+  const isCriticalHealth = health.score < 20;
 
   const getSeasonIcon = (season: string) => {
     switch (season) {
@@ -177,9 +186,13 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
           <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">Health Score</span>
           <div className="flex items-center gap-2">
             <span className={cn(
-              "text-2xl font-black font-mono text-glow",
-              health.score > 80 ? "text-success" : health.score > 50 ? "text-warning" : "text-destructive"
-            )}>
+              "text-2xl font-black font-mono transition-[color,text-shadow,opacity] duration-700",
+              isCriticalHealth ? "hud-health-critical" : ""
+            )}
+            style={{
+              color: healthColor,
+              textShadow: `0 0 10px ${healthColor}66`,
+            }}>
               {health.score}
             </span>
             <span className="text-muted-foreground text-sm">/100</span>

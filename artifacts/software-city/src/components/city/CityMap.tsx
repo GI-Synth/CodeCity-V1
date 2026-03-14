@@ -5,6 +5,8 @@ import type { CityLayout, Agent, Building } from "@workspace/api-client-react";
 interface CityMapProps {
   layout: CityLayout;
   agents: Agent[];
+  activeBuildings: Set<string>;
+  activeBuildingColors?: Map<string, string>;
   selectedBuildingId: string | null;
   onSelectBuilding: (id: string) => void;
   highlightDistrictId?: string | null;
@@ -50,11 +52,11 @@ const SEASON_BGS = {
   winter: "#151515",
 };
 
-const SEASON_OVERLAY: Record<string, string> = {
-  summer: "rgba(123, 198, 126, 0.04)",
-  spring: "rgba(168, 216, 168, 0.03)",
-  autumn: "rgba(212, 145, 90, 0.05)",
-  winter: "rgba(139, 184, 212, 0.08)",
+const SEASON_TINTS: Record<string, string> = {
+  summer: "rgb(126 190 118)",
+  spring: "rgb(142 214 150)",
+  autumn: "rgb(214 145 84)",
+  winter: "rgb(118 158 207)",
 };
 
 const SEASON_PARTICLES: Record<string, { emoji: string; count: number }> = {
@@ -90,6 +92,8 @@ function getRoadColor(road: any, isHighlighted: boolean): { stroke: string; widt
 export function CityMap({
   layout,
   agents,
+  activeBuildings,
+  activeBuildingColors,
   selectedBuildingId,
   onSelectBuilding,
   highlightDistrictId,
@@ -131,6 +135,27 @@ export function CityMap({
   const [hoveredBuilding, setHoveredBuilding] = useState<Building | null>(null);
   const hideTooltipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showMinimap, setShowMinimap] = useState(true);
+
+  const fallbackActiveBuildingColors = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const agent of agents) {
+      const buildingId =
+        agent.currentBuilding ??
+        (agent as Agent & { currentBuildingId?: string | null }).currentBuildingId ??
+        null;
+      if (agent.status !== "working" || !buildingId || map.has(buildingId)) continue;
+      map.set(buildingId, agent.color || "#00fff7");
+    }
+    return map;
+  }, [agents]);
+
+  const resolvedActiveBuildingColors = activeBuildingColors && activeBuildingColors.size > 0
+    ? activeBuildingColors
+    : fallbackActiveBuildingColors;
+
+  const seasonKey = ((layout.season as keyof typeof SEASON_BGS) || "summer") as keyof typeof SEASON_BGS;
+  const seasonBackground = SEASON_BGS[seasonKey] || SEASON_BGS.summer;
+  const seasonTint = SEASON_TINTS[seasonKey] || SEASON_TINTS.summer;
 
   useEffect(() => {
     setCenter({ x: bounds.cx, y: bounds.cy });
@@ -258,7 +283,10 @@ export function CityMap({
     <div
       ref={containerRef}
       className="w-full h-full relative overflow-hidden bg-background transition-colors duration-1000"
-      style={{ backgroundColor: SEASON_BGS[(layout.season as keyof typeof SEASON_BGS) || 'summer'] }}
+      style={{
+        backgroundColor: seasonBackground,
+        "--season-tint": seasonTint,
+      } as React.CSSProperties & { "--season-tint": string }}
     >
       {/* Background grid */}
       <div
@@ -266,6 +294,14 @@ export function CityMap({
         style={{
           backgroundImage: `linear-gradient(to right, #00fff7 1px, transparent 1px), linear-gradient(to bottom, #00fff7 1px, transparent 1px)`,
           backgroundSize: '40px 40px'
+        }}
+      />
+      <div
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background: "var(--season-tint)",
+          opacity: 0.06,
+          transition: "background 2s ease",
         }}
       />
 
@@ -358,23 +394,38 @@ export function CityMap({
                 if (isDimmed) opacity = Math.min(opacity, 0.3);
 
                 const isFlashing = flashedBuildings?.has(building.id) ?? false;
+                const isActiveBuilding = activeBuildings.has(building.id);
+                const activeBuildingColor = resolvedActiveBuildingColors.get(building.id) || "#00fff7";
 
                 if (isLowLod) {
                   return (
-                    <rect
-                      key={building.id}
-                      x={building.x}
-                      y={building.y}
-                      width={building.width}
-                      height={building.height}
-                      fill={color}
-                      fillOpacity={opacity}
-                      stroke={isSelected ? "#fff" : "rgba(0,0,0,0.3)"}
-                      strokeWidth={isSelected ? 2 : 0.5}
-                      rx="2"
-                      onClick={() => onSelectBuilding(building.id)}
-                      className="cursor-pointer"
-                    />
+                    <g key={building.id} onClick={() => onSelectBuilding(building.id)} className="cursor-pointer">
+                      {isActiveBuilding && (
+                        <rect
+                          x={building.x - 2}
+                          y={building.y - 2}
+                          width={building.width + 4}
+                          height={building.height + 4}
+                          fill="none"
+                          stroke={activeBuildingColor}
+                          strokeWidth={1.5}
+                          rx="3"
+                          className="city-active-building-ring"
+                          style={{ filter: `drop-shadow(0 0 4px ${activeBuildingColor})` }}
+                        />
+                      )}
+                      <rect
+                        x={building.x}
+                        y={building.y}
+                        width={building.width}
+                        height={building.height}
+                        fill={color}
+                        fillOpacity={opacity}
+                        stroke={isSelected ? "#fff" : "rgba(0,0,0,0.3)"}
+                        strokeWidth={isSelected ? 2 : 0.5}
+                        rx="2"
+                      />
+                    </g>
                   );
                 }
 
@@ -404,6 +455,20 @@ export function CityMap({
                         strokeWidth="3"
                         rx="6"
                         className="animate-ping"
+                      />
+                    )}
+                    {isActiveBuilding && (
+                      <rect
+                        x="-4"
+                        y="-4"
+                        width={building.width + 8}
+                        height={building.height + 8}
+                        fill="none"
+                        stroke={activeBuildingColor}
+                        strokeWidth="2"
+                        rx="6"
+                        className="city-active-building-ring"
+                        style={{ filter: `drop-shadow(0 0 5px ${activeBuildingColor})` }}
                       />
                     )}
                     {(isSelected || building.status === 'glowing') && (
@@ -519,18 +584,6 @@ export function CityMap({
             </g>
           );
         })}
-
-        {/* Season overlay tint */}
-        {layout.season && SEASON_OVERLAY[layout.season] && (
-          <rect
-            x={center.x - viewW / 2}
-            y={center.y - viewH / 2}
-            width={viewW}
-            height={viewH}
-            fill={SEASON_OVERLAY[layout.season]}
-            className="pointer-events-none"
-          />
-        )}
 
         {/* Season particles */}
         {layout.season && SEASON_PARTICLES[layout.season]?.count > 0 && !isLowLod && (

@@ -51,6 +51,12 @@ export interface CalibrationResult {
   classification: "discarded" | "observation" | "bug";
 }
 
+export interface GenericFindingInput {
+  findingText: string | null | undefined;
+  functionName?: string | null;
+  lineReference?: string | null;
+}
+
 export interface RolePrompt {
   system: string;
   prompt: string;
@@ -58,6 +64,52 @@ export interface RolePrompt {
 }
 
 const TOKEN_SPLIT_REGEX = /[^a-z0-9_]+/i;
+const LINE_REFERENCE_REGEX = /\bline\s+\d+\b|\bL\d+\b|:\d+(?::\d+)?\b/i;
+const FUNCTION_REFERENCE_REGEX = /\b[a-zA-Z_$][\w$]*\s*\(|\b[a-z]+[A-Z][A-Za-z0-9_$]*\b/;
+
+const SPECIFIC_PATTERN_MARKERS = [
+  "try-catch",
+  "try/catch",
+  "null check",
+  "undefined check",
+  "promise rejection",
+  "race condition",
+  "off-by-one",
+  "n+1",
+  "sql injection",
+  "circular dependency",
+  "memory leak",
+  "deadlock",
+  "auth bypass",
+  "input validation",
+];
+
+const CODE_KEYWORDS = [
+  "async",
+  "await",
+  "try",
+  "catch",
+  "throw",
+  "promise",
+  "rejection",
+  "null",
+  "undefined",
+  "return",
+  "token",
+  "provider",
+  "auth",
+  "sql",
+  "xss",
+  "csrf",
+  "regex",
+  "parse",
+  "serialize",
+  "import",
+];
+
+const DISCARD_THRESHOLD = 0.50;
+const OBSERVATION_THRESHOLD = 0.55;
+const BUG_THRESHOLD = 0.72;
 
 function clampConfidence(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -66,6 +118,42 @@ function clampConfidence(value: number): number {
 
 function safeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function countWords(text: string): number {
+  return text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .length;
+}
+
+function hasLineReference(lineReference: string | null | undefined, findingText: string): boolean {
+  const explicitLine = safeString(lineReference);
+  if (explicitLine.length > 0) return true;
+  return LINE_REFERENCE_REGEX.test(findingText);
+}
+
+function hasFunctionReference(functionName: string | null | undefined, findingText: string): boolean {
+  const explicitFunction = safeString(functionName);
+  if (explicitFunction.length > 0) return true;
+  return FUNCTION_REFERENCE_REGEX.test(findingText);
+}
+
+function hasSpecificPatternName(findingText: string): boolean {
+  const lower = findingText.toLowerCase();
+  return SPECIFIC_PATTERN_MARKERS.some(marker => lower.includes(marker));
+}
+
+function hasCodeKeyword(findingText: string): boolean {
+  const tokens = tokenize(findingText);
+  for (const keyword of CODE_KEYWORDS) {
+    if (tokens.has(keyword)) return true;
+  }
+
+  // Keep hyphenated terms detectable even when tokenizer splits punctuation.
+  const lower = findingText.toLowerCase();
+  return lower.includes("try-catch") || lower.includes("try/catch") || lower.includes("n+1");
 }
 
 function normalizeSeverity(value: string): FindingSeverity {
@@ -534,8 +622,29 @@ export function parseRoleResponse(persona: AgentPersona, raw: string): BugStyleF
   };
 }
 
-export function isGenericFinding(functionName: string | null | undefined): boolean {
-  return !functionName || functionName.trim().length === 0;
+export function shouldApplyGenericPenalty(input: GenericFindingInput): boolean {
+  const findingText = safeString(input.findingText);
+  if (!findingText) return true;
+
+  const shortFinding = countWords(findingText) < 15;
+  if (!shortFinding) return false;
+
+  const hasFunction = hasFunctionReference(input.functionName ?? null, findingText);
+  const hasLine = hasLineReference(input.lineReference ?? null, findingText);
+  return !hasFunction && !hasLine;
+}
+
+export function isGenericFinding(input: GenericFindingInput): boolean {
+  const findingText = safeString(input.findingText);
+  if (!findingText) return true;
+  if (countWords(findingText) >= 10) return false;
+
+  const hasFunction = hasFunctionReference(input.functionName ?? null, findingText);
+  const hasLine = hasLineReference(input.lineReference ?? null, findingText);
+  const hasPattern = hasSpecificPatternName(findingText);
+  const hasKeyword = hasCodeKeyword(findingText);
+
+  return !hasFunction && !hasLine && !hasPattern && !hasKeyword;
 }
 
 export function isSecurityAdjacentFinding(params: {
@@ -588,19 +697,14 @@ export function calibrateConfidence(input: CalibrationInput): CalibrationResult 
     modifiers.push("-0.10 low_agent_accuracy");
   }
 
-  if (input.filePreviouslyNoFinding) {
-    score -= 0.15;
-    modifiers.push("-0.15 previously_no_findings");
-  }
-
   if (input.genericFinding) {
     score -= 0.20;
-    modifiers.push("-0.20 generic_without_function");
+    modifiers.push("-0.20 generic_short_without_location");
   }
 
   score = clampConfidence(score);
 
-  if (score < 0.65) {
+  if (score < DISCARD_THRESHOLD) {
     return {
       before: clampConfidence(input.baseConfidence),
       after: score,
@@ -609,7 +713,16 @@ export function calibrateConfidence(input: CalibrationInput): CalibrationResult 
     };
   }
 
-  if (score <= 0.80) {
+  if (score < OBSERVATION_THRESHOLD) {
+    return {
+      before: clampConfidence(input.baseConfidence),
+      after: score,
+      modifiers,
+      classification: "observation",
+    };
+  }
+
+  if (score < BUG_THRESHOLD) {
     return {
       before: clampConfidence(input.baseConfidence),
       after: score,

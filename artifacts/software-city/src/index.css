@@ -152,6 +152,15 @@
     box-shadow: var(--shadow-neon);
   }
 
+  .city-active-building-ring {
+    opacity: 0.6;
+    animation: city-building-pulse 1.5s ease-in-out infinite;
+  }
+
+  .hud-health-critical {
+    animation: hud-health-critical-pulse 2.8s ease-in-out infinite;
+  }
+
   /* Custom Scrollbar for dark theme */
   ::-webkit-scrollbar {
     width: 8px;
@@ -166,5 +175,24 @@
   }
   ::-webkit-scrollbar-thumb:hover {
     background: hsl(var(--primary) / 0.5); 
+  }
+}
+
+@keyframes city-building-pulse {
+  0% {
+    opacity: 0.6;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes hud-health-critical-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.65;
   }
 }
