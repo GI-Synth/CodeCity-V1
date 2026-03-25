@@ -1,0 +1,12 @@
+pack	files	fbx	obj	gltf	glb	png	jpg	mtl
+3d-road-tiles	915	0	302	302	0	2	0	302
+car-kit	259	50	50	0	50	54	0	50
+city-kit-commercial	219	41	41	0	41	50	0	41
+city-kit-industrial	141	25	25	0	25	36	0	25
+city-kit-roads	372	72	72	0	72	79	0	72
+city-kit-suburban	216	40	40	0	40	51	0	40
+conveyor-kit	317	61	61	0	61	68	0	61
+isometric-roads-water	47	0	0	0	0	42	1	0
+modular-buildings	554	108	108	0	108	117	0	108
+nature-kit	3618	329	329	0	329	1640	0	329
+train-kit	527	103	103	0	103	110	0	103

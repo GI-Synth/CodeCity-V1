@@ -356,7 +356,6 @@ export function CityView() {
   const [alchemistCommand, setAlchemistCommand] = useState("pnpm run typecheck");
   const [alchemistRunning, setAlchemistRunning] = useState(false);
   const [alchemistResults, setAlchemistResults] = useState<AlchemistResult[]>([]);
-  const [alchemistBanner, setAlchemistBanner] = useState<AlchemistResult | null>(null);
   const mayorSessionIdRef = useRef<string>(getOrCreateMayorSessionId());
   const reportScrollRef = useRef<HTMLDivElement | null>(null);
   const reportSectionRefs = useRef<Record<ReportSectionId, HTMLElement | null>>({
@@ -518,7 +517,6 @@ export function CityView() {
         durationMs: typeof alchemistPayload.durationMs === "number" ? alchemistPayload.durationMs : 0,
         reason: alchemistPayload.reason ?? null,
       };
-      setAlchemistBanner(liveResult);
       setAlchemistResults(prev => [liveResult, ...prev].slice(0, 12));
       refetchHealth();
     }
@@ -1067,9 +1065,6 @@ export function CityView() {
       const data = await res.json() as AlchemistResultsResponse;
       const nextResults = Array.isArray(data.results) ? data.results : [];
       setAlchemistResults(nextResults);
-      if (nextResults.length > 0) {
-        setAlchemistBanner(nextResults[0]);
-      }
     } catch {
       // Keep last known alchemist results if polling fails.
     }
@@ -1103,7 +1098,6 @@ export function CityView() {
       };
 
       setAlchemistResults(prev => [result, ...prev].slice(0, 12));
-      setAlchemistBanner(result);
       refetchHealth();
 
       toast({
@@ -1228,24 +1222,6 @@ export function CityView() {
             visibleBuildings={visibleCount}
             totalBuildings={totalCount}
           />
-
-          {alchemistBanner && (
-            <div
-              className={cn(
-                "absolute top-20 left-1/2 -translate-x-1/2 z-20 rounded-full border px-4 py-1.5 text-[10px] font-mono tracking-wide backdrop-blur",
-                alchemistBanner.status === "success"
-                  ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300"
-                  : alchemistBanner.status === "blocked"
-                    ? "border-yellow-400/50 bg-yellow-400/10 text-yellow-300"
-                    : "border-red-400/50 bg-red-400/10 text-red-300"
-              )}
-            >
-              <span className="inline-flex items-center gap-1.5">
-                <FlaskConical size={11} />
-                Alchemist {alchemistBanner.status.toUpperCase()}: {alchemistBanner.command.slice(0, 80)}
-              </span>
-            </div>
-          )}
 
           <div className="absolute top-4 left-4 z-20 flex gap-2">
             <Button
@@ -1515,18 +1491,28 @@ export function CityView() {
           <div className="flex h-[85vh] min-h-0 flex-col">
             <div className="sticky top-0 z-30 border-b border-primary/30 bg-background/95 px-3 py-3 sm:px-5">
               <div className="flex items-start justify-between gap-3">
-                <DialogHeader className="space-y-1 text-left">
-                  <DialogTitle className="text-primary">City Urgency Report</DialogTitle>
-                  <div className="text-xs text-muted-foreground">
-                    {reportData ? `Generated at ${reportData.generatedAt}` : "Report will appear once generation completes."}
-                  </div>
+                <DialogHeader className="space-y-0 text-left">
+                  <DialogTitle className="text-primary text-sm sm:text-base">
+                    City Urgency Report {reportData ? `- ${reportData.generatedAt}` : "- pending generation"}
+                  </DialogTitle>
                 </DialogHeader>
 
-                <DialogClose asChild>
-                  <Button variant="outline" size="sm" className="h-7 px-2 text-[10px] font-mono border-primary/30">
-                    Close
+                <div className="flex items-center gap-2">
+                  <Button
+                    onClick={() => { void handleCopyReport(); }}
+                    disabled={!reportData?.report}
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[10px] font-mono border-primary/30"
+                  >
+                    <Copy size={12} className="mr-1.5" /> Copy
                   </Button>
-                </DialogClose>
+                  <DialogClose asChild>
+                    <Button variant="outline" size="sm" className="h-7 px-2 text-[10px] font-mono border-primary/30">
+                      Close
+                    </Button>
+                  </DialogClose>
+                </div>
               </div>
             </div>
 
@@ -1735,17 +1721,6 @@ export function CityView() {
                     </section>
                   </div>
                 )}
-              </div>
-            </div>
-
-            <div className="sticky bottom-0 z-30 border-t border-primary/30 bg-background/95 px-3 py-3 sm:px-5">
-              <div className="flex justify-end gap-2">
-                <DialogClose asChild>
-                  <Button variant="outline" className="h-8 text-xs font-mono">Close</Button>
-                </DialogClose>
-                <Button onClick={() => { void handleCopyReport(); }} disabled={!reportData?.report} className="h-8 text-xs font-mono">
-                  <Copy size={12} className="mr-1.5" /> Copy Full Report
-                </Button>
               </div>
             </div>
           </div>

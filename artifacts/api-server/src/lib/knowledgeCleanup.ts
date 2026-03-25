@@ -3,6 +3,7 @@ import { agentsTable, eventsTable, knowledgeTable, reposTable } from "@workspace
 import { and, count, desc, eq, inArray, like, or } from "drizzle-orm";
 import type { CityLayout } from "./types";
 import { isSourceFile } from "./sourceFiles";
+import { invalidateKnowledgeSearchCache } from "./vectorSearch";
 
 const STARTUP_LANGUAGE_PURGE = ["markdown", "html", "text"] as const;
 const FIX1_MARKUP_LANGUAGES = ["markdown", "html"] as const;
@@ -26,6 +27,34 @@ type CleanupResult = {
   remaining: number;
   bugsFound: number;
 };
+
+function isSqliteCorruptionError(error: unknown): boolean {
+  const messages: string[] = [];
+
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof Error) {
+      messages.push(current.message);
+      current = (current as Error & { cause?: unknown }).cause;
+      continue;
+    }
+
+    messages.push(String(current));
+    break;
+  }
+
+  const lower = messages.join(" | ").toLowerCase();
+  return (
+    lower.includes("sqlite_corrupt")
+    || lower.includes("sqlite_corrupt_vtab")
+    || lower.includes("database disk image is malformed")
+  );
+}
+
+function logCleanupSkip(reason: string, error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(`[KBCleanup] ${reason}: ${detail.slice(0, 240)}`);
+}
 
 type EventForRecount = {
   type: string;
@@ -115,9 +144,23 @@ function buildNonSourceWhereClause() {
 
 async function deleteKnowledgeByPredicate(predicate: ReturnType<typeof buildNonSourceWhereClause>): Promise<number> {
   const before = await countKnowledgeEntries();
-  await db.delete(knowledgeTable).where(predicate);
+  try {
+    await db.delete(knowledgeTable).where(predicate);
+  } catch (error) {
+    if (isSqliteCorruptionError(error)) {
+      logCleanupSkip("Skipping non-source knowledge cleanup due SQLite corruption", error);
+      return 0;
+    }
+    throw error;
+  }
+
   const after = await countKnowledgeEntries();
-  return Math.max(0, before - after);
+  const removed = Math.max(0, before - after);
+  if (removed > 0) {
+    invalidateKnowledgeSearchCache({ resetVectorCache: true });
+  }
+
+  return removed;
 }
 
 async function recountAgentBugCountersFromSourceEvents(): Promise<number> {
@@ -167,9 +210,24 @@ export async function hasMarkdownOrHtmlKnowledgeEntries(): Promise<boolean> {
 
 export async function purgeStartupKnowledgeLanguages(): Promise<number> {
   const before = await countKnowledgeEntries();
-  await db.delete(knowledgeTable).where(inArray(knowledgeTable.language, [...STARTUP_LANGUAGE_PURGE]));
+
+  try {
+    await db.delete(knowledgeTable).where(inArray(knowledgeTable.language, [...STARTUP_LANGUAGE_PURGE]));
+  } catch (error) {
+    if (isSqliteCorruptionError(error)) {
+      logCleanupSkip("Skipping startup language purge due SQLite corruption", error);
+      return 0;
+    }
+    throw error;
+  }
+
   const after = await countKnowledgeEntries();
-  return Math.max(0, before - after);
+  const removed = Math.max(0, before - after);
+  if (removed > 0) {
+    invalidateKnowledgeSearchCache({ resetVectorCache: true });
+  }
+
+  return removed;
 }
 
 export async function cleanupNonSourceKnowledgeAndRecountBugs(): Promise<CleanupResult> {

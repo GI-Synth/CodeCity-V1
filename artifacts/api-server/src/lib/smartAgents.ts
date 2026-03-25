@@ -1,9 +1,84 @@
 import { basename, extname } from "node:path";
 
-export type AgentRoleId = "qa_inspector" | "api_fuzzer" | "load_tester" | "edge_explorer" | "ui_navigator" | "scribe";
-export type AgentPersona = "inspector" | "guardian" | "optimizer" | "architect" | "scribe" | "alchemist";
+// Legacy role IDs kept for backward compatibility with existing agents
+export type LegacyAgentRoleId = "qa_inspector" | "api_fuzzer" | "load_tester" | "edge_explorer" | "ui_navigator" | "scribe";
+
+// New specialized role IDs from the Intelligence Master Plan
+export type SpecializedAgentRoleId = "architect" | "security" | "performance" | "quality" | "documentation" | "console_log";
+
+export type AgentRoleId = LegacyAgentRoleId | SpecializedAgentRoleId;
+
+// Legacy + new personas
+export type AgentPersona = "inspector" | "guardian" | "optimizer" | "architect" | "scribe" | "alchemist"
+  | "quality" | "documentation" | "console_log";
+
 export type FindingSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
 export type FindingClassification = "discarded" | "observation" | "bug" | "test_target" | "no_finding";
+
+/** Describes a specialized agent role with its focus, capabilities, and analysis domains. */
+export interface AgentRoleDescriptor {
+  id: SpecializedAgentRoleId;
+  name: string;
+  emoji: string;
+  persona: AgentPersona;
+  focus: string;
+  domains: string[];
+}
+
+/**
+ * The 6 specialized agent roles from the CodeCity Intelligence Master Plan.
+ * Each has a distinct focus area and set of analysis domains.
+ */
+export const SPECIALIZED_ROLES: readonly AgentRoleDescriptor[] = [
+  {
+    id: "architect",
+    name: "Architect Agent",
+    emoji: "🏗",
+    persona: "architect",
+    focus: "Reads the full dependency graph, finds circular dependencies, tight coupling, god modules. Recommends structural refactors.",
+    domains: ["circular-deps", "coupling", "cohesion", "god-modules", "separation-of-concerns", "feature-envy"],
+  },
+  {
+    id: "security",
+    name: "Security Agent",
+    emoji: "🛡",
+    persona: "guardian",
+    focus: "Runs security-focused analysis on every file. Checks for hardcoded secrets, injection vectors, unsafe deserialization, auth bypasses, exposed endpoints.",
+    domains: ["injection", "xss", "auth", "secrets", "deserialization", "csrf", "ssrf", "cve-patterns"],
+  },
+  {
+    id: "performance",
+    name: "Performance Agent",
+    emoji: "⚡",
+    persona: "optimizer",
+    focus: "Identifies N+1 patterns, synchronous blocking, memory leaks, large bundle contributors, unindexed queries. Reads runtime console logs to correlate with code locations.",
+    domains: ["n-plus-1", "blocking-io", "memory-leaks", "bundle-size", "query-optimization", "render-performance"],
+  },
+  {
+    id: "quality",
+    name: "Quality Agent",
+    emoji: "✅",
+    persona: "quality",
+    focus: "Tracks test coverage gaps by file. Identifies untested high-complexity functions. Generates test skeletons. Monitors code duplication above threshold.",
+    domains: ["test-coverage", "code-duplication", "complexity", "untested-functions", "test-quality"],
+  },
+  {
+    id: "documentation",
+    name: "Documentation Agent",
+    emoji: "📝",
+    persona: "documentation",
+    focus: "Finds undocumented public APIs. Detects stale comments that no longer match code. Recommends JSDoc/TSDoc additions for complex functions.",
+    domains: ["undocumented-apis", "stale-comments", "jsdoc", "readme-freshness", "todo-detection"],
+  },
+  {
+    id: "console_log",
+    name: "Console Log Agent",
+    emoji: "📟",
+    persona: "console_log",
+    focus: "Continuously reads and parses runtime console output. Classifies logs, maps entries back to source file + line. Reports runtime errors to Mayor with full context.",
+    domains: ["error-rate", "warning-frequency", "perf-timing", "stack-trace-mapping", "log-correlation"],
+  },
+] as const;
 
 export interface PersonalKbEntry {
   pattern: string;
@@ -40,7 +115,6 @@ export interface CalibrationInput {
   personalExperienceMatch: boolean;
   sharedPatternMatch: boolean;
   accuracy: number;
-  filePreviouslyNoFinding: boolean;
   genericFinding: boolean;
 }
 
@@ -220,12 +294,21 @@ function parseRawJsonObject(raw: string): Record<string, unknown> | null {
 }
 
 export function mapRoleToPersona(role: string): AgentPersona {
+  // Legacy role → persona mapping
   if (role === "qa_inspector" || role === "inspector") return "inspector";
   if (role === "api_fuzzer" || role === "guardian") return "guardian";
   if (role === "load_tester" || role === "optimizer") return "optimizer";
   if (role === "edge_explorer" || role === "architect") return "architect";
   if (role === "scribe") return "scribe";
   if (role === "alchemist") return "alchemist";
+
+  // New specialized role → persona mapping
+  if (role === "security") return "guardian";
+  if (role === "performance") return "optimizer";
+  if (role === "quality") return "quality";
+  if (role === "documentation") return "documentation";
+  if (role === "console_log") return "console_log";
+
   return "alchemist";
 }
 
@@ -235,7 +318,20 @@ export function personaEmoji(persona: AgentPersona): string {
   if (persona === "optimizer") return "⚡";
   if (persona === "architect") return "🏗";
   if (persona === "scribe") return "📋";
+  if (persona === "quality") return "✅";
+  if (persona === "documentation") return "📝";
+  if (persona === "console_log") return "📟";
   return "🧪";
+}
+
+/** Look up a specialized role descriptor by ID. */
+export function getSpecializedRole(roleId: string): AgentRoleDescriptor | undefined {
+  return SPECIALIZED_ROLES.find(r => r.id === roleId);
+}
+
+/** Check whether a role ID is one of the new specialized roles. */
+export function isSpecializedRole(roleId: string): roleId is SpecializedAgentRoleId {
+  return SPECIALIZED_ROLES.some(r => r.id === roleId);
 }
 
 export function extractFileType(filePath: string): string {
@@ -540,6 +636,84 @@ export function buildRolePrompt(params: {
         "  couplingImports: string[]",
         "}",
         "If no real bug found: { finding: null }",
+      ].join("\n"),
+      expects: "bug",
+    };
+  }
+
+  if (params.persona === "quality") {
+    return {
+      system: "You are a code quality specialist focused on test coverage and duplication. Return JSON only.",
+      prompt: [
+        `You are a code quality analyst reviewing ${params.language} code.`,
+        "Look ONLY for: untested high-complexity functions, test coverage gaps,",
+        "code duplication above threshold, missing assertions in tests,",
+        "functions that lack any test coverage despite high cyclomatic complexity.",
+        `File: ${params.filePath}`,
+        `Code: ${snippet}`,
+        contextLine,
+        "",
+        "Respond in JSON:",
+        "{",
+        "  finding: string (specific, under 50 words),",
+        "  lineReference: string (e.g. 'around line 47'),",
+        "  severity: 'CRITICAL'|'HIGH'|'MEDIUM'|'LOW',",
+        "  confidence: number (0-1),",
+        "  functionName: string (which function has the issue)",
+        "}",
+        "If no real issue found: { finding: null }",
+      ].join("\n"),
+      expects: "bug",
+    };
+  }
+
+  if (params.persona === "documentation") {
+    return {
+      system: "You are a documentation quality specialist. Return JSON only.",
+      prompt: [
+        `You are a documentation analyst reviewing ${params.language} code.`,
+        "Look ONLY for: undocumented public APIs, exported functions missing JSDoc/TSDoc,",
+        "stale comments that no longer match the code, complex functions without inline explanation,",
+        "TODO/FIXME/HACK comments older than 30 days.",
+        `File: ${params.filePath}`,
+        `Code: ${snippet}`,
+        contextLine,
+        "",
+        "Respond in JSON:",
+        "{",
+        "  finding: string (specific, under 50 words),",
+        "  lineReference: string (e.g. 'around line 47'),",
+        "  severity: 'CRITICAL'|'HIGH'|'MEDIUM'|'LOW',",
+        "  confidence: number (0-1),",
+        "  functionName: string (which function has the issue)",
+        "}",
+        "If no real issue found: { finding: null }",
+      ].join("\n"),
+      expects: "bug",
+    };
+  }
+
+  if (params.persona === "console_log") {
+    return {
+      system: "You are a runtime log analyst. Return JSON only.",
+      prompt: [
+        `You are a runtime log analyst reviewing ${params.language} code alongside recent console output.`,
+        "Look ONLY for: code paths that produce repeated runtime errors,",
+        "unhandled exceptions not caught by error boundaries, console.error calls with no recovery,",
+        "performance timing anomalies, warning patterns that indicate degrading behavior.",
+        `File: ${params.filePath}`,
+        `Code: ${snippet}`,
+        contextLine,
+        "",
+        "Respond in JSON:",
+        "{",
+        "  finding: string (specific, under 50 words),",
+        "  lineReference: string (e.g. 'around line 47'),",
+        "  severity: 'CRITICAL'|'HIGH'|'MEDIUM'|'LOW',",
+        "  confidence: number (0-1),",
+        "  functionName: string (which function has the issue)",
+        "}",
+        "If no real issue found: { finding: null }",
       ].join("\n"),
       expects: "bug",
     };

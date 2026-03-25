@@ -48,6 +48,7 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
   const [kbSessionStats, setKbSessionStats] = useState<KbSessionStats | null>(null);
   const [alchemistSummary, setAlchemistSummary] = useState<AlchemistSummary | null>(null);
   const [mayorFlash, setMayorFlash] = useState(false);
+  const [providerStatus, setProviderStatus] = useState<Record<string, { ok: boolean; name: string }>>({});
 
   useEffect(() => {
     let mounted = true;
@@ -150,6 +151,26 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
     };
   }, []);
 
+  useEffect(() => {
+    let mounted = true;
+    const fetchProviders = async () => {
+      try {
+        const res = await fetch("/api/providers/status", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json() as Record<string, { configured: boolean; rateLimited: boolean; consecutiveErrors: number }>;
+        if (!mounted) return;
+        const mapped: Record<string, { ok: boolean; name: string }> = {};
+        for (const [name, info] of Object.entries(data)) {
+          mapped[name] = { name, ok: info.configured && !info.rateLimited && info.consecutiveErrors < 3 };
+        }
+        setProviderStatus(mapped);
+      } catch { /* ignore */ }
+    };
+    fetchProviders().catch(() => {});
+    const t = setInterval(() => fetchProviders().catch(() => {}), 30000);
+    return () => { mounted = false; clearInterval(t); };
+  }, []);
+
   if (!health || !metrics) return null;
 
   const mayorReasoning = truncateText(orchestratorStatus?.lastDirective?.reasoning ?? "Mayor thinking...");
@@ -237,6 +258,15 @@ export function HUD({ health, metrics, wsConnected, ollamaAvailable }: HUDProps)
           {ollamaAvailable !== undefined && (
             <div className={cn("w-2 h-2 rounded-full", ollamaAvailable ? "bg-success animate-pulse" : "bg-muted-foreground")}
               title={ollamaAvailable ? "Ollama AI available" : "Ollama not available"} />
+          )}
+          {Object.values(providerStatus).length > 0 && (
+            <div className="flex items-center gap-1 pl-1 border-l border-border/40" title="AI Provider Status">
+              {Object.values(providerStatus).map(p => (
+                <div key={p.name}
+                  className={cn("w-2 h-2 rounded-full", p.ok ? "bg-cyan-400 animate-pulse" : "bg-destructive/60")}
+                  title={`${p.name}: ${p.ok ? "OK" : "unavailable"}`} />
+              ))}
+            </div>
           )}
         </div>
       </div>

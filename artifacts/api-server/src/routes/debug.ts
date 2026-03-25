@@ -2,6 +2,7 @@ import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { findingsTable } from "@workspace/db/schema";
 import { desc } from "drizzle-orm";
+import { getRecentFindingPipelineAttempts } from "../lib/findingQuality";
 
 const router: IRouter = Router();
 
@@ -51,6 +52,12 @@ function fallbackReason(classification: string): string {
 // Debug-only endpoint for trust-gate inspection. Remove in production.
 router.get("/findings-pipeline", async (_req, res): Promise<void> => {
   try {
+    const liveAttempts = getRecentFindingPipelineAttempts(10);
+    if (liveAttempts.length > 0) {
+      res.json({ attempts: liveAttempts, count: liveAttempts.length });
+      return;
+    }
+
     const rows = await db
       .select({
         filePath: findingsTable.filePath,

@@ -5,6 +5,7 @@ import { wsServer } from "./wsServer";
 import type { CityLayout, Building } from "./types";
 import { eq } from "drizzle-orm";
 import { analyzeBuildingForAgent, type SmartAnalysisResult } from "./smartAgentWorkflow";
+import { computeRank } from "./agentRanking";
 import {
   getTopLanguageFromPersonalKb,
   mapRoleToPersona,
@@ -16,13 +17,6 @@ import {
   recordDiscardedFindingEvent,
   recordObservationEvent,
 } from "./findingQuality";
-
-function computeRank(totalTasks: number, accuracy: number, truePositives: number): string {
-  if (accuracy >= 0.90 && totalTasks >= 100 && truePositives >= 10) return "principal";
-  if (accuracy >= 0.80 && totalTasks >= 50) return "senior";
-  if (accuracy >= 0.60 && totalTasks >= 20) return "mid";
-  return "junior";
-}
 
 function emitThought(agentId: string, thought: string, duration = 3000): void {
   wsServer.broadcastThought(agentId, thought, duration);

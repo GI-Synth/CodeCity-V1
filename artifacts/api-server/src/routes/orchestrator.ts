@@ -30,9 +30,16 @@ import { fileURLToPath } from "node:url";
 import { fileWatcher } from "../lib/fileWatcher";
 import { computeHealthScore } from "../lib/healthScorer";
 import { cleanupNonSourceKnowledgeAndRecountBugs } from "../lib/knowledgeCleanup";
+import {
+  applyVerdictToPersonalKb,
+  reinforceSharedKnowledgeFromVerdict,
+} from "../lib/learningReinforcement";
+import { recordReinforcementEvent } from "../lib/reinforcementTelemetry";
+import { ollamaClient } from "../lib/ollamaClient";
 import { orchestrator } from "../lib/orchestrator";
 import { resolveGithubTokenFromEnvOrDb } from "../lib/githubTokenStore";
 import { getKbSessionStats, resetKbSessionStats } from "../lib/sessionStats";
+import { invalidateKnowledgeSearchCache } from "../lib/vectorSearch";
 import { wsServer } from "../lib/wsServer";
 import type { Building, CityLayout } from "../lib/types";
 
@@ -70,6 +77,15 @@ const MAYOR_INSIGHT_MAX_HISTORY = 24;
 const SNIPPET_CACHE_TTL_MS = 60_000;
 const TEST_PROPOSAL_TTL_MS = 45 * 60 * 1000;
 const MAX_PENDING_TEST_PROPOSALS = 120;
+const MAYOR_OLLAMA_MODEL_HINT = (process.env["MAYOR_OLLAMA_MODEL"] ?? "").trim();
+const MAYOR_OLLAMA_FALLBACK_MODELS = [
+  MAYOR_OLLAMA_MODEL_HINT,
+  "qwen2.5:0.5b",
+  "qwen2.5:1.5b",
+  "tinyllama:1.1b",
+  "smollm2:360m",
+  "smollm2:135m",
+].filter((value): value is string => value.trim().length > 0);
 
 const MAYOR_TECHNICAL_TERMS = [
   ".ts",
@@ -144,14 +160,20 @@ type TestProposal = {
   generatedByRole: "scribe";
 };
 
+type ParsedReviewVerdictValue = "true_positive" | "false_positive" | "needs_review";
+
 type ParsedVerdict = {
-  findingNumber: number;
-  verdict: "REAL BUG" | "FALSE POSITIVE";
+  findingNumber: number | null;
+  fileHint: string | null;
+  verdict: ParsedReviewVerdictValue;
 };
 
 type ParsedAgentAdjustment = {
   agentName: string;
   adjustment: string;
+  confidenceRole: string | null;
+  confidenceDelta: number;
+  avoidPattern: string | null;
 };
 
 interface CitySnapshot {
@@ -208,6 +230,13 @@ type TestRecommendation = {
 type MayorConversationEntry = {
   role: "user" | "assistant";
   content: string;
+};
+
+type MayorAiResponse = {
+  content: string;
+  provider: "groq" | "ollama";
+  model: string;
+  fallbackReason?: string;
 };
 
 type MayorMemorySummary = {
@@ -1300,25 +1329,78 @@ function findSectionBody(sections: Array<{ title: string; body: string }>, keywo
   return partial?.body ?? "";
 }
 
-function parseVerdictsFromText(text: string): ParsedVerdict[] {
-  const verdicts = new Map<number, ParsedVerdict>();
-  const regex = /FINDING\s*#?\s*(\d+)[^\n]*?\b(REAL(?:\s+BUG)?|FALSE\s*POSITIVE|FALSE[-_ ]POSITIVE|FP)\b/gi;
+function parseVerdictKeyword(line: string): ParsedReviewVerdictValue | null {
+  const upper = line.toUpperCase();
+  if (/\bINVESTIGATE\b/.test(upper)) return "needs_review";
+  if (/\bFALSE\s*POSITIVE\b|\bFALSE[-_ ]POSITIVE\b|\bFALSE\b/.test(upper)) return "false_positive";
+  if (/\bREAL\b|\bCRITICAL\b|\bTRUE\b/.test(upper)) return "true_positive";
+  return null;
+}
 
-  let match = regex.exec(text);
-  while (match) {
-    const findingNumber = Number(match[1]);
-    const verdictRaw = (match[2] ?? "").toUpperCase().replace(/[-_]/g, " ");
-    const verdict: "REAL BUG" | "FALSE POSITIVE" = verdictRaw.includes("REAL")
-      ? "REAL BUG"
-      : "FALSE POSITIVE";
+function extractVerdictFileHint(line: string): string | null {
+  const delimiterMatch = line.match(/(?:->|=>|→|:)/);
+  const beforeDelimiter = delimiterMatch?.index !== undefined
+    ? line.slice(0, delimiterMatch.index)
+    : line;
 
-    if (Number.isFinite(findingNumber) && findingNumber > 0) {
-      verdicts.set(findingNumber, { findingNumber, verdict });
-    }
-    match = regex.exec(text);
+  const cleaned = beforeDelimiter
+    .replace(/^(?:[-*]\s*|\d+[.)]\s*)/, "")
+    .trim();
+
+  const extensionMatch = cleaned.match(/([A-Za-z0-9_./\\-]+\.(?:ts|js|py|go))(?![A-Za-z0-9])/i)
+    ?? line.match(/([A-Za-z0-9_./\\-]+\.(?:ts|js|py|go))(?![A-Za-z0-9])/i);
+
+  if (extensionMatch?.[1]) {
+    return normalizePathForLookup(extensionMatch[1]);
   }
 
-  return Array.from(verdicts.values()).sort((a, b) => a.findingNumber - b.findingNumber);
+  const pathOnlyMatch = cleaned.match(/([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)/);
+  if (pathOnlyMatch?.[1]) {
+    return normalizePathForLookup(pathOnlyMatch[1]);
+  }
+
+  return null;
+}
+
+function parseVerdictsFromText(text: string): ParsedVerdict[] {
+  const verdicts = new Map<string, ParsedVerdict>();
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+
+    const verdict = parseVerdictKeyword(trimmed);
+    if (!verdict) continue;
+
+    const findingMatch = trimmed.match(/FINDING\s*#?\s*(\d+)/i);
+    const parsedFindingNumber = findingMatch ? Number(findingMatch[1]) : NaN;
+    const findingNumber = Number.isFinite(parsedFindingNumber) && parsedFindingNumber > 0
+      ? parsedFindingNumber
+      : null;
+
+    const fileHint = extractVerdictFileHint(trimmed);
+    if (!findingNumber && !fileHint) continue;
+
+    const key = findingNumber
+      ? `finding:${findingNumber}`
+      : `file:${(fileHint ?? "").toLowerCase()}`;
+
+    verdicts.set(key, {
+      findingNumber,
+      fileHint,
+      verdict,
+    });
+  }
+
+  return Array.from(verdicts.values()).sort((a, b) => {
+    const left = a.findingNumber ?? Number.MAX_SAFE_INTEGER;
+    const right = b.findingNumber ?? Number.MAX_SAFE_INTEGER;
+    if (left !== right) return left - right;
+
+    const leftPath = (a.fileHint ?? "").toLowerCase();
+    const rightPath = (b.fileHint ?? "").toLowerCase();
+    return leftPath.localeCompare(rightPath);
+  });
 }
 
 function parseAgentAdjustments(sectionText: string): ParsedAgentAdjustment[] {
@@ -1331,16 +1413,47 @@ function parseAgentAdjustments(sectionText: string): ParsedAgentAdjustment[] {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    const match = trimmed.match(/(?:[-*]\s*)?([A-Za-z][A-Za-z0-9 _-]{1,48})\s*[:\-]\s*(.+)$/);
-    if (!match) continue;
+    const cleaned = trimmed.replace(/^(?:[-*]\s*|\d+[.)]\s*)/, "").trim();
+    if (!cleaned) continue;
+
+    const namedPrefix = cleaned.match(/^([A-Za-z][A-Za-z0-9 _-]{1,48})\s*[:\-]\s*(.+)$/);
+    const instruction = (namedPrefix?.[2] ?? cleaned).trim();
+
+    const increaseMatch = instruction.match(/\bincrease\s+([A-Za-z][A-Za-z0-9 _-]{1,48})\s+confidence\b/i);
+    const decreaseMatch = instruction.match(/\bdecrease\s+([A-Za-z][A-Za-z0-9 _-]{1,48})\s+confidence\b/i);
+    const neverMatch = instruction.match(/\bshould\s+NEVER\s+(.+)$/i);
+
+    const confidenceRole = increaseMatch?.[1]?.trim() ?? decreaseMatch?.[1]?.trim() ?? null;
+    const confidenceDelta = increaseMatch ? 1 : decreaseMatch ? -1 : 0;
+    const avoidPattern = neverMatch?.[1] ? compactText(neverMatch[1].trim(), 180) : null;
+
+    const legacyMatch = cleaned.match(/(?:[-*]\s*)?([A-Za-z][A-Za-z0-9 _-]{1,48})\s*[:\-]\s*(.+)$/);
+    if (!legacyMatch && confidenceDelta === 0 && !avoidPattern) continue;
+
+    const agentName = namedPrefix?.[1]?.trim() ?? confidenceRole ?? legacyMatch?.[1]?.trim() ?? "General";
+    const adjustmentText = namedPrefix?.[2] ?? legacyMatch?.[2] ?? instruction;
 
     adjustments.push({
-      agentName: match[1].trim(),
-      adjustment: compactText(match[2], 180),
+      agentName,
+      adjustment: compactText(adjustmentText, 180),
+      confidenceRole,
+      confidenceDelta,
+      avoidPattern,
     });
   }
 
   return adjustments;
+}
+
+function normalizeRoleForMatching(role: string): string {
+  return role.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function roleMatches(agentRole: string, targetRole: string): boolean {
+  const normalizedAgent = normalizeRoleForMatching(agentRole);
+  const normalizedTarget = normalizeRoleForMatching(targetRole);
+  if (!normalizedAgent || !normalizedTarget) return false;
+  return normalizedAgent === normalizedTarget || normalizedAgent.includes(normalizedTarget) || normalizedTarget.includes(normalizedAgent);
 }
 
 function summarizeImplementedFixes(sectionText: string): string {
@@ -2662,6 +2775,115 @@ async function callGroqMayor(params: {
   return content;
 }
 
+function mayorModelMatches(candidate: string, preferred: string): boolean {
+  const normalizedCandidate = candidate.toLowerCase();
+  const normalizedPreferred = preferred.toLowerCase();
+  if (normalizedCandidate === normalizedPreferred) return true;
+
+  const preferredBase = normalizedPreferred.split(":")[0];
+  return (
+    normalizedCandidate.startsWith(`${normalizedPreferred}:`)
+    || normalizedCandidate.startsWith(`${preferredBase}:`)
+    || normalizedCandidate.startsWith(`${preferredBase}-`)
+  );
+}
+
+function pickMayorOllamaModel(models: string[]): string | null {
+  if (models.length === 0) return null;
+
+  for (const preferred of MAYOR_OLLAMA_FALLBACK_MODELS) {
+    const match = models.find((model) => mayorModelMatches(model, preferred));
+    if (match) return match;
+  }
+
+  const qwenMini = models.find((model) => model.toLowerCase().includes("qwen2.5:0.5b"));
+  if (qwenMini) return qwenMini;
+
+  return models[0] ?? null;
+}
+
+function buildMayorOllamaPrompt(history: MayorConversationEntry[], userMessage: string): string {
+  const historyText = history.length > 0
+    ? history.map((entry) => `${entry.role === "assistant" ? "Mayor" : "User"}: ${entry.content}`).join("\n")
+    : "none";
+
+  return [
+    "Conversation history:",
+    historyText,
+    "",
+    "Latest user message:",
+    userMessage,
+    "",
+    "Respond directly to the latest user message.",
+  ].join("\n");
+}
+
+async function callOllamaMayor(params: {
+  systemPrompt: string;
+  conversationHistory: MayorConversationEntry[];
+  userMessage: string;
+}): Promise<{ content: string; model: string }> {
+  const connection = await ollamaClient.testConnection();
+  if (!connection.reachable) throw new Error("ollama_unreachable");
+
+  const model = pickMayorOllamaModel(connection.models);
+  if (!model) throw new Error("ollama_no_models");
+
+  const prompt = buildMayorOllamaPrompt(params.conversationHistory, params.userMessage);
+  const content = await ollamaClient.generate({
+    model,
+    system: params.systemPrompt,
+    prompt,
+    temperature: 0.2,
+    maxTokens: 400,
+  });
+
+  if (!content.trim()) throw new Error("ollama_empty_reply");
+  return { content, model };
+}
+
+async function callMayorWithFallback(params: {
+  groqModel: string;
+  systemPrompt: string;
+  conversationHistory: MayorConversationEntry[];
+  userMessage: string;
+}): Promise<MayorAiResponse> {
+  try {
+    const content = await callGroqMayor({
+      model: params.groqModel,
+      systemPrompt: params.systemPrompt,
+      conversationHistory: params.conversationHistory,
+      userMessage: params.userMessage,
+    });
+
+    return {
+      content,
+      provider: "groq",
+      model: params.groqModel,
+    };
+  } catch (groqError) {
+    const fallbackReason = groqError instanceof Error ? groqError.message : String(groqError);
+
+    try {
+      const local = await callOllamaMayor({
+        systemPrompt: params.systemPrompt,
+        conversationHistory: params.conversationHistory,
+        userMessage: params.userMessage,
+      });
+
+      return {
+        content: local.content,
+        provider: "ollama",
+        model: local.model,
+        fallbackReason,
+      };
+    } catch (ollamaError) {
+      const ollamaDetail = ollamaError instanceof Error ? ollamaError.message : String(ollamaError);
+      throw new Error(`groq_failed(${fallbackReason}); ollama_failed(${ollamaDetail})`);
+    }
+  }
+}
+
 function toMaxSentences(text: string, maxSentences: number): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
@@ -2695,7 +2917,6 @@ function rememberMayorInsight(insight: string): void {
 
 async function generateMayorInsight(): Promise<void> {
   if (mayorInsightInFlight) return;
-  if (!process.env["GROQ_API_KEY"]) return;
 
   mayorInsightInFlight = true;
   try {
@@ -2751,12 +2972,18 @@ async function generateMayorInsight(): Promise<void> {
       "Return only the insight sentence(s).",
     ].join("\n");
 
-    const rawInsight = await callGroqMayor({
-      model: settings.groqModel,
+    const aiResult = await callMayorWithFallback({
+      groqModel: settings.groqModel,
       systemPrompt,
       conversationHistory: [],
       userMessage: userPrompt,
     });
+
+    if (aiResult.provider === "ollama" && aiResult.fallbackReason) {
+      console.warn(`[MayorInsight] Groq fallback -> Ollama (${aiResult.model}): ${aiResult.fallbackReason}`);
+    }
+
+    const rawInsight = aiResult.content;
 
     const insight = toMaxSentences(rawInsight, 2);
     const normalizedKey = normalizeMayorInsightKey(insight);
@@ -3102,13 +3329,7 @@ router.post("/chat", async (req, res): Promise<void> => {
           : await fetchGithubFileContent(repoContext.repoUrl, repoContext.branch, referencedFileContext.normalizedFilePath);
         const fileContent = localFileContent ?? remoteFileContent;
 
-        if (!process.env["GROQ_API_KEY"]) {
-          reply = buildMayorFileAdviceFallbackReply(referencedFileContext);
-          provider = "rule-based";
-          model = "file-telemetry-fallback";
-          source = "rule-based";
-          cost = 0;
-        } else if (!fileContent) {
+        if (!fileContent) {
           reply = buildMayorFileAdviceFallbackReply(referencedFileContext, { sourceBodyUnavailable: true });
           provider = "rule-based";
           model = "file-content-unavailable";
@@ -3126,17 +3347,21 @@ router.post("/chat", async (req, res): Promise<void> => {
             trimFileContentForPrompt(fileContent),
           ].join("\n\n");
 
-          const aiReply = await callGroqMayor({
-            model: settings.groqModel,
+          const aiResult = await callMayorWithFallback({
+            groqModel: settings.groqModel,
             systemPrompt,
             conversationHistory,
             userMessage: fileAwareQuestion,
           });
-          reply = `${buildMayorFileTelemetryLead(referencedFileContext)} ${toMaxSentences(aiReply, 2)}`.trim();
-          provider = "groq";
-          model = settings.groqModel;
+          reply = `${buildMayorFileTelemetryLead(referencedFileContext)} ${toMaxSentences(aiResult.content, 2)}`.trim();
+          provider = aiResult.provider;
+          model = aiResult.model;
           source = "ai";
-          cost = 1;
+          cost = aiResult.provider === "groq" ? 1 : 0;
+
+          if (aiResult.provider === "ollama" && aiResult.fallbackReason) {
+            console.warn(`[MayorChat] file-aware Groq fallback -> Ollama (${aiResult.model}): ${aiResult.fallbackReason}`);
+          }
         }
       } catch (error) {
         const detail = error instanceof Error ? error.message : "unknown";
@@ -3202,17 +3427,21 @@ router.post("/chat", async (req, res): Promise<void> => {
 
     if (!reply && !dbStatsReply && !specificReply) {
       try {
-        if (!process.env["GROQ_API_KEY"]) throw new Error("missing_groq_key");
-        reply = await callGroqMayor({
-          model: settings.groqModel,
+        const aiResult = await callMayorWithFallback({
+          groqModel: settings.groqModel,
           systemPrompt,
           conversationHistory,
           userMessage: message,
         });
-        provider = "groq";
-        model = settings.groqModel;
+        reply = aiResult.content;
+        provider = aiResult.provider;
+        model = aiResult.model;
         source = "ai";
-        cost = 1;
+        cost = aiResult.provider === "groq" ? 1 : 0;
+
+        if (aiResult.provider === "ollama" && aiResult.fallbackReason) {
+          console.warn(`[MayorChat] Groq fallback -> Ollama (${aiResult.model}): ${aiResult.fallbackReason}`);
+        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : "unknown";
         console.warn(`[MayorChat] fallback reason=${detail}`);
@@ -3568,6 +3797,10 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
   const verdictRaw = typeof req.body?.verdict === "string" ? req.body.verdict.trim().toLowerCase() : "";
   const sourceFilePathRaw = typeof req.body?.sourceFilePath === "string" ? req.body.sourceFilePath.trim() : "";
   const testFilePath = typeof req.body?.testFilePath === "string" ? req.body.testFilePath.trim() : "";
+  const findingTextHint = typeof req.body?.findingText === "string" ? req.body.findingText.trim() : "";
+  const issueTypeHint = typeof req.body?.issueType === "string" ? req.body.issueType.trim() : "";
+  const confidenceRaw = typeof req.body?.confidence === "number" ? req.body.confidence : Number(req.body?.confidence);
+  const confidenceHint = Number.isFinite(confidenceRaw) ? Math.max(0, Math.min(1, confidenceRaw)) : null;
   const buildingId = typeof req.body?.buildingId === "string" ? req.body.buildingId.trim() : null;
   const priorityRaw = typeof req.body?.priority === "string" ? req.body.priority.trim().toLowerCase() : "medium";
   const testTypeRaw = typeof req.body?.testType === "string" ? req.body.testType.trim().toLowerCase() : "unit";
@@ -3633,6 +3866,8 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
       qualityScore: verdict === "approved" ? 0.9 : 0.35,
     });
 
+    invalidateKnowledgeSearchCache();
+
     const allAgents = await db.select().from(agentsTable);
     const normalizedSource = normalizePathForLookup(sourceFilePath).toLowerCase();
     const linkedFinding = latestReportFindings.find(item => normalizePathForLookup(item.filePath).toLowerCase() === normalizedSource);
@@ -3652,6 +3887,55 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
     }
 
     let accuracyUpdate: { agentId: string; agentName: string; before: number; after: number } | null = null;
+    let nextPersonalKb: string | null = targetAgent?.personalKB ?? null;
+    let personalKbAction: "boosted" | "degraded" | "none" = "none";
+    let phase2Reinforcement: {
+      issuePattern: string;
+      updatedEntries: number;
+      insertedEntry: boolean;
+      cooldownSkipped: boolean;
+      applied: boolean;
+      qualityDelta: number;
+    } | null = null;
+
+    const linkedFindingId = linkedFinding ? `report-${linkedFinding.findingNumber}` : null;
+    const reinforcementFindingText = linkedFinding?.findingText || findingTextHint || null;
+    const reinforcementIssueType = linkedFinding?.issueType || issueTypeHint || null;
+    const reinforcementConfidence = linkedFinding
+      ? Math.max(0, Math.min(1, linkedFinding.confidencePercent / 100))
+      : confidenceHint;
+    const reinforcementVerdict = verdict === "approved" ? "true_positive" : "false_positive";
+
+    if (targetAgent && reinforcementFindingText) {
+      const personalKbResult = applyVerdictToPersonalKb({
+        rawPersonalKb: targetAgent.personalKB,
+        role: targetAgent.role,
+        filePath: sourceFilePath,
+        findingText: reinforcementFindingText,
+        functionName: null,
+        fileType,
+        language,
+        confidence: reinforcementConfidence,
+        verdict: reinforcementVerdict,
+      });
+      nextPersonalKb = personalKbResult.nextPersonalKb;
+      personalKbAction = personalKbResult.action;
+
+      try {
+        phase2Reinforcement = await reinforceSharedKnowledgeFromVerdict({
+          verdict: reinforcementVerdict,
+          filePath: sourceFilePath,
+          findingText: reinforcementFindingText,
+          issueType: reinforcementIssueType,
+          language,
+          confidence: reinforcementConfidence,
+          source: "recommendation-feedback",
+        });
+      } catch (reinforcementError) {
+        const detail = reinforcementError instanceof Error ? reinforcementError.message : String(reinforcementError);
+        console.warn(`[Phase2] recommendation-feedback reinforcement skipped: ${detail}`);
+      }
+    }
 
     if (targetAgent) {
       const nextTruePositives = targetAgent.truePositives + (verdict === "approved" ? 1 : 0);
@@ -3659,11 +3943,22 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
       const reviewedTotal = nextTruePositives + nextFalsePositives;
       const nextAccuracy = reviewedTotal > 0 ? nextTruePositives / reviewedTotal : targetAgent.accuracy;
 
-      await db.update(agentsTable).set({
+      const updateSet: {
+        truePositives: number;
+        falsePositives: number;
+        accuracy: number;
+        personalKB?: string;
+      } = {
         truePositives: nextTruePositives,
         falsePositives: nextFalsePositives,
         accuracy: nextAccuracy,
-      }).where(eq(agentsTable.id, targetAgent.id));
+      };
+
+      if (typeof nextPersonalKb === "string") {
+        updateSet.personalKB = nextPersonalKb;
+      }
+
+      await db.update(agentsTable).set(updateSet).where(eq(agentsTable.id, targetAgent.id));
 
       accuracyUpdate = {
         agentId: targetAgent.id,
@@ -3688,6 +3983,30 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
       severity: verdict === "approved" ? "info" : "warning",
     }).catch(() => {});
 
+    await recordReinforcementEvent({
+      eventType: reinforcementVerdict === "true_positive" ? "phase2_reinforcement_boost" : "phase2_reinforcement_decay",
+      source: "recommendation-feedback",
+      verdict: reinforcementVerdict,
+      verdictOrigin: linkedFinding ? "report-linked-feedback" : "manual-feedback",
+      issuePattern: phase2Reinforcement?.issuePattern ?? normalizeIssuePattern(reinforcementIssueType ?? "general"),
+      filePath: sourceFilePath,
+      agentId: targetAgent?.id ?? null,
+      agentName: targetAgent?.name ?? null,
+      agentRole: targetAgent?.role ?? null,
+      findingId: linkedFindingId,
+      linkedContext: linkedFinding ? `finding#${linkedFinding.findingNumber}` : testFilePath,
+      personalKbAction,
+      personalKbChanged: personalKbAction !== "none",
+      sharedKnowledgeUpdated: phase2Reinforcement?.updatedEntries ?? 0,
+      sharedKnowledgeSeeded: phase2Reinforcement?.insertedEntry ?? false,
+      qualityDelta: phase2Reinforcement?.qualityDelta ?? 0,
+      confidenceDelta: personalKbAction === "boosted" ? 0.08 : personalKbAction === "degraded" ? -0.08 : 0,
+      attempted: true,
+      applied: (personalKbAction !== "none") || Boolean(phase2Reinforcement?.applied),
+      cooldownSkipped: phase2Reinforcement?.cooldownSkipped ?? false,
+      evidenceScore: reinforcementConfidence ?? 0,
+    });
+
     wsServer.broadcastEventLog("MAYOR_REVIEW", verdictMessage, verdict === "approved" ? "info" : "warning");
 
     res.json({
@@ -3696,6 +4015,8 @@ router.post("/recommendation-feedback", async (req, res): Promise<void> => {
       sourceFilePath,
       testFilePath,
       agentUpdate: accuracyUpdate,
+      phase2Reinforcement,
+      phase2PersonalKbAction: personalKbAction,
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Unknown error";
@@ -3721,16 +4042,66 @@ router.post("/import-review", async (req, res): Promise<void> => {
     const implementedFixSummary = summarizeImplementedFixes(implementedFixesSection);
 
     const findingsByNumber = new Map(latestReportFindings.map(finding => [finding.findingNumber, finding]));
+    const findingsByPath = new Map<string, StoredReportFinding>();
+    const findingsByBasename = new Map<string, StoredReportFinding[]>();
+
+    for (const finding of latestReportFindings) {
+      const normalizedPath = normalizePathForLookup(finding.filePath).toLowerCase();
+      if (!findingsByPath.has(normalizedPath)) {
+        findingsByPath.set(normalizedPath, finding);
+      }
+
+      const fileName = basename(normalizedPath);
+      const existing = findingsByBasename.get(fileName) ?? [];
+      existing.push(finding);
+      findingsByBasename.set(fileName, existing);
+    }
 
     const agents = await db.select().from(agentsTable);
     const agentsById = new Map(agents.map(agent => [agent.id, agent]));
     const agentsByName = new Map(agents.map(agent => [agent.name.toLowerCase(), agent]));
 
     const perAgentDelta = new Map<string, { agent: typeof agentsTable.$inferSelect; tp: number; fp: number }>();
+    const roleConfidenceDeltaByAgent = new Map<string, number>();
+    const nextPersonalKbByAgentId = new Map<string, string>(agents.map(agent => [agent.id, agent.personalKB]));
+    const personalKbUpdatedAgentIds = new Set<string>();
     const updatedAgentNames = new Set<string>();
     const confirmedPatternCounts = new Map<string, number>();
+    let phase2ReinforcementCount = 0;
 
     const learningNotes = learningAdjustments.map(item => `${item.agentName}: ${item.adjustment}`).join(" | ");
+
+    const resolveFindingFromVerdict = (parsedVerdict: ParsedVerdict): StoredReportFinding | null => {
+      if (parsedVerdict.findingNumber) {
+        return findingsByNumber.get(parsedVerdict.findingNumber) ?? null;
+      }
+
+      if (!parsedVerdict.fileHint) return null;
+
+      const normalizedHint = normalizePathForLookup(parsedVerdict.fileHint).toLowerCase();
+      const directMatch = findingsByPath.get(normalizedHint);
+      if (directMatch) return directMatch;
+
+      for (const [pathKey, finding] of findingsByPath.entries()) {
+        if (pathKey.endsWith(`/${normalizedHint}`)) return finding;
+      }
+
+      const fileName = basename(normalizedHint);
+      const candidates = findingsByBasename.get(fileName) ?? [];
+      if (candidates.length === 0) return null;
+      if (candidates.length === 1) return candidates[0] ?? null;
+
+      const hintParts = normalizedHint.split("/").filter(Boolean);
+      const ranked = candidates
+        .map(candidate => {
+          const candidatePath = normalizePathForLookup(candidate.filePath).toLowerCase();
+          const score = hintParts.reduce((total, part) => total + (candidatePath.includes(part) ? 1 : 0), 0);
+          return { candidate, score };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      return ranked[0]?.candidate ?? candidates[0] ?? null;
+    };
 
     let verdictsProcessed = 0;
     let kbEntriesAdded = 0;
@@ -3738,10 +4109,27 @@ router.post("/import-review", async (req, res): Promise<void> => {
     let falsePositiveCount = 0;
 
     for (const verdict of verdicts) {
-      const finding = findingsByNumber.get(verdict.findingNumber);
+      verdictsProcessed += 1;
+
+      const finding = resolveFindingFromVerdict(verdict);
       if (!finding) continue;
 
-      verdictsProcessed += 1;
+      await db.insert(eventsTable).values({
+        id: `evt-import-verdict-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        type: "import_review_verdict",
+        buildingId: null,
+        buildingName: basename(finding.filePath),
+        agentId: finding.agentId,
+        agentName: finding.agentName,
+        message: `Import review verdict ${verdict.verdict} for finding #${finding.findingNumber}`,
+        severity: verdict.verdict === "true_positive" ? "info" : verdict.verdict === "false_positive" ? "warning" : "info",
+        filePath: finding.filePath,
+        issueType: finding.issueType,
+        confidence: finding.confidencePercent / 100,
+        codeReference: finding.codeReference,
+        findingSeverity: finding.severityClass,
+        findingText: finding.findingText,
+      }).catch(() => {});
 
       const linkedAgent = finding.agentId
         ? agentsById.get(finding.agentId)
@@ -3749,18 +4137,102 @@ router.post("/import-review", async (req, res): Promise<void> => {
 
       if (linkedAgent) {
         const current = perAgentDelta.get(linkedAgent.id) ?? { agent: linkedAgent, tp: 0, fp: 0 };
-        if (verdict.verdict === "REAL BUG") current.tp += 1;
-        else current.fp += 1;
+        if (verdict.verdict === "true_positive") current.tp += 1;
+        else if (verdict.verdict === "false_positive") current.fp += 1;
         perAgentDelta.set(linkedAgent.id, current);
         updatedAgentNames.add(linkedAgent.name);
       }
+
+      if (verdict.verdict === "needs_review") continue;
 
       const issuePattern = normalizeIssuePattern(finding.issueType);
       const language = detectSourceLanguage(finding.filePath);
       const fileType = extname(finding.filePath).replace(".", "") || "source";
       const snippet = finding.codeContext === "Code snippet unavailable" ? undefined : finding.codeContext;
+      const reinforcementVerdict = verdict.verdict;
+      let personalKbAction: "boosted" | "degraded" | "none" = "none";
+      let personalKbChanged = false;
+      let sharedKbResult: {
+        issuePattern: string;
+        updatedEntries: number;
+        insertedEntry: boolean;
+        cooldownSkipped: boolean;
+        applied: boolean;
+        qualityDelta: number;
+      } | null = null;
 
-      if (verdict.verdict === "REAL BUG") {
+      if (linkedAgent && finding.findingText) {
+        if (reinforcementVerdict === "true_positive" || reinforcementVerdict === "false_positive") {
+          try {
+            const currentPersonalKb = nextPersonalKbByAgentId.get(linkedAgent.id) ?? linkedAgent.personalKB;
+            const personalKbResult = applyVerdictToPersonalKb({
+              rawPersonalKb: currentPersonalKb,
+              role: linkedAgent.role,
+              filePath: finding.filePath,
+              findingText: finding.findingText,
+              functionName: null,
+              fileType,
+              language,
+              confidence: finding.confidencePercent / 100,
+              verdict: reinforcementVerdict,
+            });
+
+            personalKbAction = personalKbResult.action;
+            personalKbChanged = personalKbResult.action !== "none";
+
+            if (personalKbResult.action !== "none") {
+              nextPersonalKbByAgentId.set(linkedAgent.id, personalKbResult.nextPersonalKb);
+              personalKbUpdatedAgentIds.add(linkedAgent.id);
+              updatedAgentNames.add(linkedAgent.name);
+            }
+
+            sharedKbResult = await reinforceSharedKnowledgeFromVerdict({
+              verdict: reinforcementVerdict,
+              filePath: finding.filePath,
+              findingText: finding.findingText,
+              issueType: finding.issueType,
+              language,
+              confidence: finding.confidencePercent / 100,
+              source: "import-review",
+            });
+
+            if (sharedKbResult.updatedEntries > 0 || sharedKbResult.insertedEntry) {
+              phase2ReinforcementCount += 1;
+            }
+          } catch (reinforcementError) {
+            const detail = reinforcementError instanceof Error ? reinforcementError.message : String(reinforcementError);
+            console.warn(`[Phase2] import-review reinforcement skipped for finding #${finding.findingNumber}: ${detail}`);
+          }
+        }
+      }
+
+      if (reinforcementVerdict === "true_positive" || reinforcementVerdict === "false_positive") {
+        await recordReinforcementEvent({
+          eventType: reinforcementVerdict === "true_positive" ? "phase2_reinforcement_boost" : "phase2_reinforcement_decay",
+          source: "import-review",
+          verdict: reinforcementVerdict,
+          verdictOrigin: "imported-review-verdict",
+          issuePattern,
+          filePath: finding.filePath,
+          agentId: linkedAgent?.id ?? finding.agentId ?? null,
+          agentName: linkedAgent?.name ?? finding.agentName,
+          agentRole: linkedAgent?.role ?? finding.agentRole,
+          findingId: `import-${finding.findingNumber}`,
+          linkedContext: finding.codeReference,
+          personalKbAction,
+          personalKbChanged,
+          sharedKnowledgeUpdated: sharedKbResult?.updatedEntries ?? 0,
+          sharedKnowledgeSeeded: sharedKbResult?.insertedEntry ?? false,
+          qualityDelta: sharedKbResult?.qualityDelta ?? 0,
+          confidenceDelta: personalKbAction === "boosted" ? 0.08 : personalKbAction === "degraded" ? -0.08 : 0,
+          attempted: true,
+          applied: personalKbChanged || Boolean(sharedKbResult?.applied),
+          cooldownSkipped: sharedKbResult?.cooldownSkipped ?? false,
+          evidenceScore: finding.confidencePercent / 100,
+        });
+      }
+
+      if (verdict.verdict === "true_positive") {
         realBugCount += 1;
         confirmedPatternCounts.set(issuePattern, (confirmedPatternCounts.get(issuePattern) ?? 0) + 1);
 
@@ -3785,7 +4257,7 @@ router.post("/import-review", async (req, res): Promise<void> => {
           qualityScore: 0.95,
         });
         kbEntriesAdded += 1;
-      } else {
+      } else if (verdict.verdict === "false_positive") {
         falsePositiveCount += 1;
 
         await db.insert(knowledgeTable).values({
@@ -3812,18 +4284,80 @@ router.post("/import-review", async (req, res): Promise<void> => {
       }
     }
 
+    const ROLE_CONFIDENCE_STEP = 0.03;
+    for (const adjustment of learningAdjustments) {
+      if (adjustment.confidenceRole && adjustment.confidenceDelta !== 0) {
+        const matchingAgents = agents.filter(agent => roleMatches(agent.role, adjustment.confidenceRole ?? ""));
+
+        for (const agent of matchingAgents) {
+          const signedDelta = adjustment.confidenceDelta * ROLE_CONFIDENCE_STEP;
+          roleConfidenceDeltaByAgent.set(agent.id, (roleConfidenceDeltaByAgent.get(agent.id) ?? 0) + signedDelta);
+        }
+      }
+
+      if (!adjustment.avoidPattern) continue;
+
+      const avoidPatternTag = normalizeIssuePattern(adjustment.avoidPattern);
+      await db.insert(knowledgeTable).values({
+        problemType: "review_import_avoid_pattern",
+        language: "meta",
+        fileType: "learning",
+        patternTags: `avoid-pattern,review-import,${avoidPatternTag}`,
+        question: `Avoid pattern from AI review: ${adjustment.avoidPattern}`,
+        contextHash: `review-import:avoid:${avoidPatternTag}`,
+        answer: `Agent instruction captured: should NEVER ${adjustment.avoidPattern}.`,
+        actionItems: JSON.stringify([
+          "Down-rank findings that match this avoid pattern unless hard evidence is present.",
+          `Source instruction: ${adjustment.agentName}: ${adjustment.adjustment}`,
+        ]),
+        confidence: "0.85",
+        provider: "ai-review-import",
+        wasUseful: 1,
+        producedBugs: 0,
+        qualityScore: 0.7,
+      });
+      kbEntriesAdded += 1;
+    }
+
     const accuracyChanges: Array<{ agentName: string; before: number; after: number }> = [];
-    for (const { agent, tp, fp } of perAgentDelta.values()) {
-      const nextTruePositives = agent.truePositives + tp;
-      const nextFalsePositives = agent.falsePositives + fp;
+    const impactedAgentIds = new Set<string>([
+      ...Array.from(perAgentDelta.keys()),
+      ...Array.from(roleConfidenceDeltaByAgent.keys()),
+      ...Array.from(personalKbUpdatedAgentIds),
+    ]);
+
+    for (const agentId of impactedAgentIds) {
+      const agent = agentsById.get(agentId);
+      if (!agent) continue;
+
+      const verdictDelta = perAgentDelta.get(agentId);
+      const nextTruePositives = agent.truePositives + (verdictDelta?.tp ?? 0);
+      const nextFalsePositives = agent.falsePositives + (verdictDelta?.fp ?? 0);
       const reviewedTotal = nextTruePositives + nextFalsePositives;
-      const nextAccuracy = reviewedTotal > 0 ? nextTruePositives / reviewedTotal : agent.accuracy;
+      const nextPersonalKb = nextPersonalKbByAgentId.get(agentId) ?? agent.personalKB;
+
+      let nextAccuracy = reviewedTotal > 0 ? nextTruePositives / reviewedTotal : agent.accuracy;
+      const roleDelta = roleConfidenceDeltaByAgent.get(agentId) ?? 0;
+      if (roleDelta !== 0) {
+        nextAccuracy = Math.max(0.01, Math.min(0.99, nextAccuracy + roleDelta));
+      }
+
+      const personalKbChanged = nextPersonalKb !== agent.personalKB;
+
+      const noMetricChange = nextTruePositives === agent.truePositives
+        && nextFalsePositives === agent.falsePositives
+        && Math.abs(nextAccuracy - agent.accuracy) < 0.0001
+        && !personalKbChanged;
+      if (noMetricChange) continue;
 
       await db.update(agentsTable).set({
         truePositives: nextTruePositives,
         falsePositives: nextFalsePositives,
         accuracy: nextAccuracy,
+        personalKB: nextPersonalKb,
       }).where(eq(agentsTable.id, agent.id));
+
+      updatedAgentNames.add(agent.name);
 
       accuracyChanges.push({
         agentName: agent.name,
@@ -3851,6 +4385,10 @@ router.post("/import-review", async (req, res): Promise<void> => {
       implementedFixSummary,
     };
 
+    if (kbEntriesAdded > 0) {
+      invalidateKnowledgeSearchCache();
+    }
+
     await writeMayorReviewContext(summaryRecord);
 
     const biggestGain = accuracyChanges
@@ -3866,6 +4404,7 @@ router.post("/import-review", async (req, res): Promise<void> => {
       agentsUpdated: Array.from(updatedAgentNames),
       kbEntriesAdded,
       accuracyChanges,
+      phase2ReinforcementCount,
       mayorMessage,
       lastReviewSummary: implementedFixSummary,
     });
@@ -4221,6 +4760,7 @@ router.post("/controls/wipe-all", async (req, res): Promise<void> => {
     await db.delete(snapshotsTable);
     await db.delete(executionResultsTable);
     await db.delete(knowledgeTable);
+    invalidateKnowledgeSearchCache({ resetVectorCache: true });
     await db.delete(agentsTable);
     await db.delete(reposTable);
     await db.delete(settingsTable);

@@ -7,6 +7,9 @@ import { isGenericFinding as isGenericFindingHeuristic } from "./smartAgents";
 
 const REPORTABLE_SOURCE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
 const MIN_BUG_CONFIDENCE = 0.72;
+const MIN_OBSERVATION_CONFIDENCE = 0.55;
+const MIN_DISCARD_CONFIDENCE = 0.50;
+const MAX_PIPELINE_ATTEMPTS = 200;
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {
   CRITICAL: 4,
@@ -35,8 +38,19 @@ export type FindingAssessment =
   }
   | {
     status: "discarded";
-    reason: "empty" | "generic";
+    reason: "empty" | "generic" | "low_confidence";
   };
+
+export type FindingDecision = "bug" | "observation" | "discard";
+
+export type FindingPipelineAttempt = {
+  filePath: string;
+  rawConfidence: number;
+  calibratedConfidence: number;
+  decision: FindingDecision;
+  reason: string;
+  timestamp: string;
+};
 
 export type PersistedFindingResult = {
   status: "new" | "duplicate";
@@ -57,8 +71,34 @@ type PersistFindingInput = {
   codeReference: string;
 };
 
+const findingPipelineAttempts: FindingPipelineAttempt[] = [];
+
 function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, "/").trim();
+}
+
+function clampConfidence(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+export function recordFindingPipelineAttempt(attempt: Omit<FindingPipelineAttempt, "timestamp"> & { timestamp?: string }): void {
+  findingPipelineAttempts.push({
+    ...attempt,
+    filePath: normalizePath(attempt.filePath),
+    rawConfidence: clampConfidence(attempt.rawConfidence),
+    calibratedConfidence: clampConfidence(attempt.calibratedConfidence),
+    timestamp: attempt.timestamp ?? new Date().toISOString(),
+  });
+
+  if (findingPipelineAttempts.length > MAX_PIPELINE_ATTEMPTS) {
+    findingPipelineAttempts.splice(0, findingPipelineAttempts.length - MAX_PIPELINE_ATTEMPTS);
+  }
+}
+
+export function getRecentFindingPipelineAttempts(limit = 10): FindingPipelineAttempt[] {
+  const safeLimit = Math.max(1, Math.min(limit, MAX_PIPELINE_ATTEMPTS));
+  return findingPipelineAttempts.slice(-safeLimit).reverse();
 }
 
 function compactText(text: string, max = 220): string {
@@ -138,6 +178,7 @@ export function assessFindingCandidate(params: {
 }): FindingAssessment {
   const normalizedPath = normalizePath(params.filePath);
   const normalizedText = compactText(params.findingText, 1200);
+  const normalizedConfidence = clampConfidence(params.confidence);
 
   if (!normalizedText) {
     return { status: "discarded", reason: "empty" };
@@ -151,8 +192,24 @@ export function assessFindingCandidate(params: {
     };
   }
 
-  if (params.confidence < MIN_BUG_CONFIDENCE) {
-    const confidencePercent = Math.round(params.confidence * 100);
+  if (normalizedConfidence < MIN_DISCARD_CONFIDENCE) {
+    return {
+      status: "discarded",
+      reason: "low_confidence",
+    };
+  }
+
+  if (normalizedConfidence < MIN_OBSERVATION_CONFIDENCE) {
+    const confidencePercent = Math.round(normalizedConfidence * 100);
+    return {
+      status: "observation",
+      reason: "low_confidence",
+      observation: `${params.agentName} low-confidence (${confidencePercent}%) observation in ${normalizedPath}: ${compactText(normalizedText, 180)}`,
+    };
+  }
+
+  if (normalizedConfidence < MIN_BUG_CONFIDENCE) {
+    const confidencePercent = Math.round(normalizedConfidence * 100);
     return {
       status: "observation",
       reason: "low_confidence",
@@ -174,7 +231,7 @@ export function assessFindingCandidate(params: {
     finding: {
       filePath: normalizedPath,
       findingText: normalizedText,
-      confidence: params.confidence,
+      confidence: normalizedConfidence,
       issueType: inferIssueType(normalizedText),
       codeReference: extractCodeReference(normalizedText),
     },

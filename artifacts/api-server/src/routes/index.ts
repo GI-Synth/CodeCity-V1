@@ -16,6 +16,11 @@ import reportRouter from "./report";
 import orchestratorRouter from "./orchestrator";
 import alchemistRouter from "./alchemist";
 import debugRouter from "./debug";
+import graphRouter from "./graph";
+import agentChatRouter from "./agentChat";
+import logsRouter from "./logs";
+import mayorRouter from "./mayor";
+import providersRouter from "./providers";
 
 const router: IRouter = Router();
 
@@ -38,5 +43,10 @@ router.use("/city", reportRouter);
 router.use("/orchestrator", orchestratorRouter);
 router.use("/alchemist", alchemistRouter);
 router.use("/debug", debugRouter);
+router.use("/graph", graphRouter);
+router.use("/agent-chat", agentChatRouter);
+router.use("/logs", logsRouter);
+router.use("/mayor", mayorRouter);
+router.use("/providers", providersRouter);
 
 export default router;

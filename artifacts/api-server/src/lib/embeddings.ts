@@ -2,6 +2,7 @@ import path from "node:path";
 import { db } from "@workspace/db";
 import { knowledgeTable } from "@workspace/db/schema";
 import { eq, isNull } from "drizzle-orm";
+import { cosineSimilarity } from "./vectorMath";
 
 type TransformersModule = typeof import("@xenova/transformers");
 
@@ -86,23 +87,6 @@ export async function embedBatch(texts: string[]): Promise<number[][]> {
   return results;
 }
 
-export function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length || a.length === 0) return 0;
-
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-
-  if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
 export async function embedExistingEntries(): Promise<void> {
   const unembedded = await db
     .select({ id: knowledgeTable.id, question: knowledgeTable.question, answer: knowledgeTable.answer })
@@ -136,3 +120,4 @@ export async function embedExistingEntries(): Promise<void> {
 }
 
 export { EMBEDDING_DIM };
+export { cosineSimilarity };

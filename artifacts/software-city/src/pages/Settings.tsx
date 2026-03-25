@@ -6,6 +6,14 @@ import { Trash2, RotateCcw, AlertTriangle, CheckCircle } from "lucide-react";
 
 type SettingsMap = Record<string, string>;
 
+interface OllamaConnectionResult {
+  host: string;
+  reachable: boolean;
+  models: string[];
+  latencyMs: number;
+  recommendation: string;
+}
+
 interface FieldRowProps {
   label: string;
   description?: string;
@@ -200,6 +208,19 @@ export function Settings() {
   const [danger, setDanger] = useState<"none" | "clearKb" | "resetSettings">("none");
   const [dangerConfirm, setDangerConfirm] = useState("");
 
+  const {
+    data: ollamaConnection,
+    isFetching: ollamaConnectionLoading,
+    refetch: refetchOllamaConnection,
+  } = useQuery<OllamaConnectionResult>({
+    queryKey: ["ollama-connection"],
+    queryFn: async () => {
+      const res = await fetch("/api/ollama/test-connection");
+      if (!res.ok) throw new Error("Failed to test Ollama connection");
+      return res.json() as Promise<OllamaConnectionResult>;
+    },
+  });
+
   const { data: settings, isLoading } = useQuery<SettingsMap>({
     queryKey: ["settings"],
     queryFn: async () => {
@@ -237,6 +258,17 @@ export function Settings() {
   );
 
   const get = (key: string, def: string) => settings?.[key] ?? def;
+
+  const ollamaHost = ollamaConnection?.host ?? "http://localhost:11434";
+  const ollamaReachable = ollamaConnection?.reachable ?? false;
+  const ollamaModels = ollamaConnection?.models ?? [];
+  const ollamaLatency = ollamaConnection?.latencyMs;
+  const ollamaRecommendation = ollamaConnection?.recommendation
+    ?? "Click Test Connection to verify your current Ollama host.";
+
+  const handleTestOllamaConnection = useCallback(() => {
+    void refetchOllamaConnection();
+  }, [refetchOllamaConnection]);
 
   async function handleClearKB() {
     if (dangerConfirm !== "CLEAR") return;
@@ -321,6 +353,68 @@ export function Settings() {
                 savedKey={savedKey}
               />
             </FieldRow>
+
+            <div className="rounded-lg border border-border/60 bg-background/40 p-4 space-y-3">
+              <div>
+                <div className="text-sm font-mono font-bold text-foreground">Ollama Connection</div>
+                <div className="text-xs text-muted-foreground font-mono mt-0.5">Verify connectivity to your configured Ollama server.</div>
+              </div>
+
+              <div className="flex flex-col gap-2 text-xs font-mono text-muted-foreground">
+                <div>
+                  <span className="text-foreground">OLLAMA_HOST:</span> {ollamaHost}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "inline-block h-2.5 w-2.5 rounded-full",
+                      ollamaReachable ? "bg-green-400" : "bg-red-400"
+                    )}
+                  />
+                  <span className={cn("font-mono", ollamaReachable ? "text-green-400" : "text-red-400")}>
+                    {ollamaReachable ? "Connected" : "Not reachable"}
+                  </span>
+                  {typeof ollamaLatency === "number" && (
+                    <span className="text-muted-foreground">{ollamaLatency}ms</span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  {ollamaModels.length > 0 ? (
+                    ollamaModels.map(model => (
+                      <span
+                        key={model}
+                        className="rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] text-primary"
+                      >
+                        {model}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-muted-foreground">No models reported</span>
+                  )}
+                </div>
+
+                <div className="rounded-md border border-border/60 bg-background/60 px-3 py-2 text-xs text-muted-foreground">
+                  {ollamaRecommendation}
+                </div>
+
+                <button
+                  onClick={handleTestOllamaConnection}
+                  disabled={ollamaConnectionLoading}
+                  className="w-fit rounded-lg border border-primary/50 px-3 py-1.5 text-xs font-mono text-primary hover:bg-primary/10 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {ollamaConnectionLoading ? "Testing..." : "Test Connection"}
+                </button>
+
+                <div className="rounded-md border border-border/60 bg-background/60 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                  <p>To use Ollama on another machine on your network:</p>
+                  <p>1. On that machine: set OLLAMA_HOST=0.0.0.0 in system environment variables</p>
+                  <p>2. Find that machine&apos;s local IP (ipconfig on Windows)</p>
+                  <p>3. Add to your .env: OLLAMA_HOST=http://192.168.x.x:11434</p>
+                </div>
+              </div>
+            </div>
           </Section>
 
           <Section title="Agent Behavior" description="Control agent loop speed and concurrency">

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { cn } from "@/lib/utils";
-import { Activity, Bug, Brain, Zap, RefreshCw, TrendingUp, TrendingDown, Cpu, Server } from "lucide-react";
+import { Activity, Bug, Brain, Zap, RefreshCw, TrendingUp, TrendingDown, Cpu, Server, type LucideIcon } from "lucide-react";
 import { format } from "date-fns";
 import { useState } from "react";
 
@@ -10,6 +10,20 @@ interface MetricSnapshot {
   timestamp: string;
   healthScore: number;
   coverageOverall: number;
+  predictionAccuracyScore: number;
+  falseNegativeRate: number;
+  confidenceCalibrationIndex: number;
+  recommendationFixConversion: number;
+  testGenerationEffectiveness: number;
+  kpiSampleSize: number;
+  reinforcementAttempts: number;
+  reinforcementApplied: number;
+  reinforcementBoosts: number;
+  reinforcementDecays: number;
+  reinforcementNet: number;
+  reinforcementCoverage: number;
+  agingPersonalUpdates: number;
+  agingKnowledgeUpdates: number;
   activeAgents: number;
   pausedAgents: number;
   totalBugs: number;
@@ -24,6 +38,31 @@ interface MetricsHistory {
   snapshots: MetricSnapshot[];
   hours: number;
   count: number;
+  kpiContractVersion?: string;
+}
+
+interface ReinforcementSummary {
+  hours: number;
+  since: string;
+  totals: {
+    attempts: number;
+    applied: number;
+    boosts: number;
+    decays: number;
+    net: number;
+    coverage: number;
+  };
+  topBoostPatterns: Array<{ issuePattern: string; count: number }>;
+  topDecayPatterns: Array<{ issuePattern: string; count: number }>;
+  topAgentDeltas: Array<{ agentName: string; agentId: string | null; boosts: number; decays: number; net: number }>;
+  trend: Array<{ bucket: string; boosts: number; decays: number; net: number }>;
+  smarterPercentEstimate: number;
+  smarterPercentComponents: {
+    pasDelta: number;
+    fnrDelta: number;
+    cciDelta: number;
+    coverageLift: number;
+  } | null;
 }
 
 interface LiveMetrics {
@@ -69,7 +108,7 @@ function StatCard({
   label: string;
   value: string | number;
   unit?: string;
-  icon: React.ElementType;
+  icon: LucideIcon;
   trend?: "up" | "down" | "neutral";
   color?: "primary" | "green" | "red" | "orange" | "blue";
 }) {
@@ -176,12 +215,34 @@ function SVGLineChart({
 export function Metrics() {
   const [hours, setHours] = useState(24);
 
+  function kpiTrend(current: number, previous: number | undefined, invert = false): "up" | "down" | "neutral" {
+    if (typeof previous !== "number") return "neutral";
+    const delta = current - previous;
+    if (Math.abs(delta) < 0.0025) return "neutral";
+    if (invert) return delta < 0 ? "up" : "down";
+    return delta > 0 ? "up" : "down";
+  }
+
   const { data: history, refetch: refetchHistory, isFetching: fetchingHistory } = useQuery<MetricsHistory>({
     queryKey: ["metricsHistory", hours],
     queryFn: async () => {
       const res = await fetch(`/api/metrics/history?hours=${hours}`);
       if (!res.ok) throw new Error("Failed to fetch metrics history");
       return res.json() as Promise<MetricsHistory>;
+    },
+    refetchInterval: 30_000,
+  });
+
+  const {
+    data: reinforcementSummary,
+    refetch: refetchReinforcement,
+    isFetching: fetchingReinforcement,
+  } = useQuery<ReinforcementSummary>({
+    queryKey: ["reinforcementSummary", hours],
+    queryFn: async () => {
+      const res = await fetch(`/api/metrics/reinforcement-summary?hours=${hours}`);
+      if (!res.ok) throw new Error("Failed to fetch reinforcement summary");
+      return res.json() as Promise<ReinforcementSummary>;
     },
     refetchInterval: 30_000,
   });
@@ -220,10 +281,26 @@ export function Metrics() {
   const healthChartData = snapshots.map(s => ({ time: s.timestamp, value: s.healthScore }));
   const agentsChartData = snapshots.map(s => ({ time: s.timestamp, value: s.activeAgents }));
   const bugsChartData = snapshots.map(s => ({ time: s.timestamp, value: s.totalBugs }));
+  const pasChartData = snapshots.map(s => ({ time: s.timestamp, value: (s.predictionAccuracyScore ?? 0) * 100 }));
+  const fnrChartData = snapshots.map(s => ({ time: s.timestamp, value: (s.falseNegativeRate ?? 0) * 100 }));
+  const reinforcementTrendData = (reinforcementSummary?.trend ?? []).map(s => ({ time: s.bucket, value: s.net }));
 
   const lastSnap = snapshots[snapshots.length - 1];
+  const prevSnap = snapshots.length > 1 ? snapshots[snapshots.length - 2] : undefined;
+  const kpiContractVersion = history?.kpiContractVersion ?? "phase1-v1";
   const healthScore = health?.score ?? lastSnap?.healthScore ?? 0;
   const coverage = health?.testCoverageRatio ?? lastSnap?.coverageOverall ?? 0;
+  const pas = Math.max(0, Math.min(1, lastSnap?.predictionAccuracyScore ?? 0));
+  const fnr = Math.max(0, Math.min(1, lastSnap?.falseNegativeRate ?? 0));
+  const cci = Math.max(0, Math.min(1, lastSnap?.confidenceCalibrationIndex ?? 0));
+  const rfc = Math.max(0, Math.min(1, lastSnap?.recommendationFixConversion ?? 0));
+  const tge = Math.max(0, Math.min(1, lastSnap?.testGenerationEffectiveness ?? 0));
+  const reinforcementCoverage = Math.max(0, Math.min(1, reinforcementSummary?.totals.coverage ?? lastSnap?.reinforcementCoverage ?? 0));
+  const reinforcementNet = reinforcementSummary?.totals.net ?? lastSnap?.reinforcementNet ?? 0;
+  const reinforcementBoosts = reinforcementSummary?.totals.boosts ?? lastSnap?.reinforcementBoosts ?? 0;
+  const reinforcementDecays = reinforcementSummary?.totals.decays ?? lastSnap?.reinforcementDecays ?? 0;
+  const smarterPercentEstimate = reinforcementSummary?.smarterPercentEstimate ?? 0;
+  const kpiSampleSize = lastSnap?.kpiSampleSize ?? 0;
   const activeAgents = live?.activeAgents ?? lastSnap?.activeAgents ?? 0;
   const totalBugs = live?.bugsFound ?? lastSnap?.totalBugs ?? 0;
   const cpuUsage = live?.cpuUsage ?? lastSnap?.cpuUsage ?? 0;
@@ -235,6 +312,9 @@ export function Metrics() {
   const keywordHits = knowledgeSessionStats?.keywordHits ?? 0;
   const avgSimilarityPercent = ((knowledgeSessionStats?.avgSimilarity ?? 0) * 100).toFixed(1);
   const modelLoaded = knowledgeSessionStats?.modelLoaded ?? false;
+  const topBoostPatterns = reinforcementSummary?.topBoostPatterns ?? [];
+  const topDecayPatterns = reinforcementSummary?.topDecayPatterns ?? [];
+  const topAgentDeltas = reinforcementSummary?.topAgentDeltas ?? [];
 
   const season = health?.season ?? "summer";
   const seasonEmoji = season === "winter" ? "❄️" : season === "fall" ? "🍂" : season === "spring" ? "🌱" : "☀️";
@@ -268,11 +348,13 @@ export function Metrics() {
                 ))}
               </div>
               <button
-                onClick={() => { void refetchHistory(); }}
-                disabled={fetchingHistory}
+                onClick={() => {
+                  void Promise.all([refetchHistory(), refetchReinforcement()]);
+                }}
+                disabled={fetchingHistory || fetchingReinforcement}
                 className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono rounded border border-primary/30 text-primary hover:bg-primary/10 transition-colors disabled:opacity-50"
               >
-                <RefreshCw size={13} className={cn(fetchingHistory && "animate-spin")} />
+                <RefreshCw size={13} className={cn((fetchingHistory || fetchingReinforcement) && "animate-spin")} />
                 Refresh
               </button>
             </div>
@@ -332,6 +414,156 @@ export function Metrics() {
               icon={Activity}
               color={escalations > 5 ? "red" : "orange"}
             />
+            <StatCard
+              label="PAS"
+              value={(pas * 100).toFixed(1)}
+              unit="%"
+              icon={TrendingUp}
+              color={pas >= 0.75 ? "green" : pas >= 0.55 ? "orange" : "red"}
+              trend={kpiTrend(pas, prevSnap?.predictionAccuracyScore)}
+            />
+            <StatCard
+              label="FNR"
+              value={(fnr * 100).toFixed(1)}
+              unit="%"
+              icon={TrendingDown}
+              color={fnr <= 0.20 ? "green" : fnr <= 0.35 ? "orange" : "red"}
+              trend={kpiTrend(fnr, prevSnap?.falseNegativeRate, true)}
+            />
+            <StatCard
+              label="CCI"
+              value={(cci * 100).toFixed(1)}
+              unit="%"
+              icon={Activity}
+              color={cci >= 0.75 ? "green" : cci >= 0.55 ? "orange" : "red"}
+              trend={kpiTrend(cci, prevSnap?.confidenceCalibrationIndex)}
+            />
+            <StatCard
+              label="RFC"
+              value={(rfc * 100).toFixed(1)}
+              unit="%"
+              icon={RefreshCw}
+              color={rfc >= 0.60 ? "green" : rfc >= 0.35 ? "orange" : "red"}
+              trend={kpiTrend(rfc, prevSnap?.recommendationFixConversion)}
+            />
+            <StatCard
+              label="TGE"
+              value={(tge * 100).toFixed(1)}
+              unit="%"
+              icon={Zap}
+              color={tge >= 0.60 ? "green" : tge >= 0.35 ? "orange" : "red"}
+              trend={kpiTrend(tge, prevSnap?.testGenerationEffectiveness)}
+            />
+            <StatCard
+              label="Reinforcement Coverage"
+              value={(reinforcementCoverage * 100).toFixed(1)}
+              unit="%"
+              icon={Brain}
+              color={reinforcementCoverage >= 0.7 ? "green" : reinforcementCoverage >= 0.45 ? "orange" : "red"}
+            />
+            <StatCard
+              label="Smarter Estimate"
+              value={smarterPercentEstimate.toFixed(1)}
+              unit="%"
+              icon={TrendingUp}
+              color={smarterPercentEstimate >= 8 ? "green" : smarterPercentEstimate >= 0 ? "orange" : "red"}
+            />
+          </div>
+
+          <div className="glass-panel rounded-xl border border-border/50 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-mono font-bold text-primary uppercase tracking-wider">Coding Genius KPIs</h2>
+              <span className="text-xs font-mono text-muted-foreground">contract {kpiContractVersion} · sample {kpiSampleSize}</span>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <div className="space-y-2">
+                <div className="text-xs font-mono text-muted-foreground uppercase tracking-wider">PAS Trend (higher is better)</div>
+                <div className="h-40">
+                  <SVGLineChart data={pasChartData} label="pas" color="#34d399" />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs font-mono text-muted-foreground uppercase tracking-wider">FNR Trend (lower is better)</div>
+                <div className="h-40">
+                  <SVGLineChart data={fnrChartData} label="fnr" color="#f97316" />
+                </div>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 text-xs font-mono">
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">PAS</div>
+                <div className="mt-1 text-green-400">{(pas * 100).toFixed(1)}%</div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">FNR</div>
+                <div className="mt-1 text-orange-400">{(fnr * 100).toFixed(1)}%</div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">CCI</div>
+                <div className="mt-1 text-blue-400">{(cci * 100).toFixed(1)}%</div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">RFC</div>
+                <div className="mt-1 text-primary">{(rfc * 100).toFixed(1)}%</div>
+              </div>
+              <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                <div className="text-muted-foreground">TGE</div>
+                <div className="mt-1 text-foreground">{(tge * 100).toFixed(1)}%</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="glass-panel rounded-xl border border-border/50 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-mono font-bold text-primary uppercase tracking-wider">Phase 2 Reinforcement</h2>
+              <span className="text-xs font-mono text-muted-foreground">
+                boosts {reinforcementBoosts} · decays {reinforcementDecays} · net {reinforcementNet >= 0 ? `+${reinforcementNet}` : reinforcementNet}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <div className="space-y-2">
+                <div className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Net reinforcement trend</div>
+                <div className="h-40">
+                  <SVGLineChart data={reinforcementTrendData} label="reinforcement-net" color="#f59e0b" />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
+                <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                  <div className="text-muted-foreground">Coverage</div>
+                  <div className="mt-1 text-green-400">{(reinforcementCoverage * 100).toFixed(1)}%</div>
+                </div>
+                <div className="rounded-lg border border-border/40 bg-background/40 p-3">
+                  <div className="text-muted-foreground">Smarter estimate</div>
+                  <div className={cn("mt-1", smarterPercentEstimate >= 0 ? "text-primary" : "text-red-400")}>
+                    {smarterPercentEstimate.toFixed(1)}%
+                  </div>
+                </div>
+                <div className="rounded-lg border border-border/40 bg-background/40 p-3 md:col-span-2">
+                  <div className="text-muted-foreground">Top boosted patterns</div>
+                  <div className="mt-1 text-foreground">
+                    {topBoostPatterns.length > 0
+                      ? topBoostPatterns.slice(0, 5).map(pattern => `${pattern.issuePattern} (${pattern.count})`).join(" | ")
+                      : "No boost pattern data yet"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-border/40 bg-background/40 p-3 md:col-span-2">
+                  <div className="text-muted-foreground">Top decayed patterns</div>
+                  <div className="mt-1 text-foreground">
+                    {topDecayPatterns.length > 0
+                      ? topDecayPatterns.slice(0, 5).map(pattern => `${pattern.issuePattern} (${pattern.count})`).join(" | ")
+                      : "No decay pattern data yet"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-border/40 bg-background/40 p-3 md:col-span-2">
+                  <div className="text-muted-foreground">Top changing agents</div>
+                  <div className="mt-1 text-foreground">
+                    {topAgentDeltas.length > 0
+                      ? topAgentDeltas.slice(0, 5).map(agent => `${agent.agentName} (net ${agent.net >= 0 ? "+" : ""}${agent.net})`).join(" | ")
+                      : "No agent reinforcement deltas yet"}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

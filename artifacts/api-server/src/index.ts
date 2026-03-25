@@ -2,6 +2,7 @@ import http from "http";
 import app from "./app";
 import { wsServer } from "./lib/wsServer";
 import { startAgentLoop, clearAllAgentIntervals } from "./lib/agentEngine";
+import { orchestrator } from "./lib/orchestrator";
 import { validateEnv } from "./lib/envValidator";
 import { writeMetricSnapshot } from "./routes/metrics";
 import { db, ensureRuntimeDbMigrations } from "@workspace/db";
@@ -16,6 +17,7 @@ import {
   hasMarkdownOrHtmlKnowledgeEntries,
   purgeStartupKnowledgeLanguages,
 } from "./lib/knowledgeCleanup";
+import { startConsoleLogAgent, stopConsoleLogAgent } from "./lib/consoleLogAgent";
 
 const loadedEnvPath = loadEnvFile();
 if (loadedEnvPath) {
@@ -148,6 +150,9 @@ async function startServer(): Promise<void> {
     if (simulationEnabled) {
       console.log("[AgentLoop] ENABLE_SIMULATION_LOOP=true, starting autonomous loop");
       startAgentLoop();
+      orchestrator.start();
+      startConsoleLogAgent();
+      console.log("[Orchestrator] Started city strategy loop");
     } else {
       console.log("[AgentLoop] Disabled by default (set ENABLE_SIMULATION_LOOP=true to enable)");
     }
@@ -171,6 +176,8 @@ async function startServer(): Promise<void> {
 
 function shutdown(signal: string): void {
   console.log(`\nSoftware City shutting down cleanly (${signal})`);
+  orchestrator.stop();
+  stopConsoleLogAgent();
   clearAllAgentIntervals();
   wsServer.closeAll();
   server.close(() => {

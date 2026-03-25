@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "startedAt": "2026-03-19T04:59:59.108Z",
+  "updatedAt": "2026-03-19T05:31:27.472Z",
+  "completedRepos": [
+    "expressjs/express",
+    "axios/axios",
+    "lodash/lodash",
+    "prisma/prisma",
+    "vitejs/vite",
+    "facebook/react",
+    "vercel/next.js",
+    "tailwindlabs/tailwindcss",
+    "Tonejs/Tone.js",
+    "wavesurfer-js/wavesurfer.js",
+    "tambien/standardized-audio-context",
+    "djipco/webmidi",
+    "goldfire/howler.js",
+    "meyda/meyda",
+    "radix-ui/primitives",
+    "framer/motion",
+    "floating-ui/floating-ui",
+    "recharts/recharts",
+    "promptfoo/promptfoo",
+    "karpathy/nanoGPT",
+    "pbakaus/impeccable",
+    "microsoft/autogen",
+    "langchain-ai/langchainjs"
+  ],
+  "seedsCompleted": true,
+  "providerUsage": {
+    "groq": 0,
+    "openrouter": 3,
+    "cerebras": 433,
+    "ollama-cloud": 36,
+    "ollama-local": 0,
+    "anthropic": 0,
+    "static": 0,
+    "expert-seed": 50
+  },
+  "domainCounts": {
+    "general": 437,
+    "ui": 26,
+    "audio": 25,
+    "plugin": 13,
+    "dsp": 11,
+    "ai": 10
+  },
+  "added": 522,
+  "duplicates": 74,
+  "filesProcessed": 276,
+  "repoStats": {
+    "expressjs/express": {
+      "filesProcessed": 12,
+      "patternsAdded": 23,
+      "duplicates": 1
+    },
+    "axios/axios": {
+      "filesProcessed": 12,
+      "patternsAdded": 21,
+      "duplicates": 3
+    },
+    "lodash/lodash": {
+      "filesProcessed": 12,
+      "patternsAdded": 19,
+      "duplicates": 4
+    },
+    "prisma/prisma": {
+      "filesProcessed": 12,
+      "patternsAdded": 21,
+      "duplicates": 3
+    },
+    "vitejs/vite": {
+      "filesProcessed": 12,
+      "patternsAdded": 15,
+      "duplicates": 7
+    },
+    "facebook/react": {
+      "filesProcessed": 12,
+      "patternsAdded": 21,
+      "duplicates": 3
+    },
+    "vercel/next.js": {
+      "filesProcessed": 12,
+      "patternsAdded": 18,
+      "duplicates": 6
+    },
+    "tailwindlabs/tailwindcss": {
+      "filesProcessed": 12,
+      "patternsAdded": 16,
+      "duplicates": 7
+    },
+    "Tonejs/Tone.js": {
+      "filesProcessed": 12,
+      "patternsAdded": 20,
+      "duplicates": 4
+    },
+    "wavesurfer-js/wavesurfer.js": {
+      "filesProcessed": 12,
+      "patternsAdded": 22,
+      "duplicates": 3
+    },
+    "tambien/standardized-audio-context": {
+      "filesProcessed": 12,
+      "patternsAdded": 19,
+      "duplicates": 5
+    },
+    "djipco/webmidi": {
+      "filesProcessed": 12,
+      "patternsAdded": 22,
+      "duplicates": 1
+    },
+    "goldfire/howler.js": {
+      "filesProcessed": 12,
+      "patternsAdded": 24,
+      "duplicates": 0
+    },
+    "meyda/meyda": {
+      "filesProcessed": 12,
+      "patternsAdded": 23,
+      "duplicates": 0
+    },
+    "radix-ui/primitives": {
+      "filesProcessed": 12,
+      "patternsAdded": 23,
+      "duplicates": 1
+    },
+    "framer/motion": {
+      "filesProcessed": 12,
+      "patternsAdded": 20,
+      "duplicates": 3
+    },
+    "floating-ui/floating-ui": {
+      "filesProcessed": 12,
+      "patternsAdded": 21,
+      "duplicates": 4
+    },
+    "recharts/recharts": {
+      "filesProcessed": 12,
+      "patternsAdded": 19,
+      "duplicates": 5
+    },
+    "promptfoo/promptfoo": {
+      "filesProcessed": 12,
+      "patternsAdded": 14,
+      "duplicates": 10
+    },
+    "karpathy/nanoGPT": {
+      "filesProcessed": 12,
+      "patternsAdded": 23,
+      "duplicates": 0
+    },
+    "pbakaus/impeccable": {
+      "filesProcessed": 12,
+      "patternsAdded": 22,
+      "duplicates": 2
+    },
+    "microsoft/autogen": {
+      "filesProcessed": 12,
+      "patternsAdded": 22,
+      "duplicates": 2
+    },
+    "langchain-ai/langchainjs": {
+      "filesProcessed": 12,
+      "patternsAdded": 24,
+      "duplicates": 0
+    }
+  }
+}

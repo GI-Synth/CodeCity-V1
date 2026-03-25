@@ -1,10 +1,14 @@
 import { db } from "@workspace/db";
 import { agentsTable, findingsTable, knowledgeTable } from "@workspace/db/schema";
 import { and, desc, eq, gte } from "drizzle-orm";
+import { readFile } from 'node:fs/promises';
+import { resolve, isAbsolute, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runAlchemistCommand } from "./alchemistExecutor";
+import { fileWatcher } from "./fileWatcher";
 import { escalate, type EscalationResult } from "./escalationEngine";
 import type { Building } from "./types";
-import { assessFindingCandidate } from "./findingQuality";
+import { assessFindingCandidate, recordFindingPipelineAttempt } from "./findingQuality";
 import {
   calibrateConfidence,
   extractFileType,
@@ -18,6 +22,10 @@ import {
   toMemoryPattern,
   type FindingSeverity,
 } from "./smartAgents";
+
+const _self = fileURLToPath(import.meta.url);
+// artifacts/api-server/src/lib/ → four levels up = workspace root
+const REPO_ROOT = resolve(dirname(_self), '../../../../');
 
 export type SmartFindingClassification = "discarded" | "observation" | "bug" | "test_target" | "no_finding";
 
@@ -79,6 +87,14 @@ function logFindingDecision(params: {
       + `after_calibration=${formatConfidence(params.calibratedConfidence)} `
       + `decision=${params.decision} reason=${params.reason}`,
   );
+
+  recordFindingPipelineAttempt({
+    filePath: params.filePath,
+    rawConfidence: params.confidence,
+    calibratedConfidence: params.calibratedConfidence,
+    decision: params.decision,
+    reason: params.reason,
+  });
 }
 
 function normalizeNoFindingText(raw: string | null): string | null {
@@ -91,16 +107,54 @@ function normalizeNoFindingText(raw: string | null): string | null {
   return normalized;
 }
 
-function buildCodeSnippet(building: Building): string {
-  return [
-    `FILE=${building.filePath}`,
-    `LANGUAGE=${building.language}`,
-    `TYPE=${building.fileType}`,
-    `LOC=${building.linesOfCode}`,
-    `COMPLEXITY=${building.complexity}`,
-    `HAS_TESTS=${building.hasTests}`,
-    `TEST_COVERAGE=${building.testCoverage}`,
-  ].join("\n");
+async function buildCodeSnippet(building: Building): Promise<string> {
+  const metadata = [
+    `FILE: ${building.filePath}`,
+    `LANGUAGE: ${building.language}`,
+    `TYPE: ${building.fileType}`,
+    `LOC: ${building.linesOfCode}`,
+    `COMPLEXITY: ${building.complexity}`,
+    `HAS_TESTS: ${building.hasTests}`,
+    `TEST_COVERAGE: ${building.testCoverage}`,
+  ].join('\n');
+
+  // Build candidate roots in priority order:
+  // 1. fileWatcher watched path (the actively loaded local repo)
+  // 2. process.cwd() (server working directory)
+  // 3. REPO_ROOT (CodeCity tool root — for its own source files)
+  const roots: string[] = [];
+  const watchedPath = fileWatcher.getWatchedPath().trim();
+  if (watchedPath) roots.push(watchedPath);
+  const cwd = process.cwd();
+  if (cwd !== REPO_ROOT) roots.push(cwd);
+  roots.push(REPO_ROOT);
+
+  if (isAbsolute(building.filePath)) {
+    try {
+      const content = await readFile(building.filePath, 'utf-8');
+      const capped = content.length > 4000
+        ? content.slice(0, 3000) + '\n\n... [truncated] ...\n\n' + content.slice(-1000)
+        : content;
+      return metadata + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
+    } catch {
+      return metadata + '\n\n[Could not read file contents]';
+    }
+  }
+
+  for (const root of roots) {
+    const absPath = resolve(root, building.filePath);
+    try {
+      const content = await readFile(absPath, 'utf-8');
+      const capped = content.length > 4000
+        ? content.slice(0, 3000) + '\n\n... [truncated] ...\n\n' + content.slice(-1000)
+        : content;
+      return metadata + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
+    } catch {
+      // try next root
+    }
+  }
+
+  return metadata + '\n\n[File not found locally — no local repo loaded or file path not accessible]';
 }
 
 async function hasSharedKnowledgePattern(pattern: string, language: string): Promise<boolean> {
@@ -126,22 +180,6 @@ async function hasSharedKnowledgePattern(pattern: string, language: string): Pro
   }
 
   return false;
-}
-
-async function hasPriorNoFinding(filePath: string): Promise<boolean> {
-  const normalized = normalizePath(filePath);
-
-  const rows = await db
-    .select({ id: findingsTable.id })
-    .from(findingsTable)
-    .where(and(
-      eq(findingsTable.filePath, normalized),
-      eq(findingsTable.classification, "no_finding"),
-    ))
-    .limit(1)
-    .catch(() => []);
-
-  return rows.length > 0;
 }
 
 async function insertFindingRow(params: {
@@ -205,11 +243,12 @@ async function runRoleEscalation(params: {
   role: string;
   building: Building;
   context: string;
+  codeSnippet: string;
   consultationContext?: string;
 }): Promise<EscalationResult> {
   return await escalate({
     question: toEscalationPromptQuestion(params.role, params.building, params.context),
-    codeSnippet: buildCodeSnippet(params.building),
+    codeSnippet: params.codeSnippet,
     language: params.building.language,
     failedAttempts: [],
     agentRole: params.role,
@@ -314,10 +353,13 @@ export async function analyzeBuildingForAgent(params: {
     baseConfidence = clampConfidence(directMemory.entry.confidence + 0.15);
     actionItems = ["Validate memory-based finding quickly", "Generate a regression test for this pattern"];
   } else {
+    const snippet = await buildCodeSnippet(params.building);
+    console.log(`[Agent] ${params.building.filePath}: ${snippet.includes('SOURCE CODE:') ? 'real code (' + snippet.length + ' chars)' : 'metadata only'}`);
     const escalation = await runRoleEscalation({
       role,
       building: params.building,
       context: params.context,
+      codeSnippet: snippet,
       consultationContext: params.consultedBy
         ? `Consulted by ${params.consultedBy}: ${params.context}`
         : undefined,
@@ -455,15 +497,12 @@ export async function analyzeBuildingForAgent(params: {
   }
 
   const sharedPatternMatch = await hasSharedKnowledgePattern(pattern, params.building.language);
-  const priorNoFinding = await hasPriorNoFinding(filePath);
-
   const calibration = calibrateConfidence({
     baseConfidence,
     personalPatternMatch: personalMatch !== null,
     personalExperienceMatch: directMemory !== null,
     sharedPatternMatch,
     accuracy: params.agentRow.accuracy,
-    filePreviouslyNoFinding: priorNoFinding,
     genericFinding: shouldApplyGenericPenalty({
       findingText,
       functionName,
@@ -502,7 +541,9 @@ export async function analyzeBuildingForAgent(params: {
   } else {
     classification = "discarded";
     status = "discarded";
-    qualityReason = qualityAssessment.reason === "generic" ? "generic" : null;
+    qualityReason = qualityAssessment.reason === "generic" || qualityAssessment.reason === "low_confidence"
+      ? qualityAssessment.reason
+      : null;
     effectiveFindingText = findingText;
     effectiveCodeReference = lineReference ?? null;
   }
@@ -538,7 +579,6 @@ export async function analyzeBuildingForAgent(params: {
     consultedBy: params.consultedBy,
     metadata: {
       modifiers: calibration.modifiers,
-      priorNoFinding,
       sharedPatternMatch,
       personalPatternMatch: personalMatch !== null,
       pattern,

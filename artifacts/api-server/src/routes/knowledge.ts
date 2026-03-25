@@ -3,7 +3,13 @@ import { db } from "@workspace/db";
 import { knowledgeTable, eventsTable } from "@workspace/db/schema";
 import { desc, asc, count, sql, eq, like, or, inArray } from "drizzle-orm";
 import { getKbSessionStats } from "../lib/sessionStats";
-import { getVectorCacheSize } from "../lib/vectorSearch";
+import {
+  getVectorCacheSize,
+  getQueryCacheStats,
+  invalidateKnowledgeSearchCache,
+  removeVectorCacheEntry,
+} from "../lib/vectorSearch";
+import { getEmbeddingQueueStats } from "../lib/embeddingQueue";
 import { isEmbeddingModelLoaded } from "../lib/embeddings";
 
 const router: IRouter = Router();
@@ -14,9 +20,20 @@ let cleanedLegacySeedKnowledge = false;
 async function purgeLegacySeedKnowledgeEntries(): Promise<void> {
   if (cleanedLegacySeedKnowledge) return;
 
+  const [existing] = await db
+    .select({ total: count() })
+    .from(knowledgeTable)
+    .where(inArray(knowledgeTable.contextHash, LEGACY_SEED_CONTEXT_HASHES));
+
+  const shouldInvalidate = Number(existing?.total ?? 0) > 0;
+
   await db.delete(knowledgeTable).where(
     inArray(knowledgeTable.contextHash, LEGACY_SEED_CONTEXT_HASHES)
   );
+
+  if (shouldInvalidate) {
+    invalidateKnowledgeSearchCache({ resetVectorCache: true });
+  }
 
   cleanedLegacySeedKnowledge = true;
 }
@@ -62,9 +79,13 @@ router.get("/stats", async (_req, res) => {
 
 router.get("/session-stats", (_req, res) => {
   const stats = getKbSessionStats();
+  const queryCache = getQueryCacheStats();
+  const embeddingQueue = getEmbeddingQueueStats();
   res.json({
     ...stats,
     vectorCacheSize: getVectorCacheSize(),
+    queryCache,
+    embeddingQueue,
     modelLoaded: isEmbeddingModelLoaded(),
   });
 });
@@ -198,6 +219,10 @@ router.post("/import", async (req, res) => {
       }
     }
 
+    if (imported > 0) {
+      invalidateKnowledgeSearchCache();
+    }
+
     res.json({ success: true, imported, skipped, total: rawEntries.length });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -213,6 +238,7 @@ router.delete("/:id", async (req, res): Promise<void> => {
   }
   try {
     await db.delete(knowledgeTable).where(eq(knowledgeTable.id, id));
+    removeVectorCacheEntry(id);
     res.json({ success: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

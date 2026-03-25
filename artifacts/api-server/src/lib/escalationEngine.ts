@@ -5,8 +5,9 @@ import { buildEscalationPrompt, buildDialoguePrompt } from "./ollamaPrompts";
 import { ollamaClient } from "./ollamaClient";
 import { anonymizeForKB, anonymizeCodeForAI } from "./anonymize";
 import { recordEscalationAttempt, recordKbHit, recordKbMiss, recordKbSave } from "./sessionStats";
-import { addToCache, hybridSearch } from "./vectorSearch";
-import { embed } from "./embeddings";
+import { hybridSearch, invalidateKnowledgeSearchCache } from "./vectorSearch";
+import { enqueueKnowledgeEmbedding } from "./embeddingQueue";
+import { ProviderCircuitBreaker } from "./providerCircuitBreaker";
 import {
   buildRolePrompt,
   mapRoleToPersona,
@@ -24,9 +25,104 @@ function preview(text: string, max = 220): string {
   return text.replace(/\s+/g, " ").slice(0, max);
 }
 
+type EscalationProvider = "openrouter" | "groq" | "anthropic" | "ollama";
+
+const escalationProviderCircuit = new ProviderCircuitBreaker<EscalationProvider>({
+  openrouter: {
+    failureThreshold: 2,
+    baseCooldownMs: 45_000,
+    maxCooldownMs: 5 * 60_000,
+  },
+  groq: {
+    failureThreshold: 2,
+    baseCooldownMs: 60_000,
+    maxCooldownMs: 10 * 60_000,
+  },
+  anthropic: {
+    failureThreshold: 2,
+    baseCooldownMs: 60_000,
+    maxCooldownMs: 10 * 60_000,
+  },
+  ollama: {
+    failureThreshold: 2,
+    baseCooldownMs: 20_000,
+    maxCooldownMs: 3 * 60_000,
+  },
+});
+
+function canAttemptProvider(provider: EscalationProvider): boolean {
+  const gate = escalationProviderCircuit.shouldAllow(provider);
+  if (!gate.allowed) {
+    logEscalation(
+      `${provider}.circuit`,
+      `blocked=true state=${gate.state} retryAfterMs=${gate.retryAfterMs} reason=${gate.reason ?? "unknown"}`,
+    );
+    return false;
+  }
+
+  if (gate.state === "half-open") {
+    logEscalation(`${provider}.circuit`, "state=half-open trial=true");
+  }
+
+  return true;
+}
+
+function markProviderSuccess(provider: EscalationProvider): void {
+  const before = escalationProviderCircuit.snapshot(provider);
+  escalationProviderCircuit.onSuccess(provider);
+  const after = escalationProviderCircuit.snapshot(provider);
+
+  if (before.state !== "closed" || after.state !== "closed") {
+    logEscalation(
+      `${provider}.circuit`,
+      `state=${after.state} failures=${after.consecutiveFailures} openedCount=${after.openedCount}`,
+    );
+  }
+}
+
+function markProviderFailure(
+  provider: EscalationProvider,
+  reason: string,
+  options: { forceOpen?: boolean; cooldownMs?: number } = {},
+): void {
+  escalationProviderCircuit.onFailure(provider, reason, options);
+  const after = escalationProviderCircuit.snapshot(provider);
+  if (after.state === "open") {
+    logEscalation(
+      `${provider}.circuit`,
+      `state=open retryAfterMs=${after.remainingCooldownMs} failures=${after.consecutiveFailures} reason="${preview(reason, 140)}"`,
+    );
+  }
+}
+
+export function getEscalationProviderCircuitSnapshot(provider: EscalationProvider) {
+  return escalationProviderCircuit.snapshot(provider);
+}
+
+export function resetEscalationProviderCircuit(provider?: EscalationProvider): void {
+  escalationProviderCircuit.reset(provider);
+}
+
+export function canAttemptEscalationProviderForTests(provider: EscalationProvider): boolean {
+  return canAttemptProvider(provider);
+}
+
+export function markEscalationProviderFailureForTests(
+  provider: EscalationProvider,
+  reason: string,
+  options: { forceOpen?: boolean; cooldownMs?: number } = {},
+): void {
+  markProviderFailure(provider, reason, options);
+}
+
+export function markEscalationProviderSuccessForTests(provider: EscalationProvider): void {
+  markProviderSuccess(provider);
+}
+
 interface EscalationModelSettings {
   ollamaFastModel: string;
   ollamaPrimaryModel: string;
+  ollamaPrimaryModelExplicitlySet: boolean;
   groqModel: string;
   openrouterModel: string;
   anthropicModel: string;
@@ -45,6 +141,7 @@ const ESCALATION_MODEL_KEYS = [
 const ESCALATION_MODEL_DEFAULTS: EscalationModelSettings = {
   ollamaFastModel: DEFAULT_SETTINGS["ollama_fast_model"],
   ollamaPrimaryModel: DEFAULT_SETTINGS["ollama_primary_model"],
+  ollamaPrimaryModelExplicitlySet: false,
   groqModel: DEFAULT_SETTINGS["groq_model"],
   openrouterModel: DEFAULT_SETTINGS["openrouter_model"],
   anthropicModel: DEFAULT_SETTINGS["anthropic_model"],
@@ -67,9 +164,20 @@ async function readEscalationModelSettings(): Promise<EscalationModelSettings> {
     const map = new Map<string, string>();
     for (const row of rows) map.set(row.key, row.value);
 
+    const configuredPrimaryModel = map.get("ollama_primary_model")?.trim();
+    const resolvedPrimaryModel = configuredPrimaryModel && configuredPrimaryModel.length > 0
+      ? configuredPrimaryModel
+      : ESCALATION_MODEL_DEFAULTS.ollamaPrimaryModel;
+    const primaryModelExplicitlySet = Boolean(
+      configuredPrimaryModel
+      && configuredPrimaryModel.length > 0
+      && configuredPrimaryModel !== ESCALATION_MODEL_DEFAULTS.ollamaPrimaryModel
+    );
+
     return {
       ollamaFastModel: map.get("ollama_fast_model") ?? ESCALATION_MODEL_DEFAULTS.ollamaFastModel,
-      ollamaPrimaryModel: map.get("ollama_primary_model") ?? ESCALATION_MODEL_DEFAULTS.ollamaPrimaryModel,
+      ollamaPrimaryModel: resolvedPrimaryModel,
+      ollamaPrimaryModelExplicitlySet: primaryModelExplicitlySet,
       groqModel: normalizeGroqModel(map.get("groq_model") ?? ESCALATION_MODEL_DEFAULTS.groqModel),
       openrouterModel: map.get("openrouter_model") ?? ESCALATION_MODEL_DEFAULTS.openrouterModel,
       anthropicModel: map.get("anthropic_model") ?? ESCALATION_MODEL_DEFAULTS.anthropicModel,
@@ -87,6 +195,10 @@ async function callOpenRouter(req: EscalationRequest, attempts: string[], model:
   const key = process.env["OPENROUTER_API_KEY"];
   if (!key) {
     logEscalation("openrouter.skip", "reason=missing_key");
+    return null;
+  }
+
+  if (!canAttemptProvider("openrouter")) {
     return null;
   }
 
@@ -116,6 +228,7 @@ async function callOpenRouter(req: EscalationRequest, attempts: string[], model:
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       logEscalation("openrouter.response", `status=${res.status} body="${preview(body, 260)}"`);
+      markProviderFailure("openrouter", `http_${res.status}`, { forceOpen: res.status === 429 });
       return null;
     }
     const data = await res.json() as { choices?: Array<{ message: { content: string } }> };
@@ -123,12 +236,15 @@ async function callOpenRouter(req: EscalationRequest, attempts: string[], model:
     const parsed = parseJsonResponse(content);
     if (!parsed) {
       logEscalation("openrouter.parse", "status=failed");
+      markProviderFailure("openrouter", "parse_error");
       return null;
     }
+    markProviderSuccess("openrouter");
     logEscalation("openrouter.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "openrouter" };
   } catch {
     logEscalation("openrouter.error", "status=exception");
+    markProviderFailure("openrouter", "exception");
     return null;
   }
 }
@@ -188,6 +304,11 @@ export async function classifyFindingSeverity(params: {
     return fallback;
   }
 
+  if (!canAttemptProvider("groq")) {
+    logEscalation("severity.fallback", "reason=groq_circuit_open");
+    return fallback;
+  }
+
   try {
     const models = await readEscalationModelSettings();
     const prompt = [
@@ -215,6 +336,7 @@ export async function classifyFindingSeverity(params: {
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       logEscalation("severity.groq.response", `status=${res.status} body="${preview(body, 200)}"`);
+      markProviderFailure("groq", `severity_http_${res.status}`, { forceOpen: res.status === 429 });
       return fallback;
     }
 
@@ -225,13 +347,16 @@ export async function classifyFindingSeverity(params: {
     const severity = normalizeSeverityToken(firstWord) ?? normalizeSeverityToken(content);
     if (!severity) {
       logEscalation("severity.groq.parse", `status=failed raw="${preview(content, 80)}"`);
+      markProviderFailure("groq", "severity_parse_error");
       return fallback;
     }
 
+    markProviderSuccess("groq");
     logEscalation("severity.groq.success", `severity=${severity}`);
     return severity;
   } catch {
     logEscalation("severity.fallback", "reason=request_failed");
+    markProviderFailure("groq", "severity_exception");
     return fallback;
   }
 }
@@ -316,6 +441,10 @@ async function callGroq(req: EscalationRequest, attempts: string[], model: strin
     return null;
   }
 
+  if (!canAttemptProvider("groq")) {
+    return null;
+  }
+
   // Anonymize question/code for privacy
   const question = anonymizeForKB(req.question);
   const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
@@ -354,6 +483,7 @@ async function callGroq(req: EscalationRequest, attempts: string[], model: strin
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       logEscalation("groq.response", `status=${res.status} body="${preview(body, 260)}"`);
+      markProviderFailure("groq", `http_${res.status}`, { forceOpen: res.status === 429 });
       return null;
     }
     const data = await res.json() as { choices?: Array<{ message: { content: string } }> };
@@ -364,6 +494,7 @@ async function callGroq(req: EscalationRequest, attempts: string[], model: strin
         if (persona === "scribe") {
           const scribe = structured as ScribeRecommendation;
           const answer = `Prioritize tests for ${scribe.functionName}: ${scribe.reason}`;
+          markProviderSuccess("groq");
           logEscalation("groq.success", `role=${persona} confidence=${scribe.confidence.toFixed(2)} response="${preview(answer)}"`);
           return {
             answer,
@@ -379,6 +510,7 @@ async function callGroq(req: EscalationRequest, attempts: string[], model: strin
 
         const finding = structured as BugStyleFinding;
         const answer = finding.finding ?? "No concrete bug found.";
+        markProviderSuccess("groq");
         logEscalation("groq.success", `role=${persona} confidence=${finding.confidence.toFixed(2)} response="${preview(answer)}"`);
         return {
           answer,
@@ -402,12 +534,15 @@ async function callGroq(req: EscalationRequest, attempts: string[], model: strin
     const parsed = parseJsonResponse(content);
     if (!parsed) {
       logEscalation("groq.parse", "status=failed");
+      markProviderFailure("groq", "parse_error");
       return null;
     }
+    markProviderSuccess("groq");
     logEscalation("groq.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "groq" };
   } catch {
     logEscalation("groq.error", "status=exception");
+    markProviderFailure("groq", "exception");
     return null;
   }
 }
@@ -416,6 +551,10 @@ async function callAnthropic(req: EscalationRequest, attempts: string[], model: 
   const key = process.env["ANTHROPIC_API_KEY"];
   if (!key) {
     logEscalation("anthropic.skip", "reason=missing_key");
+    return null;
+  }
+
+  if (!canAttemptProvider("anthropic")) {
     return null;
   }
 
@@ -444,6 +583,7 @@ async function callAnthropic(req: EscalationRequest, attempts: string[], model: 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       logEscalation("anthropic.response", `status=${res.status} body="${preview(body, 260)}"`);
+      markProviderFailure("anthropic", `http_${res.status}`, { forceOpen: res.status === 429 });
       return null;
     }
     const data = await res.json() as { content?: Array<{ text: string }> };
@@ -451,21 +591,39 @@ async function callAnthropic(req: EscalationRequest, attempts: string[], model: 
     const parsed = parseJsonResponse(content);
     if (!parsed) {
       logEscalation("anthropic.parse", "status=failed");
+      markProviderFailure("anthropic", "parse_error");
       return null;
     }
+    markProviderSuccess("anthropic");
     logEscalation("anthropic.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "anthropic" };
   } catch {
     logEscalation("anthropic.error", "status=exception");
+    markProviderFailure("anthropic", "exception");
     return null;
   }
 }
 
 async function callOllama(req: EscalationRequest, attempts: string[], model: string): Promise<EscalationResult | null> {
+  if (!canAttemptProvider("ollama")) {
+    return null;
+  }
+
   try {
     const available = await ollamaClient.isAvailable();
     if (!available) {
       logEscalation("ollama.skip", "reason=unavailable");
+      markProviderFailure("ollama", "unavailable", { forceOpen: true });
+      return null;
+    }
+
+    const resolvedModel = model.trim().length > 0
+      ? model
+      : await ollamaClient.selectBestModel();
+
+    if (!resolvedModel) {
+      logEscalation("ollama.skip", "reason=no_model_available");
+      markProviderFailure("ollama", "no_model_available", { forceOpen: true });
       return null;
     }
 
@@ -473,9 +631,9 @@ async function callOllama(req: EscalationRequest, attempts: string[], model: str
     const question = anonymizeForKB(req.question);
     const codeSnippet = anonymizeCodeForAI(req.codeSnippet);
     const { system, prompt } = buildEscalationPrompt(question, codeSnippet, attempts);
-    logEscalation("ollama.request", `model=${model} language=${req.language}`);
+    logEscalation("ollama.request", `model=${resolvedModel} language=${req.language}`);
     const text = await ollamaClient.generate({
-      model,
+      model: resolvedModel,
       system,
       prompt,
       temperature: 0.3,
@@ -485,12 +643,15 @@ async function callOllama(req: EscalationRequest, attempts: string[], model: str
     const parsed = parseJsonResponse(text);
     if (!parsed) {
       logEscalation("ollama.parse", "status=failed");
+      markProviderFailure("ollama", "parse_error");
       return null;
     }
+    markProviderSuccess("ollama");
     logEscalation("ollama.success", `confidence=${parsed.confidence.toFixed(2)} response="${preview(parsed.answer)}"`);
     return { ...parsed, source: "ollama" };
   } catch {
     logEscalation("ollama.error", "status=exception");
+    markProviderFailure("ollama", "exception");
     return null;
   }
 }
@@ -525,28 +686,15 @@ async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationRes
         .set({ useCount: newUseCount, answer: result.answer.slice(0, 2000), confidence: newConfidence, lastUsed: new Date().toISOString(), qualityScore: qs })
         .where(eq(knowledgeTable.id, bestMatch.id));
 
-      // Backfill a vector immediately if this reused row predates embeddings.
-      if (!bestMatch.embedding) {
-        try {
-          const text = `${bestMatch.question} ${result.answer}`.slice(0, 512);
-          const vector = await embed(text);
-          await db.update(knowledgeTable)
-            .set({ embedding: JSON.stringify(vector) })
-            .where(eq(knowledgeTable.id, bestMatch.id));
+      invalidateKnowledgeSearchCache();
 
-          const updatedEntry = {
-            ...bestMatch,
-            answer: result.answer.slice(0, 2000),
-            confidence: newConfidence,
-            useCount: newUseCount,
-            qualityScore: qs,
-            embedding: JSON.stringify(vector),
-            lastUsed: new Date().toISOString(),
-          };
-          addToCache(bestMatch.id, vector, updatedEntry);
-        } catch (error) {
-          console.warn("[Embeddings] Failed to backfill reused KB entry:", error);
-        }
+      if (!bestMatch.embedding) {
+        enqueueKnowledgeEmbedding({
+          knowledgeId: bestMatch.id,
+          text: `${bestMatch.question} ${result.answer}`,
+          reason: "reuse-backfill",
+          skipIfPresent: true,
+        });
       }
 
       recordKbSave();
@@ -568,24 +716,16 @@ async function saveToKnowledgeBase(req: EscalationRequest, result: EscalationRes
       qualityScore: qs,
     }).returning({ id: knowledgeTable.id });
 
+    invalidateKnowledgeSearchCache();
+
     const insertedId = inserted[0]?.id;
     if (insertedId) {
-      try {
-        const text = `${req.question} ${result.answer}`.slice(0, 512);
-        const vector = await embed(text);
-
-        await db.update(knowledgeTable)
-          .set({ embedding: JSON.stringify(vector) })
-          .where(eq(knowledgeTable.id, insertedId));
-
-        const [createdEntry] = await db.select().from(knowledgeTable).where(eq(knowledgeTable.id, insertedId)).limit(1);
-        if (createdEntry) {
-          addToCache(insertedId, vector, createdEntry);
-          console.log("[KB] New entry embedded and cached");
-        }
-      } catch (error) {
-        console.warn("[Embeddings] Failed to embed new KB entry:", error);
-      }
+      enqueueKnowledgeEmbedding({
+        knowledgeId: insertedId,
+        text: `${req.question} ${result.answer}`,
+        reason: "insert",
+        skipIfPresent: true,
+      });
     }
 
     recordKbSave();
@@ -649,7 +789,8 @@ export async function escalate(req: EscalationRequest): Promise<EscalationResult
     return anthropic;
   }
 
-  const ollama = await callOllama(req, attempts, models.ollamaPrimaryModel);
+  const ollamaModel = models.ollamaPrimaryModelExplicitlySet ? models.ollamaPrimaryModel : "";
+  const ollama = await callOllama(req, attempts, ollamaModel);
   if (ollama) {
     await saveToKnowledgeBase(req, ollama);
     logEscalation("complete", "source=ollama");
@@ -685,8 +826,16 @@ export async function generateDialogue(params: {
   try {
     const available = await ollamaClient.isAvailable();
     if (available) {
+      const dialogueModel = models.ollamaPrimaryModelExplicitlySet
+        ? models.ollamaFastModel
+        : await ollamaClient.selectBestModel();
+
+      if (!dialogueModel) {
+        throw new Error("No Ollama model available for dialogue");
+      }
+
       const text = await ollamaClient.generate({
-        model: models.ollamaFastModel,
+        model: dialogueModel,
         system,
         prompt,
         temperature: 0.3,

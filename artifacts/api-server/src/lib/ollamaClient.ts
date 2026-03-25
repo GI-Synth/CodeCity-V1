@@ -1,8 +1,52 @@
-const OLLAMA_BASE = process.env["OLLAMA_URL"] ?? "http://localhost:11434";
+import { loadEnvFile } from "./loadEnv";
+import { pickBestModel } from "./ollamaModelSelection";
+
 const MAX_CONCURRENT = 8;
 const TIMEOUT_MS = 2000;
+const BEST_MODEL_CACHE_MS = 60_000;
+
+const MODEL_PRIORITY = [
+  "deepseek-coder-v2:16b",
+  "deepseek-coder:6.7b",
+  "codellama:13b",
+  "codellama:7b",
+] as const;
+
+interface OllamaTagsResponse {
+  models?: Array<{ name: string }>;
+}
+
+interface BestModelCache {
+  value: string | null;
+  expiresAt: number;
+}
+
+export interface OllamaConnectionStatus {
+  host: string;
+  reachable: boolean;
+  models: string[];
+  latencyMs: number;
+}
 
 let semaphore = 0;
+let bestModelCache: BestModelCache = {
+  value: null,
+  expiresAt: 0,
+};
+
+function normalizeHost(rawHost: string): string {
+  return rawHost.replace(/\/+$/, "");
+}
+
+function getOllamaHost(): string {
+  // Ensure .env has been loaded even if this module is imported before startup bootstrap.
+  loadEnvFile();
+  const configuredHost = process.env["OLLAMA_HOST"]?.trim();
+  const host = configuredHost && configuredHost.length > 0
+    ? configuredHost
+    : "http://localhost:11434";
+  return normalizeHost(host);
+}
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
@@ -15,24 +59,66 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 }
 
 export const ollamaClient = {
-  async isAvailable(): Promise<boolean> {
+  getHost(): string {
+    return getOllamaHost();
+  },
+
+  async testConnection(): Promise<OllamaConnectionStatus> {
+    const host = getOllamaHost();
+    const startedAt = Date.now();
+
     try {
-      const res = await fetchWithTimeout(`${OLLAMA_BASE}/api/tags`, {}, TIMEOUT_MS);
-      return res.ok;
+      const res = await fetchWithTimeout(`${host}/api/tags`, {}, TIMEOUT_MS);
+      const latencyMs = Date.now() - startedAt;
+      if (!res.ok) {
+        return {
+          host,
+          reachable: false,
+          models: [],
+          latencyMs,
+        };
+      }
+
+      const data = await res.json() as OllamaTagsResponse;
+      return {
+        host,
+        reachable: true,
+        models: (data.models ?? []).map((model) => model.name),
+        latencyMs,
+      };
     } catch {
-      return false;
+      return {
+        host,
+        reachable: false,
+        models: [],
+        latencyMs: Date.now() - startedAt,
+      };
     }
   },
 
+  async isAvailable(): Promise<boolean> {
+    const status = await this.testConnection();
+    return status.reachable;
+  },
+
   async listModels(): Promise<string[]> {
-    try {
-      const res = await fetchWithTimeout(`${OLLAMA_BASE}/api/tags`, {}, TIMEOUT_MS);
-      if (!res.ok) return [];
-      const data = await res.json() as { models?: Array<{ name: string }> };
-      return (data.models ?? []).map(m => m.name);
-    } catch {
-      return [];
+    const status = await this.testConnection();
+    return status.reachable ? status.models : [];
+  },
+
+  async selectBestModel(forceRefresh = false): Promise<string | null> {
+    const now = Date.now();
+    if (!forceRefresh && bestModelCache.expiresAt > now) {
+      return bestModelCache.value;
     }
+
+    const models = await this.listModels();
+    const selected = models.length > 0 ? pickBestModel(models, MODEL_PRIORITY) : null;
+    bestModelCache = {
+      value: selected,
+      expiresAt: now + BEST_MODEL_CACHE_MS,
+    };
+    return selected;
   },
 
   async checkModel(model: string): Promise<boolean> {
@@ -57,7 +143,8 @@ export const ollamaClient = {
 
     semaphore++;
     try {
-      const res = await fetch(`${OLLAMA_BASE}/api/generate`, {
+      const ollamaHost = getOllamaHost();
+      const res = await fetch(`${ollamaHost}/api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

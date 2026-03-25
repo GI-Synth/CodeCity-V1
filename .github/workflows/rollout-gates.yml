@@ -1,0 +1,74 @@
+name: Rollout Gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rollout-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: API tests
+        run: pnpm --filter @workspace/api-server run test
+
+      - name: Start API server
+        run: |
+          ENABLE_SIMULATION_LOOP=false PORT=3000 pnpm --filter @workspace/api-server run dev > /tmp/api-server.log 2>&1 &
+          echo "API_SERVER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for health endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:3000/api/healthz" > /dev/null; then
+              echo "API is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "API did not become healthy in time"
+          exit 1
+
+      - name: Check rollout gates
+        run: pnpm run check:rollout-gates -- --hours=24
+
+      - name: Tail API logs
+        if: always()
+        run: |
+          echo "=== /tmp/api-server.log (tail -n 200) ==="
+          if [ -f /tmp/api-server.log ]; then
+            tail -n 200 /tmp/api-server.log
+          else
+            echo "No API log file found"
+          fi
+
+      - name: Stop API server
+        if: always()
+        run: |
+          if [ -n "${API_SERVER_PID:-}" ]; then
+            kill "$API_SERVER_PID" || true
+            wait "$API_SERVER_PID" 2>/dev/null || true
+          fi

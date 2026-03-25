@@ -7,6 +7,7 @@ import NotFound from "@/pages/not-found";
 import { Landing } from "@/pages/Landing";
 import { CityView } from "@/pages/CityView";
 import { Agents } from "@/pages/Agents";
+import { AgentChat } from "@/pages/AgentChat";
 import { KnowledgeBase } from "@/pages/KnowledgeBase";
 import { SharedCity } from "@/pages/SharedCity";
 import { Leaderboard } from "@/pages/Leaderboard";
@@ -28,6 +29,7 @@ function Router() {
       <Route path="/" component={Landing} />
       <Route path="/city" component={CityView} />
       <Route path="/agents" component={Agents} />
+      <Route path="/agent-chat" component={AgentChat} />
       <Route path="/knowledge" component={KnowledgeBase} />
       <Route path="/leaderboard" component={Leaderboard} />
       <Route path="/metrics" component={Metrics} />
