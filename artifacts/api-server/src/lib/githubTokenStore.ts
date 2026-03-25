@@ -12,7 +12,9 @@ const TOKEN_CACHE_TTL_MS = 60_000;
 let cachedDbToken: { token: string | null; expiresAtMs: number } | null = null;
 
 function deriveMachineKey(): Buffer {
-  return crypto.createHash("sha256").update(os.hostname()).digest();
+  const appSecret = process.env["APP_SECRET"] ?? "";
+  const material = `${os.hostname()}:${appSecret}:codecity-token-key`;
+  return crypto.createHash("sha256").update(material).digest();
 }
 
 function normalizeToken(token: string | null | undefined): string {

@@ -184,7 +184,11 @@ function shutdown(signal: string): void {
     console.log("HTTP server closed. Goodbye.");
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 5000);
+  // If server.close() hangs, force exit but still succeed (0) since cleanup is done
+  setTimeout(() => {
+    console.warn("Graceful shutdown timed out, forcing exit.");
+    process.exit(0);
+  }, 5000).unref();
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

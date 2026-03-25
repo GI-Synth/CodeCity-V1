@@ -21,17 +21,21 @@ RUN pnpm --filter @workspace/api-server run build
 RUN pnpm --filter @workspace/software-city run build
 
 FROM node:20-slim AS runner
+RUN addgroup --system --gid 1001 appgroup && \
+    adduser --system --uid 1001 --ingroup appgroup appuser
 WORKDIR /app
 
 COPY --from=builder /app/artifacts/api-server/dist ./dist/
 COPY --from=builder /app/artifacts/software-city/dist /public/
 COPY --from=builder /app/node_modules ./node_modules/
 
-RUN mkdir -p data
+RUN mkdir -p data && chown appuser:appgroup data
 
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV DB_PATH=/app/data/city.db
+
+USER appuser
 
 EXPOSE 8080
 

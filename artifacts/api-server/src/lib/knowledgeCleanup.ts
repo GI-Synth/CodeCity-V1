@@ -193,6 +193,8 @@ async function recountAgentBugCountersFromSourceEvents(): Promise<number> {
   }
 
   for (const [agentId, bugsFound] of byAgentId.entries()) {
+    // Batch agent updates in a single transaction would be ideal but individual
+    // updates are acceptable given the small cardinality (typically < 10 agents)
     await db.update(agentsTable).set({ bugsFound }).where(eq(agentsTable.id, agentId));
   }
 

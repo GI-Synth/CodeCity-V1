@@ -33,6 +33,23 @@ const DANGEROUS_TOKENS = new Set([
   "chown",
 ]);
 
+/** Env vars stripped from child processes to avoid leaking secrets. */
+const SENSITIVE_ENV_KEYS = new Set([
+  "GROQ_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+  "CEREBRAS_API_KEY", "GOOGLE_AI_KEY", "GITHUB_TOKEN", "GH_TOKEN",
+  "API_KEY", "DATABASE_URL", "DB_PATH", "SECRET", "APP_SECRET",
+]);
+
+function sanitizedEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (SENSITIVE_ENV_KEYS.has(key) || key.endsWith("_SECRET") || key.endsWith("_KEY")) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
 function clampTimeout(timeoutMs: number | undefined): number {
   if (!Number.isFinite(timeoutMs)) return DEFAULT_TIMEOUT_MS;
   const numeric = Number(timeoutMs);
@@ -82,7 +99,11 @@ function allowedByPolicy(tokens: string[]): { allowed: boolean; reason?: string 
 
   if (executable === "git") {
     const gitAction = tokens[1] ?? "";
-    if (["status", "diff", "log", "show", "rev-parse", "branch"].includes(gitAction)) {
+    if (["status", "diff", "log", "rev-parse", "branch"].includes(gitAction)) {
+      return { allowed: true };
+    }
+    // git show only for commit diffs, not arbitrary file content
+    if (gitAction === "show" && tokens.length >= 3 && /^[0-9a-f]{6,40}$/i.test(tokens[2])) {
       return { allowed: true };
     }
     return { allowed: false, reason: "only read-only git commands are allowed" };
@@ -163,7 +184,7 @@ export async function runAlchemistCommand(params: {
 
     const child = spawn(executable, args, {
       cwd: params.cwd ?? process.cwd(),
-      env: process.env,
+      env: sanitizedEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
 

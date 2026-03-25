@@ -15,6 +15,11 @@ if (!fs.existsSync(dataDir)) {
 
 const client = createClient({ url: `file:${dbPath}` });
 
+// Enable WAL mode for better concurrent read/write, busy timeout, and FK constraints
+client.execute("PRAGMA journal_mode = WAL").catch(() => {});
+client.execute("PRAGMA busy_timeout = 5000").catch(() => {});
+client.execute("PRAGMA foreign_keys = ON").catch(() => {});
+
 export const db = drizzle(client, { schema });
 
 function isDuplicateColumnError(error: unknown, columnName: string): boolean {

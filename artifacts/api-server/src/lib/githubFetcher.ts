@@ -35,11 +35,24 @@ async function getDefaultBranch(
 }
 
 export async function fetchGithubRepo(repoUrl: string, branch?: string, token?: string): Promise<{ files: FileInfo[]; repoName: string }> {
-  // Parse GitHub URL
-  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/|$)/);
-  if (!match) throw new Error("Invalid GitHub URL. Expected format: https://github.com/owner/repo");
+  // Parse and validate GitHub URL (SSRF prevention — only github.com allowed)
+  let parsed: URL;
+  try {
+    parsed = new URL(repoUrl);
+  } catch {
+    throw new Error("Invalid GitHub URL. Expected format: https://github.com/owner/repo");
+  }
 
-  const [, owner, repo] = match;
+  if (parsed.hostname !== "github.com") {
+    throw new Error("Only github.com repositories are supported");
+  }
+
+  const pathParts = parsed.pathname.replace(/\.git$/, "").split("/").filter(Boolean);
+  if (pathParts.length < 2) {
+    throw new Error("Invalid GitHub URL. Expected format: https://github.com/owner/repo");
+  }
+
+  const [owner, repo] = pathParts;
   const repoName = `${owner}/${repo}`;
 
   const baseHeaders: Record<string, string> = {

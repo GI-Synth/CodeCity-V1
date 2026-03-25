@@ -4,6 +4,23 @@ import { existsSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
 
+/** Env vars stripped from child processes spawned for test execution. */
+const SENSITIVE_ENV_KEYS = new Set([
+  "GROQ_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+  "CEREBRAS_API_KEY", "GOOGLE_AI_KEY", "GITHUB_TOKEN", "GH_TOKEN",
+  "API_KEY", "DATABASE_URL", "DB_PATH", "SECRET", "APP_SECRET",
+]);
+
+function sanitizedEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (SENSITIVE_ENV_KEYS.has(key) || key.endsWith("_SECRET") || key.endsWith("_KEY")) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
 export interface TestError {
   message: string;
   line?: number;
@@ -100,7 +117,7 @@ function runProcess(cmd: string, args: string[], timeoutMs: number): Promise<{ s
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
-    const proc = spawn(cmd, args, { shell: false, timeout: timeoutMs });
+    const proc = spawn(cmd, args, { shell: false, timeout: timeoutMs, env: sanitizedEnv() });
 
     proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
     proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
@@ -138,7 +155,7 @@ export class TestExecutor {
   }): Promise<TestExecutionResult> {
     const start = Date.now();
     const timeoutMs = params.timeoutMs ?? 15000;
-    const uuid = randomUUID().slice(0, 8);
+    const uuid = randomUUID();
     const ext = params.language === "python" ? "py" : params.language === "javascript" ? "js" : "ts";
     const tempDir = "/tmp";
     const tempFile = join(tempDir, `sc_test_${uuid}.${ext}`);

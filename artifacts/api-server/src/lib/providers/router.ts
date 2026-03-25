@@ -227,7 +227,7 @@ async function callProvider(
         console.warn(`[ProviderRouter] google error: ${res.status}`);
         return null;
       }
-      const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+      const data = (await res.json().catch(() => ({}))) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
       content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     } else {
       // OpenAI-compatible (groq, cerebras, openrouter, ollama, apifreellm)
@@ -263,7 +263,7 @@ async function callProvider(
         console.warn(`[ProviderRouter] ${config.name} error: ${res.status}`);
         return null;
       }
-      const data = await res.json() as {
+      const data = (await res.json().catch(() => ({}))) as {
         choices?: { message?: { content?: string | null } }[];
         usage?: { total_tokens?: number };
       };
@@ -288,7 +288,10 @@ async function callProvider(
   } catch (err) {
     state.consecutiveErrors++;
     state.totalErrors++;
-    console.warn(`[ProviderRouter] ${config.name} threw error:`, (err as Error).message);
+    const msg = (err as Error).message ?? "unknown";
+    // Redact anything that looks like an API key in error messages
+    const safeMsg = msg.replace(/(?:sk-|gsk_|key-|Bearer\s+)\S+/gi, "[REDACTED]");
+    console.warn(`[ProviderRouter] ${config.name} threw error:`, safeMsg);
     return null;
   }
 }
