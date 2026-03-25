@@ -221,6 +221,9 @@ importers:
       helmet:
         specifier: ^8.1.0
         version: 8.1.0
+      js-interpreter:
+        specifier: ^6.0.1
+        version: 6.0.1
       morgan:
         specifier: ^1.10.1
         version: 1.10.1
@@ -3033,6 +3036,10 @@ packages:
 
   js-base64@3.7.8:
     resolution: {integrity: sha512-hNngCeKxIUQiEUN3GPJOkz4wF/YvdUdbNL9hsBcMQTkKzboD7T/q3OYOuuPZLUE6dBxSGpwhk5mwuDud7JVAow==}
+
+  js-interpreter@6.0.1:
+    resolution: {integrity: sha512-XfPw6y1FzFwHcGYB62jzPUoSCoCSIL+dICMjRJx6f8V/AmTczeodDOaVxWc4GU4p7qeN7ieuMXNKxScoaBkJ6A==}
+    hasBin: true
 
   js-tokens@10.0.0:
     resolution: {integrity: sha512-lM/UBzQmfJRo9ABXbPWemivdCW8V2G8FHaHdypQaIy523snUjog0W71ayWXTjiR+ixeMyVHN2XcpnTd/liPg/Q==}
@@ -6621,6 +6628,10 @@ snapshots:
   jiti@2.6.1: {}
 
   js-base64@3.7.8: {}
+
+  js-interpreter@6.0.1:
+    dependencies:
+      minimist: 1.2.8
 
   js-tokens@10.0.0: {}
 

@@ -189,6 +189,14 @@ class WSServerManager {
     });
   }
 
+  broadcastBuildingStatusUpdate(buildingId: string, status: string): void {
+    this.enqueue({
+      type: "building_status_update",
+      payload: { buildingId, status },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   closeAll(): void {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);

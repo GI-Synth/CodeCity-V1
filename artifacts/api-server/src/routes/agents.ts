@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
-import { agentsTable, eventsTable, reposTable, settingsTable, DEFAULT_SETTINGS } from "@workspace/db/schema";
+import { agentsTable, eventsTable, reposTable, settingsTable, DEFAULT_SETTINGS, executionResultsTable } from "@workspace/db/schema";
 import { eq, desc } from "drizzle-orm";
 import { createAgent } from "../lib/agentEngine";
 import { generateDialogue, escalate } from "../lib/escalationEngine";
@@ -29,6 +29,7 @@ import {
 } from "../lib/learningReinforcement";
 import { recordReinforcementEvent } from "../lib/reinforcementTelemetry";
 import { broadcastFinding } from "../lib/agentMessageBus";
+import { runInSandbox, isSandboxable } from "../lib/jsSandbox";
 
 const router: IRouter = Router();
 
@@ -1096,21 +1097,50 @@ router.post("/:agentId/run-tests", async (req, res): Promise<void> => {
       testCode = buildFallbackSanityTest(building.name);
     }
 
-    let result = await testExecutor.executeTests({
-      targetFile: building.filePath,
-      testCode,
-      language: building.language,
-      timeoutMs: 15000,
-    });
+    let result: { passed: number; failed: number; errors: Array<{ message: string; line?: number; stack?: string }>; coverage: number | null; durationMs: number; rawOutput: string };
+    const startedAt = new Date().toISOString();
 
-    // If AI output was syntactically invalid, retry with deterministic fallback tests.
-    if (usedAiGeneratedTest && hasHarnessFailure(result.errors)) {
+    // Use JS sandbox for sandboxable code (describe/it/test/expect patterns)
+    if (isSandboxable(testCode)) {
+      const sandboxResult = await runInSandbox(testCode, 10000);
+      result = {
+        passed: sandboxResult.passed,
+        failed: sandboxResult.failed,
+        errors: sandboxResult.errors,
+        coverage: null,
+        durationMs: sandboxResult.durationMs,
+        rawOutput: sandboxResult.logs.join("\n"),
+      };
+
+      const finishedAt = new Date().toISOString();
+      await db.insert(executionResultsTable).values({
+        command: `sandbox:${building.filePath}`,
+        status: sandboxResult.failed > 0 ? "failure" : sandboxResult.timedOut ? "timeout" : "success",
+        exitCode: sandboxResult.failed > 0 ? 1 : 0,
+        stdout: sandboxResult.logs.join("\n").slice(0, 4000),
+        stderr: sandboxResult.errors.map(e => e.message).join("\n").slice(0, 2000),
+        durationMs: sandboxResult.durationMs,
+        startedAt,
+        finishedAt,
+        triggeredBy: "sandbox",
+      }).catch(() => {});
+    } else {
       result = await testExecutor.executeTests({
         targetFile: building.filePath,
-        testCode: buildFallbackSanityTest(building.name),
+        testCode,
         language: building.language,
         timeoutMs: 15000,
       });
+
+      // If AI output was syntactically invalid, retry with deterministic fallback tests.
+      if (usedAiGeneratedTest && hasHarnessFailure(result.errors)) {
+        result = await testExecutor.executeTests({
+          targetFile: building.filePath,
+          testCode: buildFallbackSanityTest(building.name),
+          language: building.language,
+          timeoutMs: 15000,
+        });
+      }
     }
 
     const confirmedFailedFindings = isSourceFile(building.filePath) ? result.failed : 0;

@@ -4,10 +4,12 @@ import { and, desc, eq } from "drizzle-orm";
 import { basename, extname } from "node:path";
 import { classifyFindingSeverity, type FindingSeverity } from "./escalationEngine";
 import { isGenericFinding as isGenericFindingHeuristic } from "./smartAgents";
+import { fileGitHubIssueForFinding } from "./githubIssues";
 
 const REPORTABLE_SOURCE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
-const MIN_BUG_CONFIDENCE = 0.72;
-const MIN_OBSERVATION_CONFIDENCE = 0.55;
+const _envThreshold = Number(process.env["FINDING_CONFIDENCE_THRESHOLD"]);
+const MIN_BUG_CONFIDENCE = Number.isFinite(_envThreshold) && _envThreshold > 0 ? _envThreshold : 0.65;
+const MIN_OBSERVATION_CONFIDENCE = MIN_BUG_CONFIDENCE - 0.15;
 
 // Asynchronously generates a 1–2 sentence fix suggestion for a confirmed
 // HIGH/CRITICAL finding and stores it in the findings table `metadata` field.
@@ -463,6 +465,15 @@ export async function classifyAndPersistBugFinding(input: PersistFindingInput): 
         buildingId: input.buildingId ?? null,
         buildingName: input.buildingName ?? null,
         sourceEventId: eventId,
+      }).catch(() => {});
+
+      // Optionally file a GitHub issue if ENABLE_GITHUB_ISSUES=true
+      fileGitHubIssueForFinding({
+        filePath: normalizedPath,
+        findingText: input.findingText,
+        severity,
+        agentName: input.agentName,
+        codeReference: input.codeReference,
       }).catch(() => {});
     });
   }

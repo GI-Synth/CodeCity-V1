@@ -21,6 +21,7 @@ import agentChatRouter from "./agentChat";
 import logsRouter from "./logs";
 import mayorRouter from "./mayor";
 import providersRouter from "./providers";
+import findingsRouter from "./findings";
 
 const router: IRouter = Router();
 
@@ -48,5 +49,6 @@ router.use("/agent-chat", agentChatRouter);
 router.use("/logs", logsRouter);
 router.use("/mayor", mayorRouter);
 router.use("/providers", providersRouter);
+router.use("/findings", findingsRouter);
 
 export default router;

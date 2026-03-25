@@ -1,9 +1,12 @@
 import { type NpcAgent } from "./types";
 import { db } from "@workspace/db";
-import { agentsTable, eventsTable } from "@workspace/db/schema";
+import { agentsTable, eventsTable, findingsTable } from "@workspace/db/schema";
 import { wsServer } from "./wsServer";
 import type { CityLayout, Building } from "./types";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, ne } from "drizzle-orm";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { analyzeBuildingForAgent, type SmartAnalysisResult } from "./smartAgentWorkflow";
 import { computeRank } from "./agentRanking";
 import {
@@ -17,6 +20,32 @@ import {
   recordDiscardedFindingEvent,
   recordObservationEvent,
 } from "./findingQuality";
+
+const _agentEngineSelf = fileURLToPath(import.meta.url);
+const _dataDir = resolve(dirname(_agentEngineSelf), "../../../../data");
+const KB_CHECKPOINT_PATH = resolve(_dataDir, "agent-kb-checkpoint.json");
+
+type KbCheckpoint = Record<string, { recentFindings: string[] }>;
+
+async function loadKbCheckpoint(): Promise<KbCheckpoint> {
+  try {
+    const raw = await readFile(KB_CHECKPOINT_PATH, "utf-8");
+    return JSON.parse(raw) as KbCheckpoint;
+  } catch {
+    return {};
+  }
+}
+
+async function saveKbCheckpoint(states: Map<string, AgentState>): Promise<void> {
+  const checkpoint: KbCheckpoint = {};
+  for (const [id, state] of states) {
+    checkpoint[id] = { recentFindings: state.recentFindings.slice(-120) };
+  }
+  try {
+    await mkdir(_dataDir, { recursive: true });
+    await writeFile(KB_CHECKPOINT_PATH, JSON.stringify(checkpoint, null, 2), "utf-8");
+  } catch { /* non-fatal */ }
+}
 
 function emitThought(agentId: string, thought: string, duration = 3000): void {
   wsServer.broadcastThought(agentId, thought, duration);
@@ -59,6 +88,7 @@ interface AgentState {
 
 const agentStates = new Map<string, AgentState>();
 let currentLayout: CityLayout | null = null;
+let _kbCheckpoint: KbCheckpoint = {};
 
 const activeTargets = new Set<string>();
 const stoppedAgents = new Set<string>();
@@ -263,7 +293,19 @@ async function runAgentCycle(agentId: string): Promise<void> {
       const rehydratedFindings = recentBugEvents
         .filter(e => e.filePath && e.findingText)
         .map(e => `${e.filePath}: ${(e.findingText ?? "").slice(0, 120)}`);
-      state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: rehydratedFindings };
+
+      // Also try to rehydrate from the faster disk checkpoint (catches in-memory findings
+      // that weren't yet flushed as DB events on the previous run).
+      const checkpoint = _kbCheckpoint[agentId];
+      const checkpointFindings = checkpoint?.recentFindings ?? [];
+      // Merge: deduplicate, prefer DB as authoritative source, add checkpoint extras
+      const mergedSet = new Set([...rehydratedFindings]);
+      for (const f of checkpointFindings) {
+        if (!mergedSet.has(f)) mergedSet.add(f);
+      }
+      const mergedFindings = [...mergedSet].slice(-120);
+
+      state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: mergedFindings };
       agentStates.set(agentId, state);
     }
 
@@ -297,10 +339,30 @@ async function runAgentCycle(agentId: string): Promise<void> {
     await db.update(agentsTable).set({ currentTask: "analyzing" }).where(eq(agentsTable.id, agentId));
     emitThought(agentId, `Running ${mapRoleToPersona(agentRow.role)} analysis on ${target.name}...`);
 
+    // Gather peer findings for the same building to inject as context
+    const peerFindings = await db
+      .select({ finding: findingsTable.finding, severity: findingsTable.severity, agentName: findingsTable.agentName })
+      .from(findingsTable)
+      .where(and(
+        eq(findingsTable.buildingId, target.id),
+        eq(findingsTable.classification, "bug"),
+        ne(findingsTable.agentId, agentId),
+      ))
+      .orderBy(desc(findingsTable.createdAt))
+      .limit(10)
+      .catch(() => []);
+
+    const peerContextSuffix = peerFindings.length > 0
+      ? "\n\nPEER AGENT FINDINGS FOR THIS FILE:\n"
+        + peerFindings
+          .map(f => `- [${f.severity ?? "?"}] ${(f.agentName ?? "peer")}: ${(f.finding ?? "").slice(0, 120)}`)
+          .join("\n")
+      : "";
+
     const primaryResult = await analyzeBuildingForAgent({
       agentRow,
       building: target,
-      context: `Autonomous cycle for ${agentRow.name}`,
+      context: `Autonomous cycle for ${agentRow.name}${peerContextSuffix}`,
     });
 
     let bugsFound = primaryResult.bugsFound;
@@ -310,28 +372,72 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
     if (primaryResult.classification === "bug") {
       if (primaryResult.findingText && primaryResult.issueType && primaryResult.codeReference) {
-        const persisted = await classifyAndPersistBugFinding({
-          agentId,
-          agentName: agentRow.name,
-          buildingId: target.id,
-          buildingName: target.name,
-          filePath: target.filePath,
-          findingText: primaryResult.findingText,
-          issueType: primaryResult.issueType,
-          confidence: primaryResult.finalConfidence,
-          codeReference: primaryResult.codeReference,
-        });
+        // Mandatory peer consultation for HIGH/CRITICAL findings before persisting
+        const needsConsult =
+          (primaryResult.severity === "HIGH" || primaryResult.severity === "CRITICAL")
+          && primaryResult.provider !== "knowledge_base";
 
-        bugsFound = persisted.status === "new" ? 1 : 0;
-        state.recentFindings.push(`${target.filePath}: ${(primaryResult.findingText ?? "bug finding").slice(0, 120)}`);
+        let verifiedFinding = primaryResult;
+        if (needsConsult) {
+          emitThought(agentId, `${primaryResult.severity} finding — consulting peer before filing...`, 4000);
+          const peerRole = primaryResult.isSecurityAdjacent ? "guardian" : "inspector";
+          const peerResult = await consultAgent({
+            requestingAgent: agentRow,
+            targetRole: peerRole,
+            filePath: target.filePath,
+            building: target,
+            context: `Peer review requested for ${primaryResult.severity} finding: ${primaryResult.findingText.slice(0, 200)}`,
+          });
 
-        if (bugsFound > 0) {
-          emitThought(agentId, `High-confidence issue found in ${target.name}.`, 4500);
-          wsServer.broadcastBugFound(
-            target.id,
-            persisted.severity === "CRITICAL" ? "critical" : "warning",
-            `${agentRow.name} reported ${persisted.severity} issue in ${target.name}: ${primaryResult.codeReference}`,
-          );
+          // If peer disagrees (no bug / observation), downgrade to observation
+          if (peerResult && peerResult.classification !== "bug") {
+            console.log(`[PeerConsult] Downgrading finding in ${target.filePath}: peer returned ${peerResult.classification}`);
+            observations = pushUnique(observations, primaryResult.findingText ?? "");
+            await recordObservationEvent({
+              agentId,
+              agentName: agentRow.name,
+              buildingId: target.id,
+              buildingName: target.name,
+              filePath: target.filePath,
+              observation: `[Peer downgraded] ${primaryResult.findingText ?? ""}`,
+              confidence: primaryResult.finalConfidence,
+              eventType: "finding_observation",
+            });
+            verifiedFinding = { ...primaryResult, classification: "observation" as const };
+          } else if (peerResult?.classification === "bug") {
+            wsServer.broadcastEventLog(
+              "PEER_CONFIRMED",
+              `Peer ${peerRole} confirmed ${primaryResult.severity} issue in ${target.filePath}`,
+              "warning",
+            );
+          }
+        }
+
+        if (verifiedFinding.classification === "bug") {
+          const persisted = await classifyAndPersistBugFinding({
+            agentId,
+            agentName: agentRow.name,
+            buildingId: target.id,
+            buildingName: target.name,
+            filePath: target.filePath,
+            findingText: primaryResult.findingText,
+            issueType: primaryResult.issueType,
+            confidence: primaryResult.finalConfidence,
+            codeReference: primaryResult.codeReference,
+          });
+
+          bugsFound = persisted.status === "new" ? 1 : 0;
+          state.recentFindings.push(`${target.filePath}: ${(primaryResult.findingText ?? "bug finding").slice(0, 120)}`);
+
+          if (bugsFound > 0) {
+            emitThought(agentId, `High-confidence issue found in ${target.name}.`, 4500);
+            wsServer.broadcastBugFound(
+              target.id,
+              persisted.severity === "CRITICAL" ? "critical" : "warning",
+              `${agentRow.name} reported ${persisted.severity} issue in ${target.name}: ${primaryResult.codeReference}`,
+            );
+            wsServer.broadcastBuildingStatusUpdate(target.id, "error");
+          }
         }
       } else {
         bugsFound = 0;
@@ -461,6 +567,15 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
 export async function startAgentLoop(): Promise<void> {
   console.log("[AgentLoop] Starting agent background loop");
+
+  // Load KB checkpoint from disk before the first agent cycle runs
+  _kbCheckpoint = await loadKbCheckpoint();
+  console.log(`[AgentLoop] Loaded KB checkpoint for ${Object.keys(_kbCheckpoint).length} agent(s)`);
+
+  // Persist in-memory KB state to disk every 5 minutes
+  setInterval(() => {
+    saveKbCheckpoint(agentStates).catch(() => {});
+  }, 5 * 60 * 1000);
 
   await new Promise(r => setTimeout(r, 3000));
 

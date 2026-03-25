@@ -4,6 +4,7 @@ import { and, desc, eq, gte } from "drizzle-orm";
 import { readFile } from 'node:fs/promises';
 import { resolve, isAbsolute, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { runAlchemistCommand } from "./alchemistExecutor";
 import { fileWatcher } from "./fileWatcher";
 import { escalate, type EscalationResult } from "./escalationEngine";
@@ -107,6 +108,36 @@ function normalizeNoFindingText(raw: string | null): string | null {
   return normalized;
 }
 
+/**
+ * Runs `tsc --noEmit` on the file and returns a compact error summary (≤1 200 chars).
+ * Only runs for TypeScript files; returns empty string otherwise or on any failure.
+ */
+function getTscErrors(absFilePath: string): string {
+  const lower = absFilePath.toLowerCase();
+  if (!lower.endsWith('.ts') && !lower.endsWith('.tsx')) return '';
+  try {
+    const result = spawnSync(
+      'npx',
+      ['--no-install', 'tsc', '--noEmit', '--strict', '--allowJs', '--checkJs', 'false',
+       '--isolatedModules', '--skipLibCheck', '--target', 'ESNext', absFilePath],
+      { timeout: 8000, encoding: 'utf-8', env: { ...process.env, FORCE_COLOR: '0' } },
+    );
+    const raw = ((result.stdout ?? '') + (result.stderr ?? '')).trim();
+    if (!raw) return '';
+    // Keep only lines mentioning the target file to avoid noise from imported modules
+    const fileName = absFilePath.split('/').pop() ?? '';
+    const relevant = raw
+      .split('\n')
+      .filter(l => l.includes(fileName) || /error TS\d+/.test(l))
+      .slice(0, 15)
+      .join('\n')
+      .slice(0, 1200);
+    return relevant;
+  } catch {
+    return '';
+  }
+}
+
 async function buildCodeSnippet(building: Building): Promise<string> {
   const metadata = [
     `FILE: ${building.filePath}`,
@@ -135,7 +166,9 @@ async function buildCodeSnippet(building: Building): Promise<string> {
       const capped = content.length > 4000
         ? content.slice(0, 3000) + '\n\n... [truncated] ...\n\n' + content.slice(-1000)
         : content;
-      return metadata + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
+      const tscErrors = getTscErrors(building.filePath);
+      const errSection = tscErrors ? `\n\nTYPECHECKER ERRORS:\n${tscErrors}` : '';
+      return metadata + errSection + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
     } catch {
       return metadata + '\n\n[Could not read file contents]';
     }
@@ -148,7 +181,9 @@ async function buildCodeSnippet(building: Building): Promise<string> {
       const capped = content.length > 4000
         ? content.slice(0, 3000) + '\n\n... [truncated] ...\n\n' + content.slice(-1000)
         : content;
-      return metadata + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
+      const tscErrors = getTscErrors(absPath);
+      const errSection = tscErrors ? `\n\nTYPECHECKER ERRORS:\n${tscErrors}` : '';
+      return metadata + errSection + '\n\nSOURCE CODE:\n```' + (building.language || 'typescript') + '\n' + capped + '\n```';
     } catch {
       // try next root
     }
