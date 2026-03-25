@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { reposTable, agentsTable, eventsTable, executionResultsTable } from "@workspace/db/schema";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { buildCityLayout } from "../lib/cityAnalyzer";
 import { computeHealthScore, type ExecutionHealthSummary } from "../lib/healthScorer";
 import type { CityLayout } from "../lib/types";
@@ -123,10 +123,27 @@ router.get("/health", async (_req, res) => {
     const { layout } = await getActiveLayout();
     const buildings = layout.districts.flatMap(d => d.buildings);
     const executionSummary = await getExecutionHealthSummary();
-    const { score, season } = computeHealthScore(buildings, executionSummary);
 
+    // Overlay confirmed bug findings: buildings with recent HIGH/CRITICAL confirmed
+    // bugs are demoted to "error" status so the health score reflects real agent
+    // findings rather than static file-metadata heuristics.
+    const buggedRows = await db
+      .select({ buildingId: eventsTable.buildingId })
+      .from(eventsTable)
+      .where(and(eq(eventsTable.type, "bug_found"), eq(eventsTable.severity, "critical")))
+      .orderBy(desc(eventsTable.timestamp))
+      .limit(500)
+      .catch(() => []);
+    const buggedBuildingIds = new Set(
+      buggedRows.map(r => r.buildingId).filter((id): id is string => Boolean(id)),
+    );
+    const buildingsForHealth = buildings.map(b =>
+      buggedBuildingIds.has(b.id) ? { ...b, status: "error" as const } : b,
+    );
+
+    const { score, season } = computeHealthScore(buildingsForHealth, executionSummary);
     const avgCoverage = buildings.reduce((s, b) => s + b.testCoverage, 0) / (buildings.length || 1);
-    const cleanRatio = buildings.filter(b => b.status === "healthy" || b.status === "glowing").length / (buildings.length || 1);
+    const cleanRatio = buildingsForHealth.filter(b => b.status === "healthy" || b.status === "glowing").length / (buildingsForHealth.length || 1);
     const avgComplexity = buildings.reduce((s, b) => s + b.complexity, 0) / (buildings.length || 1);
     const testFileRatio = buildings.filter(b => b.fileType === "test").length / (buildings.length || 1);
     const executionSuccessRate = executionSummary.totalRuns > 0

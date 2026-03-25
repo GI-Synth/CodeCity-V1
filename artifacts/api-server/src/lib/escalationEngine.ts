@@ -392,6 +392,23 @@ async function searchKnowledgeBase(req: EscalationRequest): Promise<EscalationRe
 
     const best = results[0];
     if (best.similarity >= 0.65) {
+      // Cross-file cache bypass: if the KB entry was produced for a different file
+      // than the one currently being analyzed, require very high similarity (≥0.90)
+      // before serving the cached answer. Below that threshold we fall through to a
+      // fresh AI call so agents actually reason about the specific file in front of
+      // them instead of recycling answers from a vaguely similar file.
+      if (req.filePath) {
+        const normalizedReqPath = req.filePath.replace(/\\/g, "/").trim();
+        const isSameFile = (best.entry.question ?? "").includes(normalizedReqPath);
+        if (!isSameFile && best.similarity < 0.90) {
+          logEscalation(
+            "kb.cross-file-bypass",
+            `reqPath=${normalizedReqPath} similarity=${best.similarity.toFixed(2)} reason=different_file`,
+          );
+          return null;
+        }
+      }
+
       await db.update(knowledgeTable)
         .set({ useCount: (best.entry.useCount ?? 0) + 1 })
         .where(eq(knowledgeTable.id, best.entry.id));

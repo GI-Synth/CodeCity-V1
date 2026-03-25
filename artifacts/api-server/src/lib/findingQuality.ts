@@ -1,5 +1,5 @@
 import { db } from "@workspace/db";
-import { eventsTable } from "@workspace/db/schema";
+import { eventsTable, findingsTable } from "@workspace/db/schema";
 import { and, desc, eq } from "drizzle-orm";
 import { basename, extname } from "node:path";
 import { classifyFindingSeverity, type FindingSeverity } from "./escalationEngine";
@@ -8,6 +8,76 @@ import { isGenericFinding as isGenericFindingHeuristic } from "./smartAgents";
 const REPORTABLE_SOURCE_EXTENSIONS = new Set([".ts", ".js", ".py", ".go", ".rs"]);
 const MIN_BUG_CONFIDENCE = 0.72;
 const MIN_OBSERVATION_CONFIDENCE = 0.55;
+
+// Asynchronously generates a 1–2 sentence fix suggestion for a confirmed
+// HIGH/CRITICAL finding and stores it in the findings table `metadata` field.
+async function generateAndStoreFix(params: {
+  agentId: string;
+  agentName: string;
+  filePath: string;
+  findingText: string;
+  severity: FindingSeverity;
+  buildingId: string | null;
+  buildingName: string | null;
+  sourceEventId: string;
+}): Promise<void> {
+  const groqKey = process.env["GROQ_API_KEY"];
+  const orKey = process.env["OPENROUTER_API_KEY"];
+  if (!groqKey && !orKey) return;
+
+  const isGroq = Boolean(groqKey);
+  const endpoint = isGroq
+    ? "https://api.groq.com/openai/v1/chat/completions"
+    : "https://openrouter.ai/api/v1/chat/completions";
+  const model = isGroq ? "llama-3.3-70b-versatile" : "openai/gpt-4o-mini";
+  const auth = `Bearer ${isGroq ? groqKey : orKey}`;
+
+  const prompt = [
+    `File: ${params.filePath}`,
+    `Finding (${params.severity}): ${params.findingText.slice(0, 400)}`,
+    "In 1–2 sentences give a specific code-level fix. Name the exact function or pattern to change. Do not repeat the finding.",
+  ].join("\n");
+
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": auth },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 150,
+        temperature: 0,
+      }),
+    });
+    if (!res.ok) return;
+    const data = await res.json() as { choices?: Array<{ message: { content: string } }> };
+    const suggestedFix = (data.choices?.[0]?.message?.content ?? "").trim().slice(0, 400);
+    if (!suggestedFix) return;
+
+    const ext = extname(params.filePath).toLowerCase().slice(1);
+    const langMap: Record<string, string> = {
+      ts: "typescript", js: "javascript", py: "python", go: "go", rs: "rust",
+    };
+    const language = langMap[ext] ?? "unknown";
+
+    await db.insert(findingsTable).values({
+      agentId: params.agentId,
+      agentName: params.agentName,
+      agentRole: "qa_inspector",
+      ...(params.buildingId ? { buildingId: params.buildingId } : {}),
+      ...(params.buildingName ? { buildingName: params.buildingName } : {}),
+      filePath: params.filePath,
+      language,
+      classification: "bug",
+      severity: params.severity,
+      baseConfidence: 0.8,
+      finalConfidence: 0.8,
+      source: "agent_confirmed",
+      finding: params.findingText.slice(0, 500),
+      metadata: JSON.stringify({ suggestedFix, sourceEventId: params.sourceEventId }),
+    }).catch(() => {});
+  } catch { }
+}
 const MIN_DISCARD_CONFIDENCE = 0.50;
 const MAX_PIPELINE_ATTEMPTS = 200;
 
@@ -379,6 +449,23 @@ export async function classifyAndPersistBugFinding(input: PersistFindingInput): 
     findingSeverity: severity,
     findingText: input.findingText,
   });
+
+  // For HIGH/CRITICAL findings, fire an async fix suggestion that stores a
+  // concrete code-level remedy in the findings table without blocking the response.
+  if (SEVERITY_RANK[severity] >= SEVERITY_RANK["HIGH"]) {
+    setImmediate(() => {
+      generateAndStoreFix({
+        agentId: input.agentId,
+        agentName: input.agentName,
+        filePath: normalizedPath,
+        findingText: input.findingText,
+        severity,
+        buildingId: input.buildingId ?? null,
+        buildingName: input.buildingName ?? null,
+        sourceEventId: eventId,
+      }).catch(() => {});
+    });
+  }
 
   return {
     status: "new",

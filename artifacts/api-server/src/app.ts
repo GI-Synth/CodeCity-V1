@@ -11,7 +11,7 @@ const app: Express = express();
 app.use(helmet());
 
 // CORS – restrict to known origins (default: localhost dev server)
-const allowedOrigins = (process.env["ALLOWED_ORIGINS"] ?? "http://localhost:5173")
+const allowedOrigins = (process.env["ALLOWED_ORIGINS"] ?? "http://localhost:5173,http://127.0.0.1:5173")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);

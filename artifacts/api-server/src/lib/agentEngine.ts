@@ -3,7 +3,7 @@ import { db } from "@workspace/db";
 import { agentsTable, eventsTable } from "@workspace/db/schema";
 import { wsServer } from "./wsServer";
 import type { CityLayout, Building } from "./types";
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { analyzeBuildingForAgent, type SmartAnalysisResult } from "./smartAgentWorkflow";
 import { computeRank } from "./agentRanking";
 import {
@@ -251,7 +251,19 @@ async function runAgentCycle(agentId: string): Promise<void> {
 
     let state = agentStates.get(agentId);
     if (!state) {
-      state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: [] };
+      // Rehydrate recentFindings from persisted bug events so learned patterns
+      // survive server restarts instead of being rediscovered from scratch.
+      const recentBugEvents = await db
+        .select({ filePath: eventsTable.filePath, findingText: eventsTable.findingText })
+        .from(eventsTable)
+        .where(and(eq(eventsTable.agentId, agentId), eq(eventsTable.type, "bug_found")))
+        .orderBy(desc(eventsTable.timestamp))
+        .limit(30)
+        .catch((): Array<{ filePath: string | null; findingText: string | null }> => []);
+      const rehydratedFindings = recentBugEvents
+        .filter(e => e.filePath && e.findingText)
+        .map(e => `${e.filePath}: ${(e.findingText ?? "").slice(0, 120)}`);
+      state = { id: agentId, status: "idle", visitedBuildings: new Set(), recentFindings: rehydratedFindings };
       agentStates.set(agentId, state);
     }
 
